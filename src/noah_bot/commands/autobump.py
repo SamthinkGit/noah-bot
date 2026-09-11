@@ -14,7 +14,11 @@ from noah_bot.modules.autobump import (
     seconds_until,
 )
 from noah_bot.modules.bot_context import get_bot_context
-from noah_bot.modules.slash_command import SlashCommandError, trigger_slash_command
+from noah_bot.modules.slash_command import (
+    SlashCommandError,
+    resolve_application_command,
+    trigger_slash_command,
+)
 
 
 def _build_autobump_help_embed() -> discord.Embed:
@@ -39,6 +43,11 @@ def _build_autobump_help_embed() -> discord.Embed:
     embed.add_field(
         name=".noah autobump status",
         value="Muestra si el autobump está activo y cuándo toca el siguiente.",
+        inline=False,
+    )
+    embed.add_field(
+        name=".noah autobump debug",
+        value="Muestra qué responde Discord al buscar `/bump` con tu token. Solo admins.",
         inline=False,
     )
     return embed
@@ -248,6 +257,44 @@ def register_autobump_commands(bot: commands.Bot, noah_group: commands.Group) ->
             return
 
         await ctx.send("🛑 Autobump desactivado.")
+
+    @autobump.command()
+    async def debug(ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.send("❌ Este comando solo funciona dentro de un servidor.")
+            return
+
+        if not _is_autobump_admin(ctx.author):
+            await ctx.send("❌ Solo los administradores pueden usar el autobump.")
+            return
+
+        context = get_bot_context(ctx.bot)
+        token = context.autogami_tokens.get_token(ctx.author.id)
+        if token is None:
+            await ctx.send(
+                "❌ No tienes un token sincronizado. Usa `.noah autogami sync` primero."
+            )
+            return
+
+        command, attempts = await asyncio.to_thread(
+            resolve_application_command,
+            BUMP_COMMAND_NAME,
+            DISBOARD_APPLICATION_ID,
+            token,
+            str(ctx.guild.id),
+            str(ctx.channel.id),
+        )
+        header = (
+            f"🔎 Buscando `/{BUMP_COMMAND_NAME}` como {ctx.author.mention} "
+            f"(app `{DISBOARD_APPLICATION_ID}`):"
+        )
+        detail = "\n".join(f"- {attempt}" for attempt in attempts)
+        verdict = (
+            f"✅ Resuelto: id `{command['id']}`, version `{command['version']}`."
+            if command is not None
+            else "❌ Ninguna fuente devolvió el comando."
+        )
+        await ctx.send(f"{header}\n{detail}\n{verdict}"[:1900])
 
     @autobump.command()
     async def status(ctx: commands.Context) -> None:
