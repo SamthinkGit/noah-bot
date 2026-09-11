@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass, field
 
 from discord.ext import commands
@@ -38,6 +39,7 @@ class BotContext:
         default_factory=NoahGochiStoryService
     )
     daily_stats: DailyStatsManager = field(default_factory=DailyStatsManager)
+    autobump_tasks: dict[int, asyncio.Task] = field(default_factory=dict)
     autogami_claim_messages: dict[int, int] = field(default_factory=dict)
     autogami_chest_messages: dict[int, str] = field(default_factory=dict)
     tts_greet_sessions: dict[int, int] = field(default_factory=dict)

@@ -230,3 +230,73 @@ class AutogamiTokenStore:
         if not isinstance(emoji, str) or not emoji.strip():
             return None
         return emoji.strip()
+
+    def set_autobump(self, guild_id: int, channel_id: int, user_id: int) -> None:
+        guild_data = self._guilds.get(self._guild_key(guild_id), {})
+        guild_data["autobump"] = {
+            "channel_id": str(channel_id),
+            "user_id": str(user_id),
+            "next_bump_at": None,
+            "started_at": _utc_now_iso(),
+        }
+        guild_data["updated_at"] = _utc_now_iso()
+        self._guilds[self._guild_key(guild_id)] = guild_data
+        self._save()
+
+    def set_autobump_next_bump(self, guild_id: int, next_bump_at: str | None) -> None:
+        guild_data = self._guilds.get(self._guild_key(guild_id))
+        if not isinstance(guild_data, dict):
+            return
+
+        autobump = guild_data.get("autobump")
+        if not isinstance(autobump, dict):
+            return
+
+        autobump["next_bump_at"] = next_bump_at
+        guild_data["updated_at"] = _utc_now_iso()
+        self._save()
+
+    def get_autobump(self, guild_id: int) -> dict[str, Any] | None:
+        guild_data = self._guilds.get(self._guild_key(guild_id))
+        if not isinstance(guild_data, dict):
+            return None
+
+        autobump = guild_data.get("autobump")
+        if not isinstance(autobump, dict):
+            return None
+
+        try:
+            channel_id = int(autobump["channel_id"])
+            user_id = int(autobump["user_id"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        next_bump_at = autobump.get("next_bump_at")
+        return {
+            "channel_id": channel_id,
+            "user_id": user_id,
+            "next_bump_at": next_bump_at if isinstance(next_bump_at, str) else None,
+        }
+
+    def clear_autobump(self, guild_id: int) -> bool:
+        guild_data = self._guilds.get(self._guild_key(guild_id))
+        if not isinstance(guild_data, dict) or "autobump" not in guild_data:
+            return False
+
+        del guild_data["autobump"]
+        guild_data["updated_at"] = _utc_now_iso()
+        self._save()
+        return True
+
+    def get_autobump_guild_ids(self) -> list[int]:
+        guild_ids = []
+        for guild_key, guild_data in self._guilds.items():
+            if not isinstance(guild_data, dict):
+                continue
+            if not isinstance(guild_data.get("autobump"), dict):
+                continue
+            try:
+                guild_ids.append(int(guild_key))
+            except (TypeError, ValueError):
+                continue
+        return guild_ids

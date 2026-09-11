@@ -6,6 +6,7 @@ import time
 import discord
 from discord.ext import commands
 
+from noah_bot.commands.autobump import register_autobump_commands
 from noah_bot.commands.autogami import register_autogami_commands
 from noah_bot.commands.gochi import register_gotchi_commands
 from noah_bot.commands.relics import register_relics_commands
@@ -263,6 +264,7 @@ def register_noah_commands(bot: commands.Bot) -> None:
         chart.add_row([".noah daily -user @user", "Resumen diario de un usuario."])
         chart.add_row([".noah gochi help", "Muestra los comandos de Noah Gochi."])
         chart.add_row([".noah autogami help", "Show Autogami sync commands."])
+        chart.add_row([".noah autobump help", "Autobump de Disboard cada 3-4h."])
         chart.add_row([".noah vc help", "Show voice stats commands."])
         chart.add_row(
             [".waifuracer setemoji <emoji>", "Set your claim reaction emoji."]
@@ -651,6 +653,7 @@ def register_noah_commands(bot: commands.Bot) -> None:
     register_waifu_commands(noah)
     register_gotchi_commands(noah)
     register_autogami_commands(bot, noah)
+    register_autobump_commands(bot, noah)
     register_relics_commands(bot, noah)
     register_tts_commands(bot, noah)
     register_vc_stats_commands(bot, noah)
