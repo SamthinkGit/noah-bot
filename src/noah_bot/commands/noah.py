@@ -264,7 +264,6 @@ def register_noah_commands(bot: commands.Bot) -> None:
         chart.add_row([".noah daily -user @user", "Resumen diario de un usuario."])
         chart.add_row([".noah gochi help", "Muestra los comandos de Noah Gochi."])
         chart.add_row([".noah autogami help", "Show Autogami sync commands."])
-        chart.add_row([".noah autobump help", "Autobump de Disboard cada 3-4h."])
         chart.add_row([".noah vc help", "Show voice stats commands."])
         chart.add_row(
             [".waifuracer setemoji <emoji>", "Set your claim reaction emoji."]
