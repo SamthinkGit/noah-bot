@@ -16,6 +16,7 @@ from noah_bot.commands.vc_stats import register_vc_stats_commands
 from noah_bot.commands.waifu import register_waifu_commands
 from noah_bot.modules.bot_context import get_bot_context
 from noah_bot.modules.daily_stats import overlap_seconds_for_current_day
+from noah_bot.modules.dice import build_d20_embed
 from noah_bot.modules.discord_formatter import (
     EmbedTable,
     RARITY_COLORS,
@@ -235,6 +236,10 @@ def register_noah_commands(bot: commands.Bot) -> None:
         await ctx.send("Im alive! 🖤")
 
     @noah.command()
+    async def d20(ctx: commands.Context) -> None:
+        await ctx.send(embed=build_d20_embed(ctx.author))
+
+    @noah.command()
     async def areyouok(ctx: commands.Context) -> None:
         await ctx.send(embed=_build_noah_command_stats_embed(ctx.bot))
 
@@ -256,6 +261,7 @@ def register_noah_commands(bot: commands.Bot) -> None:
         chart.add_row([".noah merge", "Render all images from a replied message."])
         chart.add_row([".noah if <type>", "Invert embed rarity symbol and color."])
         chart.add_row([".noah ping", "Check if Noah is responsive."])
+        chart.add_row([".noah d20", "Tira un d20 y muestra el resultado estilo D&D."])
         chart.add_row(
             [".noah areyouok", "Muestra el total de comandos y por categoria."]
         )
