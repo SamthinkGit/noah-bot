@@ -1,5 +1,4 @@
 import asyncio
-import os
 
 import discord
 from discord.ext import commands
@@ -18,6 +17,7 @@ from noah_bot.modules.spotify_player import (
 MIRROR_POLL_SECONDS = 4.0
 DRIFT_TOLERANCE_MS = 4000
 SYNC_OFFSET_MS = 1500
+CONFIRM_DELETE_AFTER = 20.0
 
 
 def _build_spotify_help_embed() -> discord.Embed:
@@ -31,10 +31,23 @@ def _build_spotify_help_embed() -> discord.Embed:
         color=discord.Color.green(),
     )
     embed.add_field(
+        name=".noah spotify unlock <password>",
+        value=(
+            "Te da acceso a los comandos de Spotify. Noah borra tu mensaje al "
+            "momento para que no se vea la password."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name=".noah spotify lock",
+        value="Te quita el acceso a ti mismo.",
+        inline=False,
+    )
+    embed.add_field(
         name=".noah spotify auth",
         value=(
-            "Solo por DM y con el `credentials.json` adjunto. Guarda las "
-            "credenciales de la cuenta en el servidor."
+            "Con el `credentials.json` adjunto, en cualquier canal. Noah guarda "
+            "las credenciales y borra el mensaje con el fichero."
         ),
         inline=False,
     )
@@ -84,25 +97,23 @@ def _build_spotify_help_embed() -> discord.Embed:
     return embed
 
 
-def _is_spotify_admin(author: discord.abc.User) -> bool:
-    raw = os.getenv("SPOTIFY_ADMIN_IDS", "")
-    allowed = {
-        int(chunk)
-        for chunk in raw.replace(" ", "").split(",")
-        if chunk.isdigit()
-    }
-
-    if allowed:
-        return author.id in allowed
-
-    return isinstance(author, discord.Member) and author.guild_permissions.administrator
+async def _delete_message(ctx: commands.Context) -> bool:
+    try:
+        await ctx.message.delete()
+        return True
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        return False
 
 
 async def _ensure_admin(ctx: commands.Context) -> bool:
-    if _is_spotify_admin(ctx.author):
+    context = get_bot_context(ctx.bot)
+
+    if context.spotify_access.is_allowed(ctx.author.id):
         return True
 
-    await ctx.send("❌ Solo los admins de Spotify pueden usar este comando.")
+    await ctx.send(
+        "🔒 Necesitas desbloquear Spotify: `.noah spotify unlock <password>`."
+    )
     return False
 
 
@@ -260,19 +271,7 @@ def register_spotify_commands(bot: commands.Bot, noah_group: commands.Group) -> 
 
     @spotify.command()
     async def auth(ctx: commands.Context) -> None:
-        if not _is_spotify_admin(ctx.author):
-            await ctx.send(
-                "❌ No estas en la allowlist. Por DM no hay permisos de servidor, "
-                f"asi que mete tu ID (`{ctx.author.id}`) en `SPOTIFY_ADMIN_IDS` "
-                "del `.env` y reinicia el bot."
-            )
-            return
-
-        if ctx.guild is not None:
-            await ctx.send(
-                "❌ Esto solo por DM, que el fichero da acceso a la cuenta. "
-                "Borra el mensaje."
-            )
+        if not await _ensure_admin(ctx):
             return
 
         if not ctx.message.attachments:
@@ -285,20 +284,67 @@ def register_spotify_commands(bot: commands.Bot, noah_group: commands.Group) -> 
 
         try:
             raw = await ctx.message.attachments[0].read()
+        except discord.HTTPException as exc:
+            await _delete_message(ctx)
+            await ctx.send(f"❌ No pude leer el adjunto: `{exc}`", delete_after=CONFIRM_DELETE_AFTER)
+            return
+
+        deleted = await _delete_message(ctx)
+
+        try:
             username = await asyncio.to_thread(
                 context.spotify_player.save_credentials,
                 raw,
             )
         except SpotifyError as exc:
-            await ctx.send(f"❌ {exc}")
+            await ctx.send(f"❌ {exc}", delete_after=CONFIRM_DELETE_AFTER)
             return
-        except discord.HTTPException as exc:
-            await ctx.send(f"❌ No pude leer el adjunto: `{exc}`")
+
+        warning = (
+            ""
+            if deleted
+            else "\n⚠️ No pude borrar tu mensaje (me falta `Gestionar mensajes`), borralo tu."
+        )
+        await ctx.send(
+            f"✅ Credenciales guardadas para **{username}**. "
+            f"Prueba con `.noah spotify login`.{warning}"
+        )
+
+    @spotify.command()
+    async def unlock(ctx: commands.Context, *, password: str = "") -> None:
+        context = get_bot_context(ctx.bot)
+        deleted = await _delete_message(ctx)
+
+        if not context.spotify_access.check_password(password):
+            await ctx.send(
+                "❌ Password incorrecta.",
+                delete_after=CONFIRM_DELETE_AFTER,
+            )
+            return
+
+        context.spotify_access.unlock(ctx.author.id)
+        warning = (
+            ""
+            if deleted
+            else "\n⚠️ No pude borrar tu mensaje (me falta `Gestionar mensajes`), borralo tu."
+        )
+        await ctx.send(
+            f"🔓 {ctx.author.mention}, Spotify desbloqueado. "
+            f"Empieza con `.noah spotify join`.{warning}",
+            delete_after=CONFIRM_DELETE_AFTER,
+        )
+
+    @spotify.command()
+    async def lock(ctx: commands.Context) -> None:
+        context = get_bot_context(ctx.bot)
+
+        if not context.spotify_access.lock(ctx.author.id):
+            await ctx.send("🔒 No tenias acceso.", delete_after=CONFIRM_DELETE_AFTER)
             return
 
         await ctx.send(
-            f"✅ Credenciales guardadas para **{username}**. "
-            "Prueba con `.noah spotify login`."
+            "🔒 Acceso a Spotify retirado.",
+            delete_after=CONFIRM_DELETE_AFTER,
         )
 
     @spotify.command()
@@ -325,7 +371,6 @@ def register_spotify_commands(bot: commands.Bot, noah_group: commands.Group) -> 
         context = get_bot_context(ctx.bot)
         player = context.spotify_player
         state = _get_state(ctx.bot, ctx.guild.id) if ctx.guild else SpotifyGuildState()
-        allowlist = os.getenv("SPOTIFY_ADMIN_IDS", "").strip()
 
         table = EmbedTable(
             headers=["Campo", "Valor"],
@@ -337,7 +382,7 @@ def register_spotify_commands(bot: commands.Bot, noah_group: commands.Group) -> 
         table.add_row(["Sesion abierta", "✅" if player.is_connected else "❌"])
         table.add_row(["Espejo", "✅" if state.mirror else "❌"])
         table.add_row(["Volumen", f"{int(state.volume * 100)}%"])
-        table.add_row(["Allowlist", allowlist or "(vacia, usa admins del server)"])
+        table.add_row(["Desbloqueados", str(len(context.spotify_access.users()))])
         await ctx.send(embed=table.render())
 
     @spotify.command()

@@ -11,7 +11,11 @@ from noah_bot.modules.leaderboard import Leaderboard
 from noah_bot.modules.noah_gochi import NoahGochiManager
 from noah_bot.modules.noah_gochi_ai import NoahGochiStoryService
 from noah_bot.modules.relics_game import RelicsGameManager
-from noah_bot.modules.spotify_player import SpotifyGuildState, SpotifyPlayer
+from noah_bot.modules.spotify_player import (
+    SpotifyAccessStore,
+    SpotifyGuildState,
+    SpotifyPlayer,
+)
 from noah_bot.modules.steallist import StealList
 from noah_bot.modules.tts import TTSVoiceStore
 from noah_bot.modules.voice_manager import VoiceManager
@@ -41,6 +45,7 @@ class BotContext:
     )
     daily_stats: DailyStatsManager = field(default_factory=DailyStatsManager)
     spotify_player: SpotifyPlayer = field(default_factory=SpotifyPlayer)
+    spotify_access: SpotifyAccessStore = field(default_factory=SpotifyAccessStore)
     spotify_states: dict[int, SpotifyGuildState] = field(default_factory=dict)
     spotify_mirror_tasks: dict[int, asyncio.Task] = field(default_factory=dict)
     autobump_tasks: dict[int, asyncio.Task] = field(default_factory=dict)

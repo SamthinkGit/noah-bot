@@ -6,9 +6,9 @@ http://127.0.0.1:5588/login, o sea al localhost de la maquina que corre esto.
     uv run python auth_local.py
 
 Te imprime una URL, la abres, te logueas, y se genera `credentials.json` en
-esta carpeta. Ese fichero es el que le mandas a Noah por DM con
-`.noah spotify auth`. Trata el fichero como una contrasena: da acceso a tu
-cuenta. No lo subas al repo.
+esta carpeta. Ese fichero es el que le mandas a Noah adjunto con
+`.noah spotify auth` (Noah borra el mensaje al momento). Trata el fichero como
+una contrasena: da acceso a tu cuenta. No lo subas al repo.
 """
 
 from pathlib import Path
@@ -32,7 +32,7 @@ def main() -> None:
     session = Session.Builder().oauth(print_auth_url).create()
     print(f"\nListo. Cuenta: {session.username()}")
     print(f"Fichero generado: {CREDENTIALS_FILE.resolve()}")
-    print("Mandaselo a Noah por DM con `.noah spotify auth` (adjuntando el fichero).")
+    print("Adjuntaselo a Noah con `.noah spotify auth` (borra el mensaje el solo).")
     session.close()
 
 

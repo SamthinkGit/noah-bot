@@ -7,8 +7,10 @@ que la musica sigue sonando tambien en tu PC o tu Alexa.
 
 from __future__ import annotations
 
+import hmac
 import importlib
 import json
+import os
 import re
 import subprocess
 import threading
@@ -22,6 +24,8 @@ import requests
 
 
 CREDENTIALS_PATH = "spotify_credentials.json"
+ADMINS_PATH = "spotify_admins.json"
+DEFAULT_PASSWORD = "5441"
 WEB_API_BASE = "https://api.spotify.com/v1"
 PLAYBACK_SCOPE = "user-read-playback-state"
 DEFAULT_VOLUME = 0.6
@@ -161,6 +165,71 @@ class TrackPlayback:
             self._ogg.close()
         except (OSError, ValueError, AttributeError):
             pass
+
+
+class SpotifyAccessStore:
+    """Quien puede tocar los comandos de Spotify.
+
+    Se abre con una contrasena (`SPOTIFY_PASSWORD` en el .env, por defecto
+    `5441`) y el usuario queda desbloqueado aunque se reinicie el bot.
+    """
+
+    def __init__(self, json_path: str = ADMINS_PATH) -> None:
+        self.json_path = Path(json_path)
+        self._users = self._load()
+
+    def _load(self) -> set[int]:
+        if not self.json_path.is_file():
+            return set()
+
+        try:
+            payload = json.loads(self.json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return set()
+
+        if not isinstance(payload, dict):
+            return set()
+
+        return {
+            int(user_id)
+            for user_id in payload.get("users", [])
+            if str(user_id).isdigit()
+        }
+
+    def _save(self) -> None:
+        self.json_path.write_text(
+            json.dumps({"users": sorted(self._users)}, indent=2),
+            encoding="utf-8",
+        )
+
+    @property
+    def password(self) -> str:
+        return os.getenv("SPOTIFY_PASSWORD", DEFAULT_PASSWORD)
+
+    def check_password(self, value: str) -> bool:
+        return hmac.compare_digest(value.strip(), self.password)
+
+    def is_allowed(self, user_id: int) -> bool:
+        return user_id in self._users
+
+    def unlock(self, user_id: int) -> bool:
+        if user_id in self._users:
+            return False
+
+        self._users.add(user_id)
+        self._save()
+        return True
+
+    def lock(self, user_id: int) -> bool:
+        if user_id not in self._users:
+            return False
+
+        self._users.discard(user_id)
+        self._save()
+        return True
+
+    def users(self) -> list[int]:
+        return sorted(self._users)
 
 
 @dataclass(slots=True)
