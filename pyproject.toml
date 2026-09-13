@@ -15,8 +15,10 @@ dependencies = [
     "langchain>=1.2.3",
     "langchain-openai>=1.1.7",
     "langchain-xai>=1.2.2",
+    "librespot",
     "pillow>=12.1.0",
     "pynacl>=1.5,<1.6",
+    "requests>=2.32.0",
     "rich>=14.2.0",
     "tinydb>=4.8.2",
 ]
@@ -34,3 +36,6 @@ dev = [
     "memory-profiler>=0.61.0",
     "rich>=14.2.0",
 ]
+
+[tool.uv.sources]
+librespot = { git = "https://github.com/kokarare1212/librespot-python.git" }

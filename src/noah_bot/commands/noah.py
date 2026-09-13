@@ -10,6 +10,7 @@ from noah_bot.commands.autobump import register_autobump_commands
 from noah_bot.commands.autogami import register_autogami_commands
 from noah_bot.commands.gochi import register_gotchi_commands
 from noah_bot.commands.relics import register_relics_commands
+from noah_bot.commands.spotify import register_spotify_commands
 from noah_bot.commands.tts import register_tts_commands
 from noah_bot.commands.vc_stats import register_vc_stats_commands
 from noah_bot.commands.waifu import register_waifu_commands
@@ -265,6 +266,7 @@ def register_noah_commands(bot: commands.Bot) -> None:
         chart.add_row([".noah gochi help", "Muestra los comandos de Noah Gochi."])
         chart.add_row([".noah autogami help", "Show Autogami sync commands."])
         chart.add_row([".noah vc help", "Show voice stats commands."])
+        chart.add_row([".noah spotify help", "Muestra los comandos de Spotify."])
         chart.add_row(
             [".waifuracer setemoji <emoji>", "Set your claim reaction emoji."]
         )
@@ -655,4 +657,5 @@ def register_noah_commands(bot: commands.Bot) -> None:
     register_autobump_commands(bot, noah)
     register_relics_commands(bot, noah)
     register_tts_commands(bot, noah)
+    register_spotify_commands(bot, noah)
     register_vc_stats_commands(bot, noah)
