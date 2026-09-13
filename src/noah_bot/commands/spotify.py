@@ -9,6 +9,7 @@ from noah_bot.modules.spotify_player import (
     PlaybackState,
     SpotifyError,
     SpotifyGuildState,
+    SpotifyRateLimitError,
     TrackInfo,
     format_ms,
 )
@@ -46,8 +47,9 @@ def _build_spotify_help_embed() -> discord.Embed:
     embed.add_field(
         name=".noah spotify auth",
         value=(
-            "Con el `credentials.json` adjunto, en cualquier canal. Noah guarda "
-            "las credenciales y borra el mensaje con el fichero."
+            "Adjunta un JSON y Noah lo guarda y borra el mensaje. Acepta los "
+            "dos: `credentials.json` (audio, de `auth_local.py`) y "
+            "`spotify_webapi.json` (para el espejo, de `auth_webapi.py`)."
         ),
         inline=False,
     )
@@ -236,6 +238,7 @@ async def _apply_remote_state(
 async def _mirror_loop(bot: commands.Bot, guild_id: int) -> None:
     context = get_bot_context(bot)
     state = _get_state(bot, guild_id)
+    rate_limit_warned = False
 
     while True:
         await asyncio.sleep(MIRROR_POLL_SECONDS)
@@ -250,8 +253,16 @@ async def _mirror_loop(bot: commands.Bot, guild_id: int) -> None:
 
         try:
             remote = await asyncio.to_thread(context.spotify_player.current_playback)
+        except SpotifyRateLimitError as exc:
+            if not rate_limit_warned:
+                await _notify(bot, state, f"⚠️ {exc}")
+                rate_limit_warned = True
+            await asyncio.sleep(exc.retry_after)
+            continue
         except SpotifyError:
             continue
+
+        rate_limit_warned = False
 
         try:
             await _apply_remote_state(bot, guild, state, remote)
@@ -292,7 +303,7 @@ def register_spotify_commands(bot: commands.Bot, noah_group: commands.Group) -> 
         deleted = await _delete_message(ctx)
 
         try:
-            username = await asyncio.to_thread(
+            kind, label = await asyncio.to_thread(
                 context.spotify_player.save_credentials,
                 raw,
             )
@@ -305,8 +316,16 @@ def register_spotify_commands(bot: commands.Bot, noah_group: commands.Group) -> 
             if deleted
             else "\n⚠️ No pude borrar tu mensaje (me falta `Gestionar mensajes`), borralo tu."
         )
+
+        if kind == "webapi":
+            await ctx.send(
+                f"✅ App propia de la Web API guardada (`{label}`). "
+                f"Ya puedes usar `.noah spotify mirror`.{warning}"
+            )
+            return
+
         await ctx.send(
-            f"✅ Credenciales guardadas para **{username}**. "
+            f"✅ Credenciales de audio guardadas para **{label}**. "
             f"Prueba con `.noah spotify login`.{warning}"
         )
 
@@ -378,8 +397,16 @@ def register_spotify_commands(bot: commands.Bot, noah_group: commands.Group) -> 
             color=discord.Color.green(),
             max_columns=2,
         )
-        table.add_row(["Credenciales", "✅" if player.has_credentials() else "❌"])
+        cooldown = player.rate_limit_remaining()
+        table.add_row(["Credenciales audio", "✅" if player.has_credentials() else "❌"])
         table.add_row(["Sesion abierta", "✅" if player.is_connected else "❌"])
+        table.add_row(
+            [
+                "Web API",
+                "app propia ✅" if player.has_webapi_app() else "librespot ⚠️ (429)",
+            ]
+        )
+        table.add_row(["Cooldown 429", f"{cooldown}s" if cooldown else "—"])
         table.add_row(["Espejo", "✅" if state.mirror else "❌"])
         table.add_row(["Volumen", f"{int(state.volume * 100)}%"])
         table.add_row(["Desbloqueados", str(len(context.spotify_access.users()))])

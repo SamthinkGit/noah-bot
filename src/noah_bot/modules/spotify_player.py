@@ -24,10 +24,14 @@ import requests
 
 
 CREDENTIALS_PATH = "spotify_credentials.json"
+WEBAPI_PATH = "spotify_webapi.json"
 ADMINS_PATH = "spotify_admins.json"
 DEFAULT_PASSWORD = "5441"
 WEB_API_BASE = "https://api.spotify.com/v1"
+TOKEN_URL = "https://accounts.spotify.com/api/token"
 PLAYBACK_SCOPE = "user-read-playback-state"
+DEFAULT_RETRY_AFTER = 30
+MAX_RETRY_AFTER = 900
 DEFAULT_VOLUME = 0.6
 FFMPEG_READ_SIZE = 8192
 REQUEST_TIMEOUT = 10
@@ -44,6 +48,17 @@ class SpotifyError(RuntimeError):
 
 class SpotifyAuthError(SpotifyError):
     """Faltan credenciales o la sesion no se pudo abrir."""
+
+
+class SpotifyRateLimitError(SpotifyError):
+    """La Web API nos ha cortado con un 429."""
+
+    def __init__(self, retry_after: int, detail: str = "") -> None:
+        self.retry_after = max(1, int(retry_after))
+        suffix = f" ({detail})" if detail else ""
+        super().__init__(
+            f"Web API limitada (429). Reintento en {self.retry_after}s{suffix}."
+        )
 
 
 def _import_librespot(module_name: str) -> Any:
@@ -244,27 +259,67 @@ class SpotifyGuildState:
 class SpotifyPlayer:
     """Sesion de librespot + acceso a la Web API con el token de esa sesion."""
 
-    def __init__(self, credentials_path: str = CREDENTIALS_PATH) -> None:
+    def __init__(
+        self,
+        credentials_path: str = CREDENTIALS_PATH,
+        webapi_path: str = WEBAPI_PATH,
+    ) -> None:
         self.credentials_path = Path(credentials_path)
+        self.webapi_path = Path(webapi_path)
         self._session: Any = None
         self._lock = threading.Lock()
+        self._web_token: str = ""
+        self._web_token_expires_at: float = 0.0
+        self._rate_limited_until: float = 0.0
 
     def has_credentials(self) -> bool:
         return self.credentials_path.is_file()
+
+    def has_webapi_app(self) -> bool:
+        return self.webapi_path.is_file()
+
+    def rate_limit_remaining(self) -> int:
+        return max(0, int(self._rate_limited_until - time.time()))
 
     @property
     def is_connected(self) -> bool:
         return self._session is not None
 
-    def save_credentials(self, raw: bytes) -> str:
+    def save_credentials(self, raw: bytes) -> tuple[str, str]:
+        """Guarda el fichero que toque segun su contenido.
+
+        Devuelve (tipo, etiqueta): `librespot` para el credentials.json del
+        audio, `webapi` para el spotify_webapi.json de la app propia.
+        """
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise SpotifyAuthError("El fichero no es un JSON valido.") from exc
 
         if not isinstance(payload, dict):
-            raise SpotifyAuthError("El JSON no tiene el formato de credentials.json.")
+            raise SpotifyAuthError("El JSON no tiene el formato esperado.")
 
+        if payload.get("client_id") and payload.get("refresh_token"):
+            return self._save_webapi_credentials(payload)
+
+        return self._save_librespot_credentials(payload)
+
+    def _save_webapi_credentials(self, payload: dict[str, Any]) -> tuple[str, str]:
+        if not payload.get("client_secret"):
+            raise SpotifyAuthError(
+                "Al JSON de la Web API le falta `client_secret`."
+            )
+
+        self.webapi_path.write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self._web_token = ""
+        self._web_token_expires_at = 0.0
+        self._rate_limited_until = 0.0
+        return ("webapi", str(payload["client_id"])[:8] + "…")
+
+    def _save_librespot_credentials(self, payload: dict[str, Any]) -> tuple[str, str]:
         username = payload.get("username")
         auth_type = payload.get("auth_type") or payload.get("type")
         auth_data = payload.get("auth_data") or payload.get("credentials")
@@ -280,7 +335,7 @@ class SpotifyPlayer:
             json.dumps(payload, ensure_ascii=False),
             encoding="utf-8",
         )
-        return str(username)
+        return ("librespot", str(username))
 
     def connect(self) -> str:
         with self._lock:
@@ -330,6 +385,14 @@ class SpotifyPlayer:
         return self._session
 
     def web_token(self, scope: str = PLAYBACK_SCOPE) -> str:
+        if self.has_webapi_app():
+            if self._web_token and time.time() < self._web_token_expires_at:
+                return self._web_token
+            return self._refresh_web_token()
+
+        # Sin app propia caemos al token de la sesion de librespot, que usa el
+        # client_id de la app de escritorio de Spotify. Desde 2025-12 la Web API
+        # responde 429 a esos tokens, asi que esto es solo un plan B.
         session = self._require_session()
 
         try:
@@ -339,7 +402,40 @@ class SpotifyPlayer:
                 f"No se pudo obtener el token de la Web API: {exc}"
             ) from exc
 
+    def _refresh_web_token(self) -> str:
+        try:
+            config = json.loads(self.webapi_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SpotifyAuthError(
+                "El `spotify_webapi.json` esta corrupto. Vuelve a generarlo."
+            ) from exc
+
+        response = requests.post(
+            TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": config["refresh_token"],
+            },
+            auth=(config["client_id"], config["client_secret"]),
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            raise SpotifyAuthError(
+                f"No se pudo refrescar el token de la Web API "
+                f"({response.status_code}): {response.text[:120]}"
+            )
+
+        payload = response.json()
+        self._web_token = payload["access_token"]
+        self._web_token_expires_at = time.time() + int(payload.get("expires_in", 3600)) - 60
+        return self._web_token
+
     def current_playback(self) -> PlaybackState | None:
+        remaining = self.rate_limit_remaining()
+        if remaining > 0:
+            raise SpotifyRateLimitError(remaining)
+
         token = self.web_token()
         response = requests.get(
             f"{WEB_API_BASE}/me/player",
@@ -347,6 +443,16 @@ class SpotifyPlayer:
             params={"additional_types": "track,episode"},
             timeout=REQUEST_TIMEOUT,
         )
+
+        if response.status_code == 429:
+            retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+            self._rate_limited_until = time.time() + retry_after
+            detail = (
+                "tienes app propia, es limite de verdad"
+                if self.has_webapi_app()
+                else "usa `.noah spotify auth` con el JSON de tu app propia"
+            )
+            raise SpotifyRateLimitError(retry_after, detail)
 
         if response.status_code in (202, 204) or not response.content:
             return None
@@ -410,6 +516,15 @@ class SpotifyPlayer:
             ogg_stream,
             position_ms,
         )
+
+
+def _parse_retry_after(raw: str | None) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_RETRY_AFTER
+
+    return max(1, min(value, MAX_RETRY_AFTER))
 
 
 def _build_track_info(uri: str, track: Any) -> TrackInfo:
