@@ -10,6 +10,7 @@ from noah_bot.modules.discord_formatter import UserEmojiManager
 from noah_bot.modules.leaderboard import Leaderboard
 from noah_bot.modules.noah_gochi import NoahGochiManager
 from noah_bot.modules.noah_gochi_ai import NoahGochiStoryService
+from noah_bot.modules.presentations import PresentationsStore
 from noah_bot.modules.relics_game import RelicsGameManager
 from noah_bot.modules.spotify_player import (
     SpotifyAccessStore,
@@ -31,6 +32,7 @@ class BotContext:
     autogami_tokens: AutogamiTokenStore = field(default_factory=AutogamiTokenStore)
     voice_manager: VoiceManager = field(default_factory=VoiceManager)
     tts_voices: TTSVoiceStore = field(default_factory=TTSVoiceStore)
+    presentations: PresentationsStore = field(default_factory=PresentationsStore)
     waifu_manager: WaifuGameManager = field(
         default_factory=lambda: WaifuGameManager(json_path="waifu_game.json")
     )

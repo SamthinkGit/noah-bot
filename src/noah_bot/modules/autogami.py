@@ -151,7 +151,12 @@ class AutogamiTokenStore:
             return None
         return token
 
-    def add_favorite_emoji(self, user_id: int, emoji: str) -> bool:
+    def add_favorite_emoji(
+        self,
+        user_id: int,
+        emoji: str,
+        at_start: bool = False,
+    ) -> bool:
         sanitized_emoji = emoji.strip()
         if not sanitized_emoji:
             return False
@@ -164,7 +169,10 @@ class AutogamiTokenStore:
         if sanitized_emoji in favorites:
             return False
 
-        favorites.append(sanitized_emoji)
+        if at_start:
+            favorites.insert(0, sanitized_emoji)
+        else:
+            favorites.append(sanitized_emoji)
         user_data["favorite_emojis"] = favorites
         user_data["updated_at"] = _utc_now_iso()
         self._users[self._user_key(user_id)] = user_data
@@ -208,6 +216,31 @@ class AutogamiTokenStore:
         self._users[self._user_key(user_id)] = user_data
         self._save()
         return True
+
+    def reorder_favorite_emojis(
+        self,
+        user_id: int,
+        ordered_emojis: list[str],
+    ) -> list[str] | None:
+        """Pone los emojis indicados al principio en ese orden; el resto mantiene su orden detrás."""
+        favorites = self.get_favorite_emojis(user_id)
+        if not favorites:
+            return None
+
+        requested: list[str] = []
+        for emoji in ordered_emojis:
+            sanitized_emoji = emoji.strip()
+            if sanitized_emoji not in favorites:
+                return None
+            if sanitized_emoji not in requested:
+                requested.append(sanitized_emoji)
+
+        reordered = requested + [emoji for emoji in favorites if emoji not in requested]
+        user_data = self._users[self._user_key(user_id)]
+        user_data["favorite_emojis"] = reordered
+        user_data["updated_at"] = _utc_now_iso()
+        self._save()
+        return reordered
 
     def set_chest_emoji(self, guild_id: int, emoji: str) -> bool:
         sanitized_emoji = emoji.strip()

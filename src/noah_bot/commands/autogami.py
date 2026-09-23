@@ -29,6 +29,8 @@ AUTOGAMI_TRADE_VIEW_TIMEOUT_SECONDS = 300
 WAIFUGAMI_BOT_USER_ID = 722418701852344391
 CHEST_TRIGGER_PATTERN = re.compile(r"\.open\s+<treasure\s+type>", re.IGNORECASE)
 USER_MENTION_PATTERN = re.compile(r"^<@!?(\d+)>$")
+FAV_POSITION_START = {"inicio", "principio", "start", "first", "-inicio", "-first"}
+FAV_POSITION_END = {"final", "fin", "end", "last", "-final", "-last"}
 CHEST_TYPE_COLORS = {
     "platinum": 0x424860,
     "bronze": 0xCD8032,
@@ -36,8 +38,9 @@ CHEST_TYPE_COLORS = {
     "gold": 0xFFD900,
     "diamond": 0xB9F2FF,
     "zeta": 0xFFC0CA,
-    "event": 0xFFC0CA,
 }
+# Colores más lejanos que esto de cualquier cofre conocido se tratan como cofre de evento.
+CHEST_COLOR_MAX_DISTANCE = 45
 
 
 def _build_autogami_help_embed() -> discord.Embed:
@@ -62,8 +65,8 @@ def _build_autogami_help_embed() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name=".noah autogami addfav <emoji>",
-        value="Guarda un emoji favorito para reaccionar a los `Waifu Claimed!`.",
+        name=".noah autogami addfav <emoji> [inicio|final]",
+        value="Guarda un emoji favorito para reaccionar a los `Waifu Claimed!`. Por defecto va al final.",
         inline=False,
     )
     embed.add_field(
@@ -74,6 +77,11 @@ def _build_autogami_help_embed() -> discord.Embed:
     embed.add_field(
         name=".noah autogami showfavs",
         value="Muestra todos tus emojis favoritos guardados.",
+        inline=False,
+    )
+    embed.add_field(
+        name=".noah autogami sortfavs <emoji> <emoji> ...",
+        value="Reordena tus favs: los emojis indicados pasan al principio en ese orden y el resto se queda detrás.",
         inline=False,
     )
     embed.add_field(
@@ -289,12 +297,18 @@ def _resolve_chest_type(embed: discord.Embed) -> str | None:
 
     color_value = embed.color.value
     nearest_type = min(
-        ("platinum", "bronze", "silver", "gold", "diamond", "zeta"),
+        CHEST_TYPE_COLORS,
         key=lambda chest_type: _color_distance(
             color_value,
             CHEST_TYPE_COLORS[chest_type],
         ),
     )
+
+    if (
+        _color_distance(color_value, CHEST_TYPE_COLORS[nearest_type])
+        > CHEST_COLOR_MAX_DISTANCE**2
+    ):
+        return "event"
 
     if nearest_type != "zeta":
         return nearest_type
@@ -1229,12 +1243,32 @@ def register_autogami_commands(bot: commands.Bot, noah_group: commands.Group) ->
         )
 
     @autogami.command()
-    async def addfav(ctx: commands.Context, emoji: str) -> None:
-        context = get_bot_context(ctx.bot)
-        added = context.autogami_tokens.add_favorite_emoji(ctx.author.id, emoji)
-        if added:
+    async def addfav(
+        ctx: commands.Context,
+        emoji: str,
+        position: str = "final",
+    ) -> None:
+        normalized_position = position.strip().casefold()
+        if normalized_position in FAV_POSITION_START:
+            at_start = True
+        elif normalized_position in FAV_POSITION_END:
+            at_start = False
+        else:
             await ctx.send(
-                f"{ctx.author.mention} he guardado `{emoji}` en tus favs de Autogami."
+                "❌ Usa `.noah autogami addfav <emoji> [inicio|final]`."
+            )
+            return
+
+        context = get_bot_context(ctx.bot)
+        added = context.autogami_tokens.add_favorite_emoji(
+            ctx.author.id,
+            emoji,
+            at_start=at_start,
+        )
+        if added:
+            position_text = "al principio" if at_start else "al final"
+            await ctx.send(
+                f"{ctx.author.mention} he guardado `{emoji}` {position_text} de tus favs de Autogami."
             )
             return
 
@@ -1265,6 +1299,43 @@ def register_autogami_commands(bot: commands.Bot, noah_group: commands.Group) ->
         favorites_text = " ".join(favorites)
         await ctx.send(
             f"{ctx.author.mention} tus favs de Autogami son: {favorites_text}"
+        )
+
+    @autogami.command(aliases=["reorderfavs"])
+    async def sortfavs(ctx: commands.Context, *emojis: str) -> None:
+        context = get_bot_context(ctx.bot)
+        favorites = context.autogami_tokens.get_favorite_emojis(ctx.author.id)
+        if not favorites:
+            await ctx.send(
+                f"{ctx.author.mention} no tienes favs guardados todavía. Usa `.noah autogami addfav <emoji>`."
+            )
+            return
+
+        requested = [emoji.strip() for emoji in emojis if emoji.strip()]
+        if not requested:
+            await ctx.send(
+                "❌ Usa `.noah autogami sortfavs <emoji> <emoji> ...`. "
+                f"Tu orden actual es: {' '.join(favorites)}"
+            )
+            return
+
+        missing = [emoji for emoji in requested if emoji not in favorites]
+        if missing:
+            await ctx.send(
+                f"❌ Estos emojis no están en tus favs: {' '.join(missing)}"
+            )
+            return
+
+        reordered = context.autogami_tokens.reorder_favorite_emojis(
+            ctx.author.id,
+            requested,
+        )
+        if reordered is None:
+            await ctx.send("❌ No he podido reordenar tus favs.")
+            return
+
+        await ctx.send(
+            f"{ctx.author.mention} tu nuevo orden de favs es: {' '.join(reordered)}"
         )
 
     @autogami.command()
