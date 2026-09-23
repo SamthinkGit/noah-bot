@@ -1,3 +1,4 @@
+import io
 import random
 from contextlib import suppress
 
@@ -8,6 +9,8 @@ from noah_bot.modules.bot_context import get_bot_context
 
 
 PRESENTATION_NOTICE_DELETE_AFTER = 20
+PRESENTATION_LIST_FIELD_LIMIT = 1024
+PRESENTATION_PREVIEW_LIMIT = 3800
 PRESENTATION_NOTICE_TEMPLATES = (
     "{mention} Uhmm... Parece que aún no te has presentado, ¿te echo una mano?",
     "{mention} Oye, oye... ¿y tu presentación? Aún no sé ni quién eres 👀",
@@ -67,7 +70,116 @@ def _build_presentations_help_embed() -> discord.Embed:
         value="Muestra la configuración actual.",
         inline=False,
     )
+    embed.add_field(
+        name=".noah presentations list",
+        value="Muestra quién se ha presentado ya y quién falta por presentarse.",
+        inline=False,
+    )
+    embed.add_field(
+        name=".noah presentations show [@user]",
+        value="Muestra la presentación de alguien (o la tuya). Disponible para todos.",
+        inline=False,
+    )
     return embed
+
+
+def _format_member_list(members: list[discord.Member]) -> tuple[str, bool]:
+    """Devuelve las menciones que caben en un field de embed y si se ha truncado."""
+    if not members:
+        return "Nadie.", False
+
+    lines: list[str] = []
+    length = 0
+    for index, member in enumerate(members):
+        more_line = f"… y {len(members) - index} más"
+        if length + len(member.mention) + 1 + len(more_line) > PRESENTATION_LIST_FIELD_LIMIT:
+            lines.append(more_line)
+            return "\n".join(lines), True
+        lines.append(member.mention)
+        length += len(member.mention) + 1
+
+    return "\n".join(lines), False
+
+
+def _build_presentations_list_file(
+    presented: list[discord.Member],
+    missing: list[discord.Member],
+) -> discord.File:
+    lines = [f"Presentados ({len(presented)}):"]
+    lines.extend(f"- {member.display_name} ({member.id})" for member in presented)
+    lines.append("")
+    lines.append(f"Sin presentar ({len(missing)}):")
+    lines.extend(f"- {member.display_name} ({member.id})" for member in missing)
+    buffer = io.BytesIO("\n".join(lines).encode("utf-8"))
+    return discord.File(buffer, filename="presentaciones.txt")
+
+
+async def _fetch_presentation_message(
+    guild: discord.Guild,
+    channel_id: int,
+    message_id: int,
+) -> discord.Message | None:
+    channel = guild.get_channel_or_thread(channel_id)
+    if channel is None or not hasattr(channel, "fetch_message"):
+        return None
+
+    try:
+        return await channel.fetch_message(message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+
+async def _search_presentation_message(
+    channel: discord.TextChannel,
+    user_id: int,
+) -> discord.Message | None:
+    try:
+        async for history_message in channel.history(limit=None, oldest_first=True):
+            if history_message.author.id == user_id:
+                return history_message
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+    return None
+
+
+def _build_presentation_embed(
+    member: discord.Member,
+    presentation: discord.Message,
+) -> discord.Embed:
+    content = presentation.content.strip() or "*Sin texto.*"
+    if len(content) > PRESENTATION_PREVIEW_LIMIT:
+        content = content[:PRESENTATION_PREVIEW_LIMIT] + "…"
+
+    embed = discord.Embed(
+        description=content,
+        color=member.color if member.color.value else discord.Color.blurple(),
+        timestamp=presentation.created_at,
+    )
+    embed.set_author(
+        name=f"Presentación de {member.display_name}",
+        icon_url=member.display_avatar.url,
+        url=presentation.jump_url,
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    for attachment in presentation.attachments:
+        if attachment.content_type and attachment.content_type.startswith("image/"):
+            embed.set_image(url=attachment.url)
+            break
+
+    return embed
+
+
+class PresentationLinkView(discord.ui.View):
+    def __init__(self, jump_url: str) -> None:
+        super().__init__()
+        self.add_item(
+            discord.ui.Button(
+                label="Ir a la presentación",
+                style=discord.ButtonStyle.link,
+                url=jump_url,
+            )
+        )
 
 
 class PresentationNoticeView(discord.ui.View):
@@ -130,7 +242,10 @@ def register_presentations_commands(bot: commands.Bot, noah_group: commands.Grou
             return
 
         if _is_presentation_channel(message.channel, channel_id):
-            store.mark_completed(message.guild.id, [message.author.id])
+            store.record_presentations(
+                message.guild.id,
+                {message.author.id: (message.channel.id, message.id)},
+            )
             return
 
         if not store.is_enabled(message.guild.id):
@@ -174,12 +289,15 @@ def register_presentations_commands(bot: commands.Bot, noah_group: commands.Grou
             "Revisando quién se ha presentado ya..."
         )
 
+        first_messages: dict[int, tuple[int, int]] = {}
         try:
-            author_ids = {
-                history_message.author.id
-                async for history_message in channel.history(limit=None)
-                if not history_message.author.bot
-            }
+            async for history_message in channel.history(limit=None, oldest_first=True):
+                if history_message.author.bot:
+                    continue
+                first_messages.setdefault(
+                    history_message.author.id,
+                    (channel.id, history_message.id),
+                )
         except (discord.Forbidden, discord.HTTPException):
             await status_message.edit(
                 content=(
@@ -190,11 +308,11 @@ def register_presentations_commands(bot: commands.Bot, noah_group: commands.Grou
             )
             return
 
-        added = store.mark_completed(ctx.guild.id, list(author_ids))
+        added = store.record_presentations(ctx.guild.id, first_messages)
         await status_message.edit(
             content=(
                 f"✅ Canal de presentaciones configurado en {channel.mention}. "
-                f"He encontrado `{len(author_ids)}` usuarios presentados "
+                f"He encontrado `{len(first_messages)}` usuarios presentados "
                 f"(`{added}` nuevos)."
             )
         )
@@ -265,8 +383,110 @@ def register_presentations_commands(bot: commands.Bot, noah_group: commands.Grou
         )
         await ctx.send(embed=embed)
 
+    @presentations.command(name="list", aliases=["who"])
+    async def list_presentations(ctx: commands.Context) -> None:
+        if not await _check_admin(ctx):
+            return
+
+        store = get_bot_context(ctx.bot).presentations
+        channel_id = store.get_channel_id(ctx.guild.id)
+        if channel_id is None:
+            await ctx.send(
+                "❌ Primero configura el canal con `.noah presentations setchannel <#canal>`."
+            )
+            return
+
+        completed_ids = store.get_completed_user_ids(ctx.guild.id)
+        members = sorted(
+            (member for member in ctx.guild.members if not member.bot),
+            key=lambda member: member.display_name.casefold(),
+        )
+        presented = [member for member in members if member.id in completed_ids]
+        missing = [member for member in members if member.id not in completed_ids]
+
+        presented_text, presented_truncated = _format_member_list(presented)
+        missing_text, missing_truncated = _format_member_list(missing)
+
+        embed = discord.Embed(
+            title="Presentaciones",
+            description=f"Canal: <#{channel_id}>",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name=f"✅ Presentados ({len(presented)})",
+            value=presented_text,
+            inline=True,
+        )
+        embed.add_field(
+            name=f"⏳ Sin presentar ({len(missing)})",
+            value=missing_text,
+            inline=True,
+        )
+
+        if presented_truncated or missing_truncated:
+            embed.set_footer(text="La lista completa va en el archivo adjunto.")
+            await ctx.send(
+                embed=embed,
+                file=_build_presentations_list_file(presented, missing),
+            )
+            return
+
+        await ctx.send(embed=embed)
+
+    @presentations.command()
+    async def show(ctx: commands.Context, member: discord.Member | None = None) -> None:
+        if ctx.guild is None:
+            await ctx.send("❌ Este comando solo funciona dentro de un servidor.")
+            return
+
+        target = member or ctx.author
+        store = get_bot_context(ctx.bot).presentations
+        channel_id = store.get_channel_id(ctx.guild.id)
+        if channel_id is None:
+            await ctx.send("❌ Todavía no hay un canal de presentaciones configurado.")
+            return
+
+        presentation: discord.Message | None = None
+        stored = store.get_presentation_message(ctx.guild.id, target.id)
+        if stored is not None:
+            presentation = await _fetch_presentation_message(ctx.guild, *stored)
+            if presentation is None:
+                store.forget_presentation_message(ctx.guild.id, target.id)
+
+        if presentation is None:
+            channel = ctx.guild.get_channel(channel_id)
+            if isinstance(channel, discord.TextChannel):
+                async with ctx.typing():
+                    presentation = await _search_presentation_message(channel, target.id)
+            if presentation is not None:
+                store.record_presentations(
+                    ctx.guild.id,
+                    {target.id: (presentation.channel.id, presentation.id)},
+                )
+
+        if presentation is None:
+            if store.has_completed(ctx.guild.id, target.id):
+                await ctx.send(
+                    f"ℹ️ {target.display_name} está marcado como presentado, pero no encuentro "
+                    f"su mensaje en <#{channel_id}>."
+                )
+                return
+
+            await ctx.send(
+                f"❌ {target.display_name} todavía no se ha presentado en <#{channel_id}>."
+            )
+            return
+
+        await ctx.send(
+            f"📜 Aquí tienes la presentación de {target.mention}: {presentation.jump_url}",
+            embed=_build_presentation_embed(target, presentation),
+            view=PresentationLinkView(presentation.jump_url),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
     @setchannel.error
     @complete.error
+    @show.error
     async def _presentations_argument_error(
         ctx: commands.Context,
         error: commands.CommandError,

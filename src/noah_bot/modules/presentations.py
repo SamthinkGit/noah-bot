@@ -89,6 +89,93 @@ class PresentationsStore:
             self._save()
         return added
 
+    def record_presentations(
+        self,
+        guild_id: int,
+        messages: dict[int, tuple[int, int]],
+    ) -> int:
+        """Marca como presentados a los autores y guarda su primer mensaje (canal, mensaje).
+
+        No sobreescribe mensajes ya guardados. Devuelve cuántos usuarios eran nuevos.
+        """
+        guild_data = self._guild_data(guild_id)
+        completed: list[str] = guild_data["completed_users"]
+        stored_messages = guild_data.get("presentation_messages")
+        if not isinstance(stored_messages, dict):
+            stored_messages = {}
+            guild_data["presentation_messages"] = stored_messages
+
+        known = set(completed)
+        added = 0
+        changed = False
+
+        for user_id, (channel_id, message_id) in messages.items():
+            user_key = str(user_id)
+            if user_key not in known:
+                completed.append(user_key)
+                known.add(user_key)
+                added += 1
+                changed = True
+
+            if user_key not in stored_messages:
+                stored_messages[user_key] = {
+                    "channel_id": str(channel_id),
+                    "message_id": str(message_id),
+                }
+                changed = True
+
+        if changed:
+            self._save()
+        return added
+
+    def get_presentation_message(
+        self,
+        guild_id: int,
+        user_id: int,
+    ) -> tuple[int, int] | None:
+        guild_data = self._guilds.get(str(guild_id))
+        if not isinstance(guild_data, dict):
+            return None
+
+        stored_messages = guild_data.get("presentation_messages")
+        if not isinstance(stored_messages, dict):
+            return None
+
+        payload = stored_messages.get(str(user_id))
+        if not isinstance(payload, dict):
+            return None
+
+        try:
+            return int(payload["channel_id"]), int(payload["message_id"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def forget_presentation_message(self, guild_id: int, user_id: int) -> None:
+        guild_data = self._guilds.get(str(guild_id))
+        if not isinstance(guild_data, dict):
+            return
+
+        stored_messages = guild_data.get("presentation_messages")
+        if isinstance(stored_messages, dict) and stored_messages.pop(str(user_id), None):
+            self._save()
+
+    def get_completed_user_ids(self, guild_id: int) -> set[int]:
+        guild_data = self._guilds.get(str(guild_id))
+        if not isinstance(guild_data, dict):
+            return set()
+
+        completed = guild_data.get("completed_users")
+        if not isinstance(completed, list):
+            return set()
+
+        user_ids: set[int] = set()
+        for user_key in completed:
+            try:
+                user_ids.add(int(user_key))
+            except (TypeError, ValueError):
+                continue
+        return user_ids
+
     def completed_count(self, guild_id: int) -> int:
         guild_data = self._guilds.get(str(guild_id))
         if not isinstance(guild_data, dict):
