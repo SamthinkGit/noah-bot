@@ -5,7 +5,7 @@ from contextlib import suppress
 import discord
 from discord.ext import commands
 
-from noah_bot.modules.bot_context import get_bot_context
+from noah_bot.modules.bot_context import get_bot_context, is_guard_active
 
 
 PRESENTATION_NOTICE_DELETE_AFTER = 20
@@ -234,6 +234,9 @@ def register_presentations_commands(bot: commands.Bot, noah_group: commands.Grou
     @bot.listen("on_message")
     async def _handle_presentations(message: discord.Message) -> None:
         if message.author.bot or message.guild is None:
+            return
+
+        if is_guard_active(bot, message.guild.id):
             return
 
         store = get_bot_context(bot).presentations

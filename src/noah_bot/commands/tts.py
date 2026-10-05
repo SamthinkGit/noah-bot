@@ -7,7 +7,7 @@ import tempfile
 import discord
 from discord.ext import commands
 
-from noah_bot.modules.bot_context import get_bot_context
+from noah_bot.modules.bot_context import get_bot_context, is_guard_active
 from noah_bot.modules.discord_formatter import EmbedTable
 from noah_bot.modules.tts import text_to_speech
 
@@ -209,6 +209,9 @@ def register_tts_commands(bot: commands.Bot, noah_group: commands.Group) -> None
         after: discord.VoiceState,
     ) -> None:
         guild = member.guild
+        if is_guard_active(bot, guild.id):
+            return
+
         context = get_bot_context(bot)
         active_voice = context.tts_voices.get_active_voice()
         tracked_channel_id = context.tts_greet_sessions.get(guild.id)

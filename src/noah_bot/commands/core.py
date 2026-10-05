@@ -7,7 +7,7 @@ import discord
 from discord.ext import commands
 from rich import inspect
 
-from noah_bot.modules.bot_context import get_bot_context
+from noah_bot.modules.bot_context import get_bot_context, is_guard_active
 from noah_bot.modules.discord_formatter import WaifuClaimFormatter
 from noah_bot.modules.send_message import send_message
 from noah_bot.modules.jarvis import create_jarvis_gif
@@ -135,6 +135,9 @@ def register_core_commands(bot: commands.Bot) -> None:
             await bot.process_commands(message)
             return
 
+        if message.guild is not None and is_guard_active(bot, message.guild.id):
+            return
+
         match = CLAIM_REGEX.search(message.content)
         if not match:
             await bot.process_commands(message)
@@ -190,6 +193,9 @@ def register_core_commands(bot: commands.Bot) -> None:
 
         message = reaction.message
         if bot.user is None or message.author.id != bot.user.id:
+            return
+
+        if message.guild is not None and is_guard_active(bot, message.guild.id):
             return
 
         context = get_bot_context(bot)

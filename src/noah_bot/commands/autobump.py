@@ -13,12 +13,15 @@ from noah_bot.modules.autobump import (
     random_bump_delay,
     seconds_until,
 )
-from noah_bot.modules.bot_context import get_bot_context
+from noah_bot.modules.bot_context import get_bot_context, is_guard_active
 from noah_bot.modules.slash_command import (
     SlashCommandError,
     resolve_application_command,
     trigger_slash_command,
 )
+
+
+GUARD_PAUSE_SECONDS = 300
 
 
 def _build_autobump_help_embed() -> discord.Embed:
@@ -119,6 +122,10 @@ async def _autobump_loop(bot: commands.Bot, guild_id: int) -> None:
         config = context.autogami_tokens.get_autobump(guild_id)
         if config is None:
             return
+
+        if is_guard_active(bot, guild_id):
+            await asyncio.sleep(GUARD_PAUSE_SECONDS)
+            continue
 
         channel_id = config["channel_id"]
         user_id = config["user_id"]

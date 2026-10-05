@@ -5,7 +5,7 @@ from typing import Optional
 import discord
 from discord.ext import commands
 
-from noah_bot.modules.bot_context import get_bot_context
+from noah_bot.modules.bot_context import get_bot_context, is_guard_active
 from noah_bot.modules.discord_formatter import with_delete_button
 from noah_bot.modules.relics_game import (
     LINK_COOLDOWN_SECONDS,
@@ -376,6 +376,9 @@ async def _dispatch_link_alert(
 ) -> bool:
     channel = await _resolve_alert_channel(bot, alert.get("channel_id"))
     if channel is None:
+        return False
+
+    if is_guard_active(bot, getattr(getattr(channel, "guild", None), "id", None)):
         return False
 
     try:

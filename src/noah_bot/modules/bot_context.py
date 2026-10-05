@@ -7,6 +7,7 @@ from noah_bot.modules.ai import AiResponder
 from noah_bot.modules.autogami import AutogamiTokenStore
 from noah_bot.modules.daily_stats import DailyStatsManager
 from noah_bot.modules.discord_formatter import UserEmojiManager
+from noah_bot.modules.guard import GuardStore
 from noah_bot.modules.leaderboard import Leaderboard
 from noah_bot.modules.noah_gochi import NoahGochiManager
 from noah_bot.modules.noah_gochi_ai import NoahGochiStoryService
@@ -33,6 +34,7 @@ class BotContext:
     voice_manager: VoiceManager = field(default_factory=VoiceManager)
     tts_voices: TTSVoiceStore = field(default_factory=TTSVoiceStore)
     presentations: PresentationsStore = field(default_factory=PresentationsStore)
+    guard: GuardStore = field(default_factory=GuardStore)
     waifu_manager: WaifuGameManager = field(
         default_factory=lambda: WaifuGameManager(json_path="waifu_game.json")
     )
@@ -67,3 +69,10 @@ def get_bot_context(bot: commands.Bot) -> BotContext:
     if context is None:
         raise RuntimeError("Bot context has not been initialized.")
     return context
+
+
+def is_guard_active(bot: commands.Bot, guild_id: int | None) -> bool:
+    """Indica si el protocolo de contingencia está activo en el servidor."""
+    if guild_id is None:
+        return False
+    return get_bot_context(bot).guard.is_active(guild_id)

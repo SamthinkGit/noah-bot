@@ -7,7 +7,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
-from noah_bot.modules.bot_context import get_bot_context
+from noah_bot.modules.bot_context import get_bot_context, is_guard_active
 from noah_bot.modules.discord_formatter import (
     _parse_embed_metadata,
     build_loading_embed,
@@ -1113,7 +1113,7 @@ async def _run_autogami_v(ctx: commands.Context, values: tuple[str, ...]) -> Non
 def register_autogami_commands(bot: commands.Bot, noah_group: commands.Group) -> None:
     @bot.listen("on_message")
     async def _handle_autogami_chest_spawn(message: discord.Message) -> None:
-        if message.guild is None:
+        if message.guild is None or is_guard_active(bot, message.guild.id):
             return
 
         chest_embed = _find_chest_embed(message)
@@ -1142,6 +1142,9 @@ def register_autogami_commands(bot: commands.Bot, noah_group: commands.Group) ->
         user: discord.User | discord.Member,
     ) -> None:
         if user.bot or reaction.message.guild is None:
+            return
+
+        if is_guard_active(bot, reaction.message.guild.id):
             return
 
         context = get_bot_context(bot)
