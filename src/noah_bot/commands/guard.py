@@ -5,6 +5,7 @@ import math
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 import discord
@@ -13,11 +14,13 @@ from discord.ext import commands
 from noah_bot.modules.bot_context import get_bot_context
 from noah_bot.modules.guard import (
     MASS_MENTION_PATTERN,
-    OVERWRITE_MEMBER,
+    Overwrite,
     OverwriteChange,
     account_age_days,
+    is_channel_exposed,
     plan_channel_lockdown,
     plan_restore,
+    read_overwrites,
     score_suspect,
 )
 
@@ -30,6 +33,9 @@ NOTICE_EVERY_MESSAGES = 50
 BLOCKED_REPLY_COOLDOWN_SECONDS = 60
 CHANNEL_CONCURRENCY = 4
 PROGRESS_EDIT_INTERVAL_SECONDS = 3.0
+VERIFY_DELAY_SECONDS = 2.0
+AUDIT_LOG_DELAY_SECONDS = 2.0
+AUDIT_LOG_WINDOW_SECONDS = 60
 DEFAULT_SUSPECT_SCORE = 5
 LIST_PREVIEW_LIMIT = 15
 FIELD_LIMIT = 1024
@@ -44,6 +50,9 @@ FOOTER = "Noah Guard"
 REQUIRED_PERMISSIONS = (
     ("manage_channels", "Gestionar canales"),
     ("manage_roles", "Gestionar permisos"),
+)
+ONBOARDING_PERMISSIONS = (
+    ("manage_guild", "Gestionar servidor (pausar el Onboarding)"),
 )
 RECOMMENDED_PERMISSIONS = (
     ("administrator", "Administrador (recomendado para editar cualquier canal)"),
@@ -66,6 +75,7 @@ _guild_locks: dict[int, asyncio.Lock] = {}
 _drill_tasks: dict[int, asyncio.Task] = {}
 _blocked_replies: dict[tuple[int, int], float] = {}
 _mass_mention_handled: dict[int, set[int]] = {}
+_restoring_guilds: set[int] = set()
 
 
 def _lock_for(guild_id: int) -> asyncio.Lock:
@@ -440,6 +450,121 @@ async def _edit_overwrite(
     )
 
 
+async def _patch_overwrites(
+    bot: commands.Bot,
+    channel_id: int,
+    desired: dict[int, Overwrite],
+    reason: str,
+) -> None:
+    """Reemplaza todos los permisos del canal en una única llamada a la API."""
+    await bot.http.edit_channel(
+        channel_id,
+        reason=reason,
+        permission_overwrites=[
+            {
+                "id": target_id,
+                "type": overwrite.target_type,
+                "allow": str(overwrite.allow),
+                "deny": str(overwrite.deny),
+            }
+            for target_id, overwrite in desired.items()
+        ],
+    )
+
+
+async def _pause_onboarding(
+    bot: commands.Bot,
+    guild: discord.Guild,
+    reason: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Desactiva el Onboarding si está activo y devuelve lo necesario para restaurarlo.
+
+    Discord protege los canales por defecto del Onboarding, así que mientras está
+    activo esos canales pueden seguir siendo visibles para @everyone.
+    """
+    try:
+        data = await bot.http.get_guild_onboarding(guild.id)
+    except discord.HTTPException:
+        return None, None
+    if not data.get("enabled"):
+        return None, None
+
+    snapshot = {
+        "default_channel_ids": [str(cid) for cid in data.get("default_channel_ids", [])],
+        "mode": int(data.get("mode", 0)),
+    }
+    try:
+        await bot.http.edit_guild_onboarding(guild.id, enabled=False, reason=reason)
+    except discord.HTTPException as exc:
+        return None, str(exc)
+    return snapshot, None
+
+
+async def _resume_onboarding(
+    bot: commands.Bot,
+    guild: discord.Guild,
+    snapshot: dict[str, Any],
+    reason: str,
+) -> str | None:
+    try:
+        await bot.http.edit_guild_onboarding(
+            guild.id,
+            enabled=True,
+            default_channel_ids=snapshot["default_channel_ids"],
+            mode=snapshot["mode"],
+            reason=reason,
+        )
+    except discord.HTTPException as exc:
+        return str(exc)
+    return None
+
+
+async def _find_exposed_channels(
+    guild: discord.Guild,
+    channel_ids: set[int],
+    exempt_role_ids: set[int],
+    exempt_member_ids: set[int],
+) -> list[int] | None:
+    """Relee los canales desde la API y devuelve los que siguen visibles."""
+    try:
+        fresh = await guild.fetch_channels()
+    except discord.HTTPException:
+        return None
+    return [
+        channel.id
+        for channel in fresh
+        if channel.id in channel_ids
+        and is_channel_exposed(
+            read_overwrites(channel),
+            guild.id,
+            exempt_role_ids,
+            exempt_member_ids,
+        )
+    ]
+
+
+async def _find_overwrite_actor(
+    guild: discord.Guild,
+    channel_id: int,
+) -> discord.abc.User | None:
+    actions = {
+        discord.AuditLogAction.overwrite_create,
+        discord.AuditLogAction.overwrite_update,
+        discord.AuditLogAction.overwrite_delete,
+        discord.AuditLogAction.channel_update,
+    }
+    cutoff = discord.utils.utcnow() - timedelta(seconds=AUDIT_LOG_WINDOW_SECONDS)
+    try:
+        async for entry in guild.audit_logs(limit=25):
+            if entry.created_at < cutoff:
+                break
+            if entry.action in actions and getattr(entry.target, "id", None) == channel_id:
+                return entry.user
+    except discord.HTTPException:
+        pass
+    return None
+
+
 async def _create_temp_channels(
     guild: discord.Guild,
     reason: str,
@@ -515,9 +640,19 @@ async def _apply_lockdown(
         applied: list[OverwriteChange] = []
         async with semaphore:
             try:
+                channel = guild.get_channel(channel_id)
+                desired = read_overwrites(channel) if channel is not None else {}
                 for change in changes:
-                    await _edit_overwrite(bot, change, change.after, reason)
-                    applied.append(change)
+                    desired[change.target_id] = Overwrite(change.target_type, *change.after)
+                try:
+                    await _patch_overwrites(bot, channel_id, desired, reason)
+                    applied.extend(changes)
+                except discord.HTTPException:
+                    # Si Discord rechaza el reemplazo completo, se aplica ajuste a
+                    # ajuste en orden seguro: staff primero, @everyone al final.
+                    for change in changes:
+                        await _edit_overwrite(bot, change, change.after, reason)
+                        applied.append(change)
             except discord.HTTPException:
                 failed_channels.append(channel_id)
                 store.record_failed_channel(guild.id, channel_id)
@@ -616,6 +751,11 @@ async def _activate(ctx: commands.Context, *, drill: bool) -> None:
             exempt_bot_ids=exempt.bot_ids,
             drill_ends_at=drill_ends_at,
         )
+        store.update_session(
+            guild.id,
+            exempt_role_ids=[role.id for role in exempt.roles],
+            exempt_member_ids=sorted(exempt.member_ids),
+        )
         _mass_mention_handled.pop(guild.id, None)
 
         try:
@@ -646,6 +786,9 @@ async def _activate(ctx: commands.Context, *, drill: bool) -> None:
         except discord.HTTPException:
             pass
 
+        onboarding, onboarding_error = await _pause_onboarding(bot, guild, reason)
+        store.update_session(guild.id, onboarding=onboarding)
+
         try:
             plans = {
                 channel.id: plan_channel_lockdown(
@@ -673,6 +816,14 @@ async def _activate(ctx: commands.Context, *, drill: bool) -> None:
                 voice_channel,
                 reason,
             )
+            await asyncio.sleep(VERIFY_DELAY_SECONDS)
+            exposed = await _find_exposed_channels(
+                guild,
+                set(plans) - set(failed_channels),
+                {role.id for role in exempt.roles},
+                exempt.member_ids,
+            )
+            store.update_session(guild.id, unverified_channels=exposed or [])
         except Exception:
             _log.exception("Noah Guard: error al activar la contingencia")
             await status_message.edit(
@@ -716,6 +867,41 @@ async def _activate(ctx: commands.Context, *, drill: bool) -> None:
                 value=(
                     "No he podido ocultar estos canales; revisa mis permisos en ellos:\n"
                     + _clip_lines(names, FIELD_LIMIT - 80)
+                ),
+                inline=False,
+            )
+        if exposed:
+            summary.add_field(
+                name="Siguen visibles",
+                value=(
+                    "Discord ha aceptado los cambios, pero al comprobarlo estos canales "
+                    "siguen siendo visibles para los usuarios:\n"
+                    + _clip_lines([f"<#{channel_id}>" for channel_id in exposed], FIELD_LIMIT - 120)
+                ),
+                inline=False,
+            )
+        elif exposed is None:
+            summary.add_field(
+                name="Comprobación",
+                value="No he podido releer los canales para comprobar que han quedado ocultos.",
+                inline=False,
+            )
+        if onboarding is not None:
+            summary.add_field(
+                name="Onboarding",
+                value=(
+                    "El Onboarding del servidor se ha pausado para poder ocultar sus "
+                    "canales por defecto. Se reactivará al finalizar, con la misma "
+                    "configuración."
+                ),
+                inline=False,
+            )
+        elif onboarding_error:
+            summary.add_field(
+                name="Onboarding",
+                value=(
+                    "No he podido pausar el Onboarding; sus canales por defecto podrían "
+                    f"seguir visibles. Error de Discord: {onboarding_error[:300]}"
                 ),
                 inline=False,
             )
@@ -771,6 +957,33 @@ async def _revert_changes(
             return
 
         async with semaphore:
+            desired = read_overwrites(channel)
+            decided = 0
+            for change in channel_changes:
+                action, pair = plan_restore(channel, change)
+                if action == "restore" and pair is not None:
+                    desired[change.target_id] = Overwrite(change.target_type, *pair)
+                    decided += 1
+                elif action == "delete":
+                    desired.pop(change.target_id, None)
+                    decided += 1
+            if decided == 0:
+                kept += len(channel_changes)
+                return
+
+            try:
+                await _patch_overwrites(bot, channel_id, desired, reason)
+            except discord.NotFound:
+                kept += len(channel_changes)
+                return
+            except discord.HTTPException:
+                pass
+            else:
+                restored += decided
+                kept += len(channel_changes) - decided
+                return
+
+            # Si Discord rechaza el reemplazo completo, se restaura ajuste a ajuste.
             for index, change in enumerate(reversed(channel_changes)):
                 action, pair = plan_restore(channel, change)
                 try:
@@ -809,6 +1022,22 @@ async def _deactivate(
     actor = str(stopped_by) if stopped_by else "fin del simulacro"
     reason = f"Noah Guard: {'simulacro' if drill else 'contingencia'} finalizado ({actor})"
 
+    _restoring_guilds.add(guild.id)
+    try:
+        return await _restore_server(bot, guild, session, stopped_by, drill, reason)
+    finally:
+        _restoring_guilds.discard(guild.id)
+
+
+async def _restore_server(
+    bot: commands.Bot,
+    guild: discord.Guild,
+    session: dict[str, Any],
+    stopped_by: discord.abc.User | None,
+    drill: bool,
+    reason: str,
+) -> discord.Embed:
+    store = get_bot_context(bot).guard
     restored, kept, failed = await _revert_changes(
         bot,
         guild,
@@ -840,9 +1069,15 @@ async def _deactivate(
             with suppress(discord.HTTPException):
                 await channel.delete(reason=reason)
 
+    onboarding = session.get("onboarding")
+    onboarding_error = None
+    if onboarding:
+        onboarding_error = await _resume_onboarding(bot, guild, onboarding, reason)
+
     store.update_session(
         guild.id,
         pending_changes=[change.to_payload() for change in failed],
+        onboarding_pending=onboarding if onboarding_error else None,
     )
     store.end_session(guild.id, stopped_by.id if stopped_by else None)
 
@@ -854,7 +1089,7 @@ async def _deactivate(
     embed = _base_embed(
         "Simulacro finalizado" if drill else "Protocolo de contingencia finalizado",
         "Los canales temporales se han eliminado y los permisos han vuelto a su estado anterior.",
-        COLOR_OK if not failed else COLOR_DRILL,
+        COLOR_OK if not failed and not onboarding_error else COLOR_DRILL,
     )
     embed.add_field(
         name="Resumen",
@@ -872,11 +1107,32 @@ async def _deactivate(
         name="Permisos",
         value=(
             f"Ajustes restaurados: **{restored}**\n"
-            f"Ajustes conservados por cambios manuales del staff: **{kept}**\n"
+            f"Ajustes que alguien cambió durante la contingencia (se han respetado): **{kept}**\n"
             f"Usuarios devueltos a su canal de voz: **{returned}**"
+            + (
+                "\nOnboarding reactivado con su configuración anterior."
+                if onboarding and not onboarding_error
+                else ""
+            )
         ),
         inline=False,
     )
+    reexposed = session.get("reexposed", [])
+    if reexposed:
+        lines = [
+            f"<#{entry['channel_id']}> · "
+            + (
+                f"cambiado por <@{entry['actor_id']}>"
+                if entry.get("actor_id")
+                else "sin autor en el registro de auditoría"
+            )
+            for entry in reexposed
+        ]
+        embed.add_field(
+            name="Canales que se hicieron visibles durante la contingencia",
+            value=_clip_lines(lines),
+            inline=False,
+        )
     embed.add_field(
         name="Actividad registrada",
         value=(
@@ -896,6 +1152,15 @@ async def _deactivate(
             value=(
                 f"**{len(failed)}** ajustes de permisos no se han podido restaurar. "
                 "Usa `.noah guard retry` para reintentarlo."
+            ),
+            inline=False,
+        )
+    if onboarding_error:
+        embed.add_field(
+            name="Onboarding pendiente",
+            value=(
+                "No he podido reactivar el Onboarding. Usa `.noah guard retry` para "
+                f"reintentarlo. Error de Discord: {onboarding_error[:300]}"
             ),
             inline=False,
         )
@@ -979,7 +1244,8 @@ async def _dry_run(ctx: commands.Context) -> None:
         for member in channel.members
         if member.id not in exempt.member_ids
     )
-    estimated = max(3, math.ceil(len(all_changes) * 0.5 / CHANNEL_CONCURRENCY) + 2)
+    # Una llamada por canal; si Discord la rechaza se usa el método ajuste a ajuste.
+    estimated = max(3, math.ceil(len(affected) * 0.5 / CHANNEL_CONCURRENCY) + 2)
 
     embed = _base_embed(
         "Simulacro · Ensayo sin cambios",
@@ -1018,10 +1284,28 @@ async def _dry_run(ctx: commands.Context) -> None:
         inline=False,
     )
 
+    try:
+        onboarding = await ctx.bot.http.get_guild_onboarding(guild.id)
+    except discord.HTTPException:
+        onboarding = None
+    if onboarding is not None and onboarding.get("enabled"):
+        defaults = [f"<#{cid}>" for cid in onboarding.get("default_channel_ids", [])]
+        embed.add_field(
+            name="Onboarding",
+            value=(
+                f"Activo, con **{len(defaults)}** canales por defecto. Discord protege esos "
+                "canales, así que se pausará durante la contingencia y se reactivará al "
+                "finalizar con la misma configuración."
+            ),
+            inline=False,
+        )
+    elif onboarding is not None:
+        embed.add_field(name="Onboarding", value="Inactivo, no hay que pausarlo.", inline=False)
+
     checks = [
         f"{'Correcto' if my_perms.administrator or getattr(my_perms, perm) else 'Falta'}"
         f" · {label}"
-        for perm, label in (*REQUIRED_PERMISSIONS, *RECOMMENDED_PERMISSIONS)
+        for perm, label in (*REQUIRED_PERMISSIONS, *ONBOARDING_PERMISSIONS, *RECOMMENDED_PERMISSIONS)
     ]
     embed.add_field(name="Permisos de Noah", value="\n".join(checks), inline=False)
 
@@ -1786,6 +2070,61 @@ def register_guard_commands(bot: commands.Bot, noah_group: commands.Group) -> No
             return
         await _handle_mass_mention(bot, after, session)
 
+    @bot.listen("on_guild_channel_update")
+    async def _guard_on_channel_update(
+        before: discord.abc.GuildChannel,
+        after: discord.abc.GuildChannel,
+    ) -> None:
+        guild = after.guild
+        store = get_bot_context(bot).guard
+        session = store.get_session(guild.id)
+        if session is None or not session.get("active") or guild.id in _restoring_guilds:
+            return
+        if after.id in (session.get("text_channel_id"), session.get("voice_channel_id")):
+            return
+
+        exempt_role_ids = set(session.get("exempt_role_ids", []))
+        exempt_member_ids = set(session.get("exempt_member_ids", []))
+        was_exposed = is_channel_exposed(
+            read_overwrites(before), guild.id, exempt_role_ids, exempt_member_ids
+        )
+        now_exposed = is_channel_exposed(
+            read_overwrites(after), guild.id, exempt_role_ids, exempt_member_ids
+        )
+        if was_exposed or not now_exposed:
+            return
+
+        # El registro de auditoría tarda un poco en reflejar el cambio.
+        await asyncio.sleep(AUDIT_LOG_DELAY_SECONDS)
+        actor = await _find_overwrite_actor(guild, after.id)
+        if actor is not None and bot.user is not None and actor.id == bot.user.id:
+            return
+
+        store.record_reexposure(
+            guild.id,
+            after.id,
+            actor.id if actor else None,
+            str(actor) if actor else None,
+        )
+        embed = _base_embed(
+            "Canal visible durante la contingencia",
+            (
+                f"{after.mention} vuelve a ser visible para los usuarios.\n"
+                + (
+                    f"Cambio realizado por: {actor.mention}"
+                    if actor
+                    else "No aparece ningún autor en el registro de auditoría; "
+                    "probablemente lo ha cambiado Discord de forma automática."
+                )
+                + "\nNoah no lo ha vuelto a ocultar. Revísalo manualmente si es necesario."
+            ),
+            COLOR_DRILL,
+        )
+        channel = guild.get_channel(session.get("origin_channel_id") or 0)
+        if isinstance(channel, discord.abc.Messageable):
+            with suppress(discord.HTTPException):
+                await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
     @bot.listen("on_member_join")
     async def _guard_on_member_join(member: discord.Member) -> None:
         get_bot_context(bot).guard.record_join(member)
@@ -1886,36 +2225,46 @@ def register_guard_commands(bot: commands.Bot, noah_group: commands.Group) -> No
                 OverwriteChange.from_payload(payload)
                 for payload in session.get("pending_changes", [])
             ]
-            if not pending:
+            onboarding = session.get("onboarding_pending")
+            if not pending and not onboarding:
                 await ctx.send(
                     embed=_base_embed(
                         "Noah Guard",
-                        "No hay ajustes de permisos pendientes de restaurar.",
+                        "No hay nada pendiente de restaurar.",
                         COLOR_OK,
                     )
                 )
                 return
 
-            restored, kept, failed = await _revert_changes(
-                ctx.bot,
-                ctx.guild,
-                pending,
-                f"Noah Guard: reintento de restauración por {ctx.author}",
+            reason = f"Noah Guard: reintento de restauración por {ctx.author}"
+            restored, kept, failed = await _revert_changes(ctx.bot, ctx.guild, pending, reason)
+            onboarding_error = (
+                await _resume_onboarding(ctx.bot, ctx.guild, onboarding, reason)
+                if onboarding
+                else None
             )
             store.update_session(
                 ctx.guild.id,
                 pending_changes=[change.to_payload() for change in failed],
+                onboarding_pending=onboarding if onboarding_error else None,
             )
 
+        lines = [
+            f"Ajustes restaurados: **{restored}**",
+            f"Ajustes que alguien cambió durante la contingencia (se han respetado): **{kept}**",
+            f"Siguen pendientes: **{len(failed)}**",
+        ]
+        if onboarding:
+            lines.append(
+                f"Onboarding: no se ha podido reactivar ({onboarding_error[:200]})"
+                if onboarding_error
+                else "Onboarding: reactivado con su configuración anterior"
+            )
         await ctx.send(
             embed=_base_embed(
                 "Restauración pendiente",
-                (
-                    f"Ajustes restaurados: **{restored}**\n"
-                    f"Conservados por cambios manuales: **{kept}**\n"
-                    f"Siguen pendientes: **{len(failed)}**"
-                ),
-                COLOR_OK if not failed else COLOR_DRILL,
+                "\n".join(lines),
+                COLOR_OK if not failed and not onboarding_error else COLOR_DRILL,
             )
         )
 
@@ -1947,10 +2296,18 @@ def register_guard_commands(bot: commands.Bot, noah_group: commands.Group) -> No
                 COLOR_INFO,
             )
             pending = len((session or {}).get("pending_changes", []))
-            if pending:
+            if pending or (session or {}).get("onboarding_pending"):
                 embed.add_field(
                     name="Pendiente",
-                    value=f"**{pending}** ajustes sin restaurar. Usa `.noah guard retry`.",
+                    value=(
+                        f"Ajustes sin restaurar: **{pending}**\n"
+                        + (
+                            "El Onboarding sigue pausado.\n"
+                            if (session or {}).get("onboarding_pending")
+                            else ""
+                        )
+                        + "Usa `.noah guard retry` para reintentarlo."
+                    ),
                     inline=False,
                 )
         else:
@@ -1972,10 +2329,28 @@ def register_guard_commands(bot: commands.Bot, noah_group: commands.Group) -> No
                 value=(
                     f"Ajustes de permisos aplicados: **{len(session.get('changes', []))}**\n"
                     f"Canales con incidencias: **{len(session.get('failed_channels', []))}**\n"
-                    f"Usuarios movidos de canal de voz: **{len(session.get('moved_members', {}))}**"
+                    f"Usuarios movidos de canal de voz: **{len(session.get('moved_members', {}))}**\n"
+                    f"Onboarding: **{'pausado' if session.get('onboarding') else 'sin cambios'}**"
                 ),
                 inline=False,
             )
+            visible = [
+                f"<#{channel_id}> · tras activar" for channel_id in session.get("unverified_channels", [])
+            ] + [
+                f"<#{entry['channel_id']}> · "
+                + (
+                    f"cambiado por <@{entry['actor_id']}>"
+                    if entry.get("actor_id")
+                    else "sin autor en el registro de auditoría"
+                )
+                for entry in session.get("reexposed", [])
+            ]
+            if visible:
+                embed.add_field(
+                    name="Canales visibles para los usuarios",
+                    value=_clip_lines(visible),
+                    inline=False,
+                )
             if session.get("drill") and session.get("drill_ends_at"):
                 embed.add_field(
                     name="Duración",

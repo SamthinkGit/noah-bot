@@ -237,6 +237,32 @@ def plan_channel_lockdown(
     return grants + strips + everyone_changes
 
 
+def is_channel_exposed(
+    overwrites: dict[int, Overwrite],
+    guild_id: int,
+    exempt_role_ids: set[int],
+    exempt_member_ids: set[int],
+) -> bool:
+    """Indica si un usuario sin privilegios podría ver el canal.
+
+    Un canal está oculto si @everyone tiene denegado "Ver canal" y ningún rol o
+    usuario fuera del staff exento lo tiene concedido.
+    """
+    everyone = overwrites.get(guild_id)
+    if everyone is None or not everyone.deny & VIEW_CHANNEL or everyone.allow & VIEW_CHANNEL:
+        return True
+
+    for target_id, overwrite in overwrites.items():
+        if target_id == guild_id or not overwrite.allow & VIEW_CHANNEL:
+            continue
+        exempt_ids = (
+            exempt_role_ids if overwrite.target_type == OVERWRITE_ROLE else exempt_member_ids
+        )
+        if target_id not in exempt_ids:
+            return True
+    return False
+
+
 def plan_restore(
     channel: discord.abc.GuildChannel,
     change: OverwriteChange,
@@ -490,6 +516,12 @@ class GuardStore:
             "text_channel_id": None,
             "voice_channel_id": None,
             "exempt_bot_ids": exempt_bot_ids,
+            "exempt_role_ids": [],
+            "exempt_member_ids": [],
+            "onboarding": None,
+            "onboarding_pending": None,
+            "unverified_channels": [],
+            "reexposed": [],
             "changes": [],
             "failed_channels": [],
             "moved_members": {},
@@ -531,6 +563,26 @@ class GuardStore:
         if session is None:
             return
         session["failed_channels"].append(channel_id)
+        self.save()
+
+    def record_reexposure(
+        self,
+        guild_id: int,
+        channel_id: int,
+        actor_id: int | None,
+        actor_name: str | None,
+    ) -> None:
+        session = self.get_session(guild_id)
+        if session is None:
+            return
+        session.setdefault("reexposed", []).append(
+            {
+                "channel_id": channel_id,
+                "actor_id": actor_id,
+                "actor_name": actor_name,
+                "at": time.time(),
+            }
+        )
         self.save()
 
     def record_moved_member(self, guild_id: int, member_id: int, channel_id: int) -> None:
