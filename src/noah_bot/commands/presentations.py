@@ -6,6 +6,7 @@ import discord
 from discord.ext import commands
 
 from noah_bot.modules.bot_context import get_bot_context, is_guard_active
+from noah_bot.modules.presentations import PresentationsStore
 
 
 PRESENTATION_NOTICE_DELETE_AFTER = 20
@@ -142,7 +143,34 @@ async def _search_presentation_message(
     return None
 
 
-def _build_presentation_embed(
+async def find_presentation(
+    store: PresentationsStore,
+    guild: discord.Guild,
+    user_id: int,
+) -> discord.Message | None:
+    """Busca la presentación guardada del usuario o, si falta, la busca en el historial."""
+    stored = store.get_presentation_message(guild.id, user_id)
+    if stored is not None:
+        presentation = await _fetch_presentation_message(guild, *stored)
+        if presentation is not None:
+            return presentation
+        store.forget_presentation_message(guild.id, user_id)
+
+    channel_id = store.get_channel_id(guild.id)
+    channel = guild.get_channel(channel_id) if channel_id is not None else None
+    if not isinstance(channel, discord.TextChannel):
+        return None
+
+    presentation = await _search_presentation_message(channel, user_id)
+    if presentation is not None:
+        store.record_presentations(
+            guild.id,
+            {user_id: (presentation.channel.id, presentation.id)},
+        )
+    return presentation
+
+
+def build_presentation_embed(
     member: discord.Member,
     presentation: discord.Message,
 ) -> discord.Embed:
@@ -449,23 +477,8 @@ def register_presentations_commands(bot: commands.Bot, noah_group: commands.Grou
             await ctx.send("❌ Todavía no hay un canal de presentaciones configurado.")
             return
 
-        presentation: discord.Message | None = None
-        stored = store.get_presentation_message(ctx.guild.id, target.id)
-        if stored is not None:
-            presentation = await _fetch_presentation_message(ctx.guild, *stored)
-            if presentation is None:
-                store.forget_presentation_message(ctx.guild.id, target.id)
-
-        if presentation is None:
-            channel = ctx.guild.get_channel(channel_id)
-            if isinstance(channel, discord.TextChannel):
-                async with ctx.typing():
-                    presentation = await _search_presentation_message(channel, target.id)
-            if presentation is not None:
-                store.record_presentations(
-                    ctx.guild.id,
-                    {target.id: (presentation.channel.id, presentation.id)},
-                )
+        async with ctx.typing():
+            presentation = await find_presentation(store, ctx.guild, target.id)
 
         if presentation is None:
             if store.has_completed(ctx.guild.id, target.id):
@@ -482,7 +495,7 @@ def register_presentations_commands(bot: commands.Bot, noah_group: commands.Grou
 
         await ctx.send(
             f"📜 Aquí tienes la presentación de {target.mention}: {presentation.jump_url}",
-            embed=_build_presentation_embed(target, presentation),
+            embed=build_presentation_embed(target, presentation),
             view=PresentationLinkView(presentation.jump_url),
             allowed_mentions=discord.AllowedMentions.none(),
         )

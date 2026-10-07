@@ -210,6 +210,31 @@ def with_delete_button():
     return decorator
 
 
+def build_quote_embed(
+    user: discord.Member | discord.User,
+    quoted_message: discord.Message,
+) -> discord.Embed:
+    """Embed de cita usado por `.noah quote` y `.noah rrpp quote`."""
+    created_at = quoted_message.created_at.strftime("%d/%m/%Y")
+    embed_color = (
+        user.color
+        if isinstance(user, discord.Member) and user.color.value
+        else discord.Color.from_rgb(245, 187, 87)
+    )
+
+    quoted_lines = "\n".join(
+        f"> {line}" if line.strip() else ">"
+        for line in quoted_message.content.strip().splitlines()
+    )
+
+    embed = discord.Embed(
+        description=f"{quoted_lines}\n\n*{user.mention} - {created_at}*",
+        color=embed_color,
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+    return embed
+
+
 class EmbedTable:
     """
     Render tables in Discord using embeds.

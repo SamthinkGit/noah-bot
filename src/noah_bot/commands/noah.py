@@ -12,6 +12,7 @@ from noah_bot.commands.gochi import register_gotchi_commands
 from noah_bot.commands.guard import register_guard_commands
 from noah_bot.commands.presentations import register_presentations_commands
 from noah_bot.commands.relics import register_relics_commands
+from noah_bot.commands.rrpp import register_rrpp_commands
 from noah_bot.commands.spotify import register_spotify_commands
 from noah_bot.commands.tts import register_tts_commands
 from noah_bot.commands.vc_stats import register_vc_stats_commands
@@ -25,6 +26,7 @@ from noah_bot.modules.discord_formatter import (
     RARITY_DISPLAY,
     RARITY_SYMBOLS,
     _parse_embed_metadata,
+    build_quote_embed,
     render_embeds_to_png,
 )
 
@@ -282,6 +284,9 @@ def register_noah_commands(bot: commands.Bot) -> None:
             [".noah guard help", "Protocolo de contingencia ante raids (solo staff)."]
         )
         chart.add_row(
+            [".noah rrpp help", "Mensajes con aviso a los RRPP (solo admins)."]
+        )
+        chart.add_row(
             [".waifuracer setemoji <emoji>", "Set your claim reaction emoji."]
         )
         chart.add_row([".waifuracer help", "Show waifuracer commands."])
@@ -486,25 +491,7 @@ def register_noah_commands(bot: commands.Bot) -> None:
             await ctx.send("❌ The replied message has no text content to quote.")
             return
 
-        created_at = replied_msg.created_at.strftime("%d/%m/%Y")
-        embed_color = (
-            user.color
-            if isinstance(user, discord.Member) and user.color.value
-            else discord.Color.from_rgb(245, 187, 87)
-        )
-
-        quoted_lines = "\n".join(
-            f"> {line}" if line.strip() else ">"
-            for line in content.splitlines()
-        )
-
-        embed = discord.Embed(
-            description=f"{quoted_lines}\n\n*{user.mention} - {created_at}*",
-            color=embed_color,
-        )
-        embed.set_thumbnail(url=user.display_avatar.url)
-
-        sent_message = await ctx.send(embed=embed)
+        sent_message = await ctx.send(embed=build_quote_embed(user, replied_msg))
 
         try:
             await ctx.message.delete()
@@ -675,3 +662,4 @@ def register_noah_commands(bot: commands.Bot) -> None:
     register_vc_stats_commands(bot, noah)
     register_presentations_commands(bot, noah)
     register_guard_commands(bot, noah)
+    register_rrpp_commands(bot, noah)
