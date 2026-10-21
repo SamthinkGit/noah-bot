@@ -5,6 +5,7 @@ from discord.ext import commands
 
 from noah_bot.modules.ai import AiResponder
 from noah_bot.modules.autogami import AutogamiTokenStore
+from noah_bot.modules.confessions import ConfessionsStore
 from noah_bot.modules.daily_stats import DailyStatsManager
 from noah_bot.modules.discord_formatter import UserEmojiManager
 from noah_bot.modules.guard import GuardStore
@@ -37,6 +38,7 @@ class BotContext:
     presentations: PresentationsStore = field(default_factory=PresentationsStore)
     guard: GuardStore = field(default_factory=GuardStore)
     rrpp: RrppStore = field(default_factory=RrppStore)
+    confessions: ConfessionsStore = field(default_factory=ConfessionsStore)
     waifu_manager: WaifuGameManager = field(
         default_factory=lambda: WaifuGameManager(json_path="waifu_game.json")
     )
