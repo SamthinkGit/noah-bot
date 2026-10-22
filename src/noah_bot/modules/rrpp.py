@@ -7,6 +7,8 @@ from typing import Any
 DEFAULT_RRPP_EMOJI = "📩"
 POINTS_PER_LEVEL = 5
 CLAIM_POINTS = {"greeting": 1, "presentation": 1, "vc": 3}
+# Punto extra por claim si el usuario había pedido ayuda reaccionando a una cita RRPP.
+HELP_BONUS_POINTS = 1
 CLAIM_ACCEPTED = "accepted"
 CLAIM_REJECTED = "rejected"
 
@@ -46,7 +48,7 @@ class RrppStore:
 
     def _guild_data(self, guild_id: int) -> dict[str, Any]:
         guild_data = self._guilds.setdefault(str(guild_id), {})
-        for key in ("messages", "claims", "announced_levels"):
+        for key in ("messages", "claims", "announced_levels", "help_users"):
             if not isinstance(guild_data.get(key), dict):
                 guild_data[key] = {}
         return guild_data
@@ -165,8 +167,23 @@ class RrppStore:
             return False
 
         notified.append(user_key)
+        # Se guarda aparte para no perderlo cuando se desactive o borre la cita.
+        self._guild_data(guild_id)["help_users"].setdefault(user_key, time.time())
         self._save()
         return True
+
+    def has_requested_help(self, guild_id: int, user_id: int) -> bool:
+        user_key = str(user_id)
+        guild_data = self._guilds.get(str(guild_id))
+        help_users = guild_data.get("help_users") if isinstance(guild_data, dict) else None
+        if isinstance(help_users, dict) and user_key in help_users:
+            return True
+
+        return any(
+            isinstance(payload.get("notified_users"), list)
+            and user_key in payload["notified_users"]
+            for _, payload in self.list_messages(guild_id)
+        )
 
     def unmark_notified(self, guild_id: int, message_id: int, user_id: int) -> None:
         payload = self.get_message(guild_id, message_id)
@@ -186,6 +203,7 @@ class RrppStore:
         rrpp_id: int,
         target_id: int,
         claim_type: str,
+        help_bonus: bool = False,
         **details: Any,
     ) -> dict[str, Any]:
         guild_data = self._guild_data(guild_id)
@@ -197,7 +215,8 @@ class RrppStore:
             "rrpp_id": str(rrpp_id),
             "target_id": str(target_id),
             "type": claim_type,
-            "points": CLAIM_POINTS.get(claim_type, 0),
+            "points": CLAIM_POINTS.get(claim_type, 0) + (HELP_BONUS_POINTS if help_bonus else 0),
+            "help_bonus": help_bonus,
             "status": CLAIM_ACCEPTED,
             "created_at": time.time(),
             **details,

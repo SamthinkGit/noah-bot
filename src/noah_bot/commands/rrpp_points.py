@@ -12,6 +12,7 @@ from noah_bot.modules.rrpp import (
     CLAIM_ACCEPTED,
     CLAIM_POINTS,
     CLAIM_REJECTED,
+    HELP_BONUS_POINTS,
     POINTS_PER_LEVEL,
     RrppStore,
     level_for_points,
@@ -32,9 +33,11 @@ CLAIM_TYPES: dict[str, tuple[str, str]] = {
 MEDALS = ("🥇", "🥈", "🥉")
 
 
-def _claim_label(claim_type: str) -> str:
+def _claim_label(claim_type: str, points: int | None = None) -> str:
     name, emoji = CLAIM_TYPES.get(claim_type, (claim_type, "❔"))
-    return f"{emoji} {name} (+{CLAIM_POINTS.get(claim_type, 0)}p)"
+    if points is None:
+        points = CLAIM_POINTS.get(claim_type, 0)
+    return f"{emoji} {name} (+{points}p)"
 
 
 def _rrpp_role(guild: discord.Guild, store: RrppStore) -> discord.Role | None:
@@ -77,7 +80,7 @@ def _build_claim_embed(
 ) -> discord.Embed:
     rejected = claim.get("status") == CLAIM_REJECTED
     embed = discord.Embed(
-        title=_claim_label(str(claim.get("type"))),
+        title=_claim_label(str(claim.get("type")), int(claim.get("points", 0))),
         color=discord.Color.red() if rejected else discord.Color.green(),
     )
     embed.add_field(name="RRPP", value=f"<@{claim.get('rrpp_id')}>", inline=True)
@@ -104,6 +107,12 @@ def _build_claim_embed(
         embed.add_field(
             name="Presentación",
             value=f"[Ir a la presentación]({url})" if url else "No encuentro su mensaje.",
+            inline=False,
+        )
+    if claim.get("help_bonus"):
+        embed.add_field(
+            name="🆘 Pidió ayuda",
+            value=f"Reaccionó a una cita RRPP: +{HELP_BONUS_POINTS}p extra.",
             inline=False,
         )
     if claim.get("note"):
@@ -423,7 +432,12 @@ class RrppClaimView(discord.ui.View):
             details["form_message_id"] = str(self.message.id)
 
         claim = self.store.add_claim(
-            self.guild.id, self.rrpp.id, target.id, claim_type, **details
+            self.guild.id,
+            self.rrpp.id,
+            target.id,
+            claim_type,
+            help_bonus=self.store.has_requested_help(self.guild.id, target.id),
+            **details,
         )
         self.stop()
 
@@ -481,7 +495,8 @@ def _build_form_embed(rrpp: discord.Member, source: discord.Message | None) -> d
         value=(
             f"{_claim_label('greeting')}: responde con `.nrc` a tu propio saludo.\n"
             f"{_claim_label('presentation')}: el usuario ya está presentado.\n"
-            f"{_claim_label('vc')}: el usuario está ahora mismo en VC."
+            f"{_claim_label('vc')}: el usuario está ahora mismo en VC.\n"
+            f"🆘 +{HELP_BONUS_POINTS}p extra si el usuario pidió ayuda en una cita RRPP."
         ),
         inline=False,
     )
@@ -529,14 +544,13 @@ def _build_summary_embed(
 
     breakdown: list[str] = []
     for claim_type in CLAIM_TYPES:
-        accepted = sum(
-            1
+        accepted = [
+            claim
             for claim in claims
             if claim.get("type") == claim_type and claim.get("status") == CLAIM_ACCEPTED
-        )
-        breakdown.append(
-            f"{_claim_label(claim_type)}: `{accepted}` · `{accepted * CLAIM_POINTS[claim_type]}p`"
-        )
+        ]
+        gained = sum(int(claim.get("points", 0)) for claim in accepted)
+        breakdown.append(f"{_claim_label(claim_type)}: `{len(accepted)}` · `{gained}p`")
     rejected = sum(1 for claim in claims if claim.get("status") == CLAIM_REJECTED)
     if rejected:
         breakdown.append(f"❌ Rechazados: `{rejected}`")
@@ -585,7 +599,9 @@ def _build_guide_embed() -> discord.Embed:
         value=(
             f"{_claim_label('greeting')}: saludas a alguien por primera vez.\n"
             f"{_claim_label('presentation')}: alguien se presenta gracias a ti.\n"
-            f"{_claim_label('vc')}: alguien se mete a VC gracias a ti."
+            f"{_claim_label('vc')}: alguien se mete a VC gracias a ti.\n"
+            f"🆘 **+{HELP_BONUS_POINTS}p extra** en cada claim si ese usuario había pedido "
+            "ayuda reaccionando a una cita RRPP."
         ),
         inline=False,
     )
