@@ -256,6 +256,17 @@ class RrppStore:
                 return claim
         return None
 
+    def can_get_help_bonus(self, guild_id: int, rrpp_id: int, target_id: int) -> bool:
+        """El extra por pedir ayuda se da una sola vez por RRPP y usuario."""
+        if not self.has_requested_help(guild_id, target_id):
+            return False
+        return not any(
+            claim.get("target_id") == str(target_id)
+            and claim.get("help_bonus")
+            and claim.get("status") == CLAIM_ACCEPTED
+            for claim in self.list_claims(guild_id, rrpp_id)
+        )
+
     def is_source_used(self, guild_id: int, message_id: int) -> bool:
         return any(
             claim.get("source_message_id") == str(message_id)

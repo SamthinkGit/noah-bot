@@ -436,7 +436,7 @@ class RrppClaimView(discord.ui.View):
             self.rrpp.id,
             target.id,
             claim_type,
-            help_bonus=self.store.has_requested_help(self.guild.id, target.id),
+            help_bonus=self.store.can_get_help_bonus(self.guild.id, self.rrpp.id, target.id),
             **details,
         )
         self.stop()
@@ -496,7 +496,7 @@ def _build_form_embed(rrpp: discord.Member, source: discord.Message | None) -> d
             f"{_claim_label('greeting')}: responde con `.nrc` a tu propio saludo.\n"
             f"{_claim_label('presentation')}: el usuario ya está presentado.\n"
             f"{_claim_label('vc')}: el usuario está ahora mismo en VC.\n"
-            f"🆘 +{HELP_BONUS_POINTS}p extra si el usuario pidió ayuda en una cita RRPP."
+            f"🆘 +{HELP_BONUS_POINTS}p extra (una vez por usuario) si pidió ayuda en una cita RRPP."
         ),
         inline=False,
     )
@@ -600,8 +600,8 @@ def _build_guide_embed() -> discord.Embed:
             f"{_claim_label('greeting')}: saludas a alguien por primera vez.\n"
             f"{_claim_label('presentation')}: alguien se presenta gracias a ti.\n"
             f"{_claim_label('vc')}: alguien se mete a VC gracias a ti.\n"
-            f"🆘 **+{HELP_BONUS_POINTS}p extra** en cada claim si ese usuario había pedido "
-            "ayuda reaccionando a una cita RRPP."
+            f"🆘 **+{HELP_BONUS_POINTS}p extra**, una sola vez por usuario, si ese usuario "
+            "había pedido ayuda reaccionando a una cita RRPP."
         ),
         inline=False,
     )
