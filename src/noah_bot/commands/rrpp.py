@@ -13,9 +13,15 @@ from noah_bot.modules.rrpp import RrppStore
 SELECT_LIMIT = 25
 FIELD_LIMIT = 1024
 RRPP_COLOR = discord.Color.from_rgb(235, 69, 158)
+# Canales extra del sistema de puntos: (clave en el store, nombre, placeholder).
+EXTRA_CHANNELS = (
+    ("levels", "Canal de niveles", "Canal privado de subidas de nivel"),
+    ("logs", "Canal de logs", "Canal de logs de claims (admin)"),
+    ("spam", "Canal de claims", "Canal RRPP-spam de formularios"),
+)
 
 
-def _is_rrpp_admin(member: discord.abc.User) -> bool:
+def is_rrpp_admin(member: discord.abc.User) -> bool:
     return (
         isinstance(member, discord.Member)
         and member.guild_permissions.administrator
@@ -35,7 +41,7 @@ def _jump_url(guild_id: int, channel_id: Any, message_id: int) -> str:
     return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
 
 
-def _clip_lines(lines: list[str], empty: str) -> str:
+def clip_lines(lines: list[str], empty: str) -> str:
     if not lines:
         return empty
 
@@ -67,27 +73,45 @@ def _build_help_embed() -> discord.Embed:
     embed = discord.Embed(
         title="RRPP",
         description=(
-            "Publica citas con una reacción. Cuando alguien reacciona, se avisa a los "
-            "RRPP en su canal oculto para que puedan contactar con esa persona. "
-            "Solo administradores."
+            "Los RRPP reciben avisos cuando alguien reacciona a una cita RRPP y ganan "
+            "puntos por saludar, conseguir presentaciones y llevar gente al VC."
         ),
         color=RRPP_COLOR,
     )
     embed.add_field(
-        name=".noah rrpp",
-        value="Abre el panel: rol RRPP, canal de avisos, miembros RRPP, emoji y mensajes activos.",
+        name=".noah rrpp guide",
+        value="Explica cómo funcionan los puntos y los niveles.",
+        inline=False,
+    )
+    embed.add_field(
+        name=".noah rrpp claim · .nrc",
+        value="Reclama puntos. Para un saludo, úsalo respondiendo a tu propio mensaje.",
+        inline=False,
+    )
+    embed.add_field(
+        name=".noah rrpp summary [@user]",
+        value="Muestra tu nivel, tus puntos y tus últimos claims.",
+        inline=False,
+    )
+    embed.add_field(
+        name=".noah rrpp top",
+        value="Ranking de niveles de los RRPP.",
+        inline=False,
+    )
+    embed.add_field(
+        name=".noah rrpp config",
+        value=(
+            "[Admin] Panel: rol RRPP, miembros, emoji, mensajes activos y canales "
+            "(avisos, niveles, logs y claims)."
+        ),
         inline=False,
     )
     embed.add_field(
         name=".noah rrpp quote <@user>",
         value=(
-            "Respondiendo a un mensaje: lo cita como `.noah quote` y añade la reacción RRPP."
+            "[Admin] Respondiendo a un mensaje: lo cita como `.noah quote` y añade la "
+            "reacción RRPP."
         ),
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah rrpp help",
-        value="Muestra esta ayuda.",
         inline=False,
     )
     return embed
@@ -102,8 +126,8 @@ def _build_panel_embed(guild: discord.Guild, store: RrppStore) -> discord.Embed:
     embed = discord.Embed(
         title="Panel RRPP",
         description=(
-            "Elige el rol RRPP, el canal oculto de avisos y quién es RRPP. "
-            "El selector de miembros da o quita el rol (marca la lista completa)."
+            "Elige el rol RRPP y quién es RRPP. El selector de miembros da o quita el "
+            "rol (marca la lista completa). Los canales se configuran en **Canales**."
         ),
         color=RRPP_COLOR,
     )
@@ -118,12 +142,20 @@ def _build_panel_embed(guild: discord.Guild, store: RrppStore) -> discord.Embed:
         inline=True,
     )
     embed.add_field(name="Emoji", value=store.get_emoji(guild.id), inline=True)
+    for key, name, _ in EXTRA_CHANNELS:
+        extra_id = store.get_named_channel_id(guild.id, key)
+        extra = guild.get_channel(extra_id) if extra_id is not None else None
+        embed.add_field(
+            name=name,
+            value=extra.mention if extra is not None else "Sin configurar",
+            inline=True,
+        )
 
     if role is not None:
         members = sorted(role.members, key=lambda member: member.display_name.casefold())
         embed.add_field(
             name=f"RRPPs ({len(members)})",
-            value=_clip_lines([member.mention for member in members], "Nadie."),
+            value=clip_lines([member.mention for member in members], "Nadie."),
             inline=False,
         )
         problem = _role_problem(guild, role)
@@ -142,7 +174,7 @@ def _build_panel_embed(guild: discord.Guild, store: RrppStore) -> discord.Embed:
         )
     embed.add_field(
         name=f"Mensajes activos ({len(message_lines)})",
-        value=_clip_lines(message_lines, "Ninguno. Usa `.noah rrpp quote <@user>`."),
+        value=clip_lines(message_lines, "Ninguno. Usa `.noah rrpp quote <@user>`."),
         inline=False,
     )
     embed.set_footer(text="Cambiar el emoji solo afecta a los mensajes nuevos.")
@@ -245,18 +277,81 @@ class RrppEmojiModal(discord.ui.Modal, title="Emoji de la reacción RRPP"):
 
 
 class RrppPanelView(discord.ui.View):
-    def __init__(self, bot: commands.Bot, guild: discord.Guild, author_id: int) -> None:
+    def __init__(
+        self,
+        bot: commands.Bot,
+        guild: discord.Guild,
+        author_id: int,
+        page: str = "general",
+    ) -> None:
         super().__init__(timeout=300)
         self.bot = bot
         self.guild = guild
         self.author_id = author_id
+        self.page = page
         self.store = get_bot_context(bot).rrpp
         self.message: discord.Message | None = None
 
         role_id = self.store.get_role_id(guild.id)
         self.role = guild.get_role(role_id) if role_id is not None else None
-        channel_id = self.store.get_channel_id(guild.id)
+        self.shown_member_ids: set[int] = set()
 
+        if page == "channels":
+            self._add_channel_items()
+        else:
+            self._add_general_items()
+
+    def _add_button(self, label: str, callback: Any) -> None:
+        button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, row=4)
+        button.callback = callback
+        self.add_item(button)
+
+    def _add_channel_select(
+        self, channel_id: int | None, placeholder: str, row: int, callback: Any
+    ) -> None:
+        channel = self.guild.get_channel(channel_id) if channel_id is not None else None
+        select = discord.ui.ChannelSelect(
+            placeholder=placeholder,
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+            default_values=[channel] if channel is not None else [],
+            row=row,
+        )
+
+        async def _on_select(interaction: discord.Interaction) -> None:
+            await callback(interaction, select.values[0].id)
+
+        select.callback = _on_select
+        self.add_item(select)
+
+    def _add_channel_items(self) -> None:
+        self._add_channel_select(
+            self.store.get_channel_id(self.guild.id),
+            "Canal oculto de avisos",
+            0,
+            self._on_channel,
+        )
+        for row, (key, _, placeholder) in enumerate(EXTRA_CHANNELS, start=1):
+
+            async def _on_extra(
+                interaction: discord.Interaction, channel_id: int, key: str = key
+            ) -> None:
+                self.store.set_named_channel(self.guild.id, key, channel_id)
+                await self.refresh(interaction)
+
+            self._add_channel_select(
+                self.store.get_named_channel_id(self.guild.id, key),
+                placeholder,
+                row,
+                _on_extra,
+            )
+
+        self._add_button("Volver", self._show_general)
+        self._add_button("Cerrar", self._close)
+
+    def _add_general_items(self) -> None:
+        guild = self.guild
         self.role_select = discord.ui.RoleSelect(
             placeholder="Rol RRPP",
             min_values=1,
@@ -267,20 +362,7 @@ class RrppPanelView(discord.ui.View):
         self.role_select.callback = self._on_role
         self.add_item(self.role_select)
 
-        channel = guild.get_channel(channel_id) if channel_id is not None else None
-        self.channel_select = discord.ui.ChannelSelect(
-            placeholder="Canal oculto de avisos",
-            channel_types=[discord.ChannelType.text],
-            min_values=1,
-            max_values=1,
-            default_values=[channel] if channel is not None else [],
-            row=1,
-        )
-        self.channel_select.callback = self._on_channel
-        self.add_item(self.channel_select)
-
         # Solo se pueden quitar los que aparecen marcados por defecto en el selector.
-        self.shown_member_ids: set[int] = set()
         if self.role is not None:
             shown = sorted(
                 self.role.members, key=lambda member: member.display_name.casefold()
@@ -291,7 +373,7 @@ class RrppPanelView(discord.ui.View):
                 min_values=0,
                 max_values=SELECT_LIMIT,
                 default_values=shown,
-                row=2,
+                row=1,
             )
             self.member_select.callback = self._on_members
             self.add_item(self.member_select)
@@ -318,10 +400,14 @@ class RrppPanelView(discord.ui.View):
                 min_values=1,
                 max_values=1,
                 options=options,
-                row=3,
+                row=2,
             )
             self.message_select.callback = self._on_message_disable
             self.add_item(self.message_select)
+
+        self._add_button("Emoji", self._open_emoji)
+        self._add_button("Canales", self._show_channels)
+        self._add_button("Cerrar", self._close)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
@@ -332,8 +418,8 @@ class RrppPanelView(discord.ui.View):
             return False
         return True
 
-    async def refresh(self, interaction: discord.Interaction) -> None:
-        view = RrppPanelView(self.bot, self.guild, self.author_id)
+    async def refresh(self, interaction: discord.Interaction, page: str | None = None) -> None:
+        view = RrppPanelView(self.bot, self.guild, self.author_id, page or self.page)
         view.message = self.message
         self.stop()
         embed = _build_panel_embed(self.guild, self.store)
@@ -352,8 +438,8 @@ class RrppPanelView(discord.ui.View):
         self.store.set_role(self.guild.id, role.id)
         await self.refresh(interaction)
 
-    async def _on_channel(self, interaction: discord.Interaction) -> None:
-        self.store.set_channel(self.guild.id, self.channel_select.values[0].id)
+    async def _on_channel(self, interaction: discord.Interaction, channel_id: int) -> None:
+        self.store.set_channel(self.guild.id, channel_id)
         await self.refresh(interaction)
 
     async def _on_members(self, interaction: discord.Interaction) -> None:
@@ -415,14 +501,16 @@ class RrppPanelView(discord.ui.View):
 
         await self.refresh(interaction)
 
-    @discord.ui.button(label="Emoji", style=discord.ButtonStyle.secondary, row=4)
-    async def emoji(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
+    async def _open_emoji(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(RrppEmojiModal(self))
 
-    @discord.ui.button(label="Cerrar", style=discord.ButtonStyle.secondary, row=4)
-    async def close(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
+    async def _show_channels(self, interaction: discord.Interaction) -> None:
+        await self.refresh(interaction, "channels")
+
+    async def _show_general(self, interaction: discord.Interaction) -> None:
+        await self.refresh(interaction, "general")
+
+    async def _close(self, interaction: discord.Interaction) -> None:
         self.stop()
         await interaction.response.edit_message(view=None)
 
@@ -432,7 +520,7 @@ class RrppPanelView(discord.ui.View):
                 await self.message.edit(view=None)
 
 
-def register_rrpp_commands(bot: commands.Bot, noah_group: commands.Group) -> None:
+def register_rrpp_commands(bot: commands.Bot, noah_group: commands.Group) -> commands.Group:
     @bot.listen("on_raw_reaction_add")
     async def _handle_rrpp_reaction(payload: discord.RawReactionActionEvent) -> None:
         if payload.guild_id is None or bot.user is None or payload.user_id == bot.user.id:
@@ -483,7 +571,7 @@ def register_rrpp_commands(bot: commands.Bot, noah_group: commands.Group) -> Non
             await ctx.send("❌ Este comando solo funciona dentro de un servidor.")
             return False
 
-        if not _is_rrpp_admin(ctx.author):
+        if not is_rrpp_admin(ctx.author):
             await ctx.send("❌ Solo los administradores pueden usar este comando.")
             return False
 
@@ -491,16 +579,20 @@ def register_rrpp_commands(bot: commands.Bot, noah_group: commands.Group) -> Non
 
     @noah_group.group(invoke_without_command=True)
     async def rrpp(ctx: commands.Context) -> None:
+        await ctx.send(embed=_build_help_embed())
+
+    @rrpp.command()
+    async def help(ctx: commands.Context) -> None:
+        await ctx.send(embed=_build_help_embed())
+
+    @rrpp.command()
+    async def config(ctx: commands.Context) -> None:
         if not await _check_admin(ctx):
             return
 
         view = RrppPanelView(ctx.bot, ctx.guild, ctx.author.id)
         store = get_bot_context(ctx.bot).rrpp
         view.message = await ctx.send(embed=_build_panel_embed(ctx.guild, store), view=view)
-
-    @rrpp.command()
-    async def help(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_help_embed())
 
     @rrpp.command()
     async def quote(
@@ -518,7 +610,7 @@ def register_rrpp_commands(bot: commands.Bot, noah_group: commands.Group) -> Non
             or channel_id is None
             or ctx.guild.get_channel(channel_id) is None
         ):
-            await ctx.send("❌ Primero configura el rol y el canal RRPP con `.noah rrpp`.")
+            await ctx.send("❌ Primero configura el rol y el canal RRPP con `.noah rrpp config`.")
             return
 
         if user is None:
@@ -548,7 +640,7 @@ def register_rrpp_commands(bot: commands.Bot, noah_group: commands.Group) -> Non
             with suppress(discord.HTTPException):
                 await sent_message.delete()
             await ctx.send(
-                f"❌ No puedo reaccionar con {emoji}. Cambia el emoji en `.noah rrpp`."
+                f"❌ No puedo reaccionar con {emoji}. Cambia el emoji en `.noah rrpp config`."
             )
             return
 
@@ -563,3 +655,5 @@ def register_rrpp_commands(bot: commands.Bot, noah_group: commands.Group) -> Non
     async def _rrpp_quote_error(ctx: commands.Context, error: commands.CommandError) -> None:
         if isinstance(error, (commands.MemberNotFound, commands.UserNotFound)):
             await ctx.send(f"❌ {error}")
+
+    return rrpp
