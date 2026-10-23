@@ -585,55 +585,65 @@ def _build_top_embed(guild: discord.Guild, store: RrppStore) -> discord.Embed:
     )
 
 
-def _build_guide_embed() -> discord.Embed:
+def _build_guide_embed(spam: discord.TextChannel | None) -> discord.Embed:
+    spam_mention = spam.mention if spam is not None else "de claims RRPP"
     embed = discord.Embed(
         title="Guía RRPP",
         description=(
-            f"Ganas puntos ayudando a que la gente se integre. Cada `{POINTS_PER_LEVEL}` "
-            "puntos subes un nivel. Los niveles RRPP son independientes de los niveles de VC."
+            "Ayuda a que la gente se integre y gana puntos. "
+            f"Cada {POINTS_PER_LEVEL} puntos subes de nivel."
         ),
         color=RRPP_COLOR,
     )
     embed.add_field(
-        name="Qué puntúa",
+        name="¿Cuánto vale cada cosa?",
         value=(
-            f"{_claim_label('greeting')}: saludas a alguien por primera vez.\n"
-            f"{_claim_label('presentation')}: alguien se presenta gracias a ti.\n"
-            f"{_claim_label('vc')}: alguien se mete a VC gracias a ti.\n"
-            f"🆘 **+{HELP_BONUS_POINTS}p extra**, una sola vez por usuario, si ese usuario "
-            "había pedido ayuda reaccionando a una cita RRPP."
+            f"- 👋 Saludar a alguien por primera vez → {CLAIM_POINTS['greeting']}p\n"
+            f"- 📝 Conseguir que se presente → {CLAIM_POINTS['presentation']}p\n"
+            f"- 🎙️ Conseguir que entre a VC → {CLAIM_POINTS['vc']}p\n"
+            f"> Si esa persona había pedido ayuda → **+{HELP_BONUS_POINTS}p extra**"
         ),
         inline=False,
     )
     embed.add_field(
-        name="Cómo reclamar",
+        name="¿Cómo pido mis puntos?",
         value=(
-            "1. Escribe `.nrc` (o `.noah rrpp claim`). Tu comando se borra al instante.\n"
-            "2. Te llega un formulario al canal de claims RRPP.\n"
-            "3. Elige el tipo y el usuario, pulsa **Enviar** y añade una nota si quieres."
+            f"Escribe `.nrc` o `.noah rrpp claim` y te llegará al canal {spam_mention} "
+            "un formulario donde seleccionas el tipo de claim."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Claimear un Saludo",
+        value=(
+            "1. Saluda al usuario, por ejemplo: *\"¡Bienvenido @usuario!\"*.\n"
+            "2. Responde a **ese mensaje tuyo** con `.nrc`.\n"
+            "3. En el formulario, elige **Saludo** y el usuario."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Claimear una Presentación",
+        value=(
+            "- El usuario tiene que haberse presentado ya.\n"
+            "- Escribe `.nrc` y elige **Presentación** y el usuario."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Claimear un VC",
+        value=(
+            "- El usuario tiene que estar en VC **en ese momento**.\n"
+            "- Escribe `.nrc` y elige **VC** y el usuario."
         ),
         inline=False,
     )
     embed.add_field(
         name="Reglas",
         value=(
-            "• **Nunca etiquetes al usuario.** Para un saludo, usa `.nrc` respondiendo a "
-            "**tu propio** mensaje de bienvenida.\n"
-            "• Presentación: el usuario tiene que estar ya presentado.\n"
-            "• VC: reclama mientras el usuario sigue en el canal de voz.\n"
-            "• Solo un claim de cada tipo por usuario. Otros RRPP también pueden reclamar "
-            "por el mismo usuario.\n"
-            "• Los claims se aceptan al momento, pero un admin los revisa y puede "
-            "rechazarlos."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Comandos",
-        value=(
-            "`.noah rrpp summary` · tu nivel y tus claims\n"
-            "`.noah rrpp top` · ranking de RRPP\n"
-            "`.noah rrpp guide` · esta guía"
+            "- Solo un claim de cada tipo por usuario.\n"
+            "- Otros RRPP también pueden sumar por el mismo usuario.\n"
+            "- Un admin revisa los claims y puede rechazarlos."
         ),
         inline=False,
     )
@@ -741,4 +751,5 @@ def register_rrpp_points_commands(bot: commands.Bot, rrpp_group: commands.Group)
     async def guide(ctx: commands.Context) -> None:
         if not await _check_rrpp(ctx):
             return
-        await ctx.send(embed=_build_guide_embed())
+        store = get_bot_context(ctx.bot).rrpp
+        await ctx.send(embed=_build_guide_embed(_named_channel(ctx.guild, store, "spam")))
