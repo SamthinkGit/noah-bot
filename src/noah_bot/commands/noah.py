@@ -283,6 +283,10 @@ def register_noah_commands(bot: commands.Bot) -> None:
             [".noah presentations", "Obliga a presentarse (solo admins)."]
         )
         chart.add_row(
+            [".noah mute", "Mutea a todos en tu VC menos a ti (solo admins)."]
+        )
+        chart.add_row([".noah unmute", "Desmutea a todos en tu VC (solo admins)."])
+        chart.add_row(
             [".noah guard help", "Protocolo de contingencia ante raids (solo staff)."]
         )
         chart.add_row(
@@ -629,6 +633,55 @@ def register_noah_commands(bot: commands.Bot) -> None:
             message += f"\n⚠ Could not modify: {', '.join(failed)}"
 
         await ctx.send(message)
+
+    async def _set_vc_mute(ctx: commands.Context, mute: bool) -> None:
+        if ctx.guild is None or not isinstance(ctx.author, discord.Member):
+            await ctx.send("❌ Este comando solo funciona dentro de un servidor.")
+            return
+
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Solo los administradores pueden usar este comando.")
+            return
+
+        voice_state = ctx.author.voice
+        if voice_state is None or voice_state.channel is None:
+            await ctx.send("❌ Tienes que estar en un canal de voz.")
+            return
+
+        channel = voice_state.channel
+        targets = [
+            member
+            for member in channel.members
+            if member.id != ctx.author.id and member.voice.mute != mute
+        ]
+
+        async def _apply(member: discord.Member) -> bool:
+            try:
+                await member.edit(mute=mute)
+                return True
+            except (discord.Forbidden, discord.HTTPException):
+                return False
+
+        results = await asyncio.gather(*(_apply(member) for member in targets))
+        failed = [
+            member.display_name for member, ok in zip(targets, results) if not ok
+        ]
+        changed = len(targets) - len(failed)
+
+        emoji, action = ("🔇", "muteado") if mute else ("🔊", "desmuteado")
+        message = f"{emoji} {changed} usuario(s) {action}(s) en {channel.mention}."
+        if failed:
+            message += f"\n⚠ No se pudo modificar: {', '.join(failed)}"
+
+        await ctx.send(message)
+
+    @noah.command()
+    async def mute(ctx: commands.Context) -> None:
+        await _set_vc_mute(ctx, True)
+
+    @noah.command()
+    async def unmute(ctx: commands.Context) -> None:
+        await _set_vc_mute(ctx, False)
 
     @bot.listen("on_message")
     async def _handle_husbando_spawn_timer(message: discord.Message) -> None:
