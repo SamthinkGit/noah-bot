@@ -5,6 +5,7 @@ from io import BytesIO
 from typing import List
 import json
 from pathlib import Path
+from datetime import datetime
 from functools import wraps
 from typing import Optional
 import discord
@@ -215,7 +216,19 @@ def build_quote_embed(
     quoted_message: discord.Message,
 ) -> discord.Embed:
     """Embed de cita usado por `.noah quote` y `.noah rrpp quote`."""
-    created_at = quoted_message.created_at.strftime("%d/%m/%Y")
+    return build_quote_text_embed(
+        user,
+        quoted_message.content,
+        quoted_message.created_at,
+    )
+
+
+def build_quote_text_embed(
+    user: discord.Member | discord.User,
+    content: str,
+    created_at: datetime,
+) -> discord.Embed:
+    """Misma plantilla que `.noah quote`, pero a partir de un texto y una fecha."""
     embed_color = (
         user.color
         if isinstance(user, discord.Member) and user.color.value
@@ -224,11 +237,13 @@ def build_quote_embed(
 
     quoted_lines = "\n".join(
         f"> {line}" if line.strip() else ">"
-        for line in quoted_message.content.strip().splitlines()
+        for line in content.strip().splitlines()
     )
 
     embed = discord.Embed(
-        description=f"{quoted_lines}\n\n*{user.mention} - {created_at}*",
+        description=(
+            f"{quoted_lines}\n\n*{user.mention} - {created_at.strftime('%d/%m/%Y')}*"
+        ),
         color=embed_color,
     )
     embed.set_thumbnail(url=user.display_avatar.url)

@@ -1,3 +1,4 @@
+import asyncio
 import io
 import random
 from contextlib import suppress
@@ -6,8 +7,32 @@ import discord
 from discord.ext import commands
 
 from noah_bot.modules.bot_context import get_bot_context, is_guard_active
+from noah_bot.modules.discord_formatter import build_quote_text_embed
 from noah_bot.modules.presentations import PresentationsStore
 
+PRESENTATION_STICKY_BUTTON_ID = "presentations:sticky:introduce"
+PRESENTATION_STICKY_REPOST_DELAY = 2.0
+PRESENTATION_STICKY_TEXT = (
+    "¿Aún no te has presentado?\n"
+    "Pulsa aquí para agregar información sobre ti! <3"
+)
+# Cada campo termina en ": " y va separado por una línea en blanco.
+PRESENTATION_TEMPLATE = "\n\n".join(
+    f"{field} "
+    for field in (
+        "→ 𝙉𝙤𝙢𝙗𝙧𝙚 / 𝘼𝙥𝙤𝙙𝙤:",
+        "→ 𝙀𝙙𝙖𝙙:",
+        "→ 𝙎𝙚𝙭𝙤 (𝙊𝙥𝙘𝙞𝙤𝙣𝙖𝙡):",
+        "→ 𝘿𝙤𝙣𝙙𝙚 𝙫𝙞𝙫𝙚𝙨? (𝙊𝙥𝙘𝙞𝙤𝙣𝙖𝙡):",
+        "→ 𝙌𝙪𝙚 𝙝𝙖𝙘𝙚𝙨 𝙚𝙣 𝙩𝙪 𝙩𝙞𝙚𝙢𝙥𝙤 𝙡𝙞𝙗𝙧𝙚?:",
+        "→ 𝙌𝙪𝙚 𝙤𝙙𝙞𝙖𝙨?:",
+        "→ 𝙌𝙪𝙚 𝙗𝙪𝙨𝙘𝙖𝙨 𝙚𝙣 𝙚𝙨𝙩𝙚 𝙨𝙚𝙧𝙫𝙚𝙧?:",
+        "→ 𝙏𝙚 𝙜𝙪𝙨𝙩𝙖𝙧í𝙖 𝙦𝙪𝙚𝙙𝙖𝙧 𝙘𝙤𝙣 𝙡𝙤𝙨 𝙙𝙚𝙡 𝙨𝙚𝙧𝙫𝙚𝙧?:",
+        "→ 𝘾𝙪é𝙣𝙩𝙖𝙣𝙤𝙨 𝙖𝙡𝙜𝙤 𝙙𝙚 𝙩𝙞 (𝙊𝙥𝙘𝙞𝙤𝙣𝙖𝙡):",
+        "→ 𝑪𝒐𝒎𝒐 𝒏𝒐𝒔 𝒉𝒂𝒔 𝒄𝒐𝒏𝒐𝒄𝒊𝒅𝒐?:",
+        "→ 𝑭𝒊𝒓𝒎𝒂 (𝑷𝒐𝒏 𝒍𝒐 𝒒𝒖𝒆 𝒒𝒖𝒊𝒆𝒓𝒂𝒔):",
+    )
+)
 
 PRESENTATION_NOTICE_DELETE_AFTER = 20
 PRESENTATION_LIST_FIELD_LIMIT = 1024
@@ -64,6 +89,14 @@ def _build_presentations_help_embed() -> discord.Embed:
     embed.add_field(
         name=".noah presentations enable / disable",
         value="Activa o desactiva la obligación de presentarse.",
+        inline=False,
+    )
+    embed.add_field(
+        name=".noah presentations sticky on / off",
+        value=(
+            "Deja siempre al final del canal de presentaciones un mensaje con un botón "
+            "que enseña a presentarse con la plantilla."
+        ),
         inline=False,
     )
     embed.add_field(
@@ -237,6 +270,99 @@ class PresentationNoticeView(discord.ui.View):
         )
 
 
+class PresentationStickyView(discord.ui.View):
+    """Botón del mensaje fijo. Persistente: sigue funcionando tras reiniciar el bot."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Presentarse",
+        style=discord.ButtonStyle.primary,
+        custom_id=PRESENTATION_STICKY_BUTTON_ID,
+    )
+    async def introduce(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        _ = button
+        channel_id = interaction.channel_id
+        if interaction.guild is not None and interaction.client is not None:
+            stored_channel_id = get_bot_context(interaction.client).presentations.get_channel_id(
+                interaction.guild.id
+            )
+            channel_id = stored_channel_id or channel_id
+
+        await interaction.response.send_message(
+            "\n".join(
+                [
+                    "¡Presentarse es súper fácil! 🖤",
+                    "1. Copia la plantilla que te dejo justo debajo.",
+                    "2. Rellénala con tus datos.",
+                    f"3. Envíala aquí mismo, en <#{channel_id}>.",
+                    "",
+                    "¡Tengo muchas ganas de conocerte! <3",
+                ]
+            ),
+            ephemeral=True,
+        )
+        await interaction.followup.send(PRESENTATION_TEMPLATE, ephemeral=True)
+
+
+def _is_sticky_message(bot: commands.Bot, message: discord.Message) -> bool:
+    if bot.user is None or message.author.id != bot.user.id:
+        return False
+    return any(
+        getattr(child, "custom_id", None) == PRESENTATION_STICKY_BUTTON_ID
+        for row in message.components
+        for child in getattr(row, "children", [])
+    )
+
+
+async def _delete_sticky_message(store: PresentationsStore, guild: discord.Guild) -> None:
+    stored = store.get_sticky_message(guild.id)
+    if stored is None:
+        return
+
+    channel_id, message_id = stored
+    channel = guild.get_channel_or_thread(channel_id)
+    if channel is not None and hasattr(channel, "get_partial_message"):
+        with suppress(discord.HTTPException):
+            await channel.get_partial_message(message_id).delete()
+    store.set_sticky_message(guild.id, None, None)
+
+
+async def _post_sticky_message(
+    store: PresentationsStore,
+    guild: discord.Guild,
+) -> discord.Message | None:
+    """Borra el mensaje fijo anterior y lo vuelve a publicar al final del canal."""
+    channel_id = store.get_channel_id(guild.id)
+    channel = guild.get_channel(channel_id) if channel_id is not None else None
+    if not isinstance(channel, discord.TextChannel):
+        return None
+
+    await _delete_sticky_message(store, guild)
+
+    embed = build_quote_text_embed(
+        guild.me,
+        PRESENTATION_STICKY_TEXT,
+        discord.utils.utcnow(),
+    )
+    try:
+        sticky = await channel.send(
+            embed=embed,
+            view=PresentationStickyView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        return None
+
+    store.set_sticky_message(guild.id, channel.id, sticky.id)
+    return sticky
+
+
 async def _send_presentation_notice(message: discord.Message, channel_id: int) -> None:
     content = random.choice(PRESENTATION_NOTICE_TEMPLATES).format(
         mention=message.author.mention
@@ -259,6 +385,84 @@ async def _send_presentation_notice(message: discord.Message, channel_id: int) -
 
 
 def register_presentations_commands(bot: commands.Bot, noah_group: commands.Group) -> None:
+    sticky_view_registered = False
+    sticky_locks: dict[int, asyncio.Lock] = {}
+    sticky_tasks: dict[int, asyncio.Task] = {}
+    sticky_dirty: set[int] = set()
+
+    async def _repost_sticky(guild: discord.Guild) -> discord.Message | None:
+        lock = sticky_locks.setdefault(guild.id, asyncio.Lock())
+        async with lock:
+            store = get_bot_context(bot).presentations
+            if not store.is_sticky_enabled(guild.id):
+                return None
+            return await _post_sticky_message(store, guild)
+
+    async def _sticky_repost_worker(guild: discord.Guild) -> None:
+        try:
+            while True:
+                await asyncio.sleep(PRESENTATION_STICKY_REPOST_DELAY)
+                sticky_dirty.discard(guild.id)
+                await _repost_sticky(guild)
+                # Si llegó otro mensaje mientras se reenviaba, hay que repetir.
+                if guild.id not in sticky_dirty:
+                    return
+        finally:
+            if sticky_tasks.get(guild.id) is asyncio.current_task():
+                sticky_tasks.pop(guild.id, None)
+
+    def _schedule_sticky_repost(guild: discord.Guild) -> None:
+        """Agrupa ráfagas de mensajes en un único reenvío del mensaje fijo."""
+        sticky_dirty.add(guild.id)
+        pending = sticky_tasks.get(guild.id)
+        if pending is not None and not pending.done():
+            return
+        sticky_tasks[guild.id] = asyncio.create_task(_sticky_repost_worker(guild))
+
+    async def _remove_sticky(guild: discord.Guild) -> None:
+        lock = sticky_locks.setdefault(guild.id, asyncio.Lock())
+        async with lock:
+            await _delete_sticky_message(get_bot_context(bot).presentations, guild)
+
+    @bot.listen("on_ready")
+    async def _restore_presentation_sticky() -> None:
+        nonlocal sticky_view_registered
+        if sticky_view_registered:
+            return
+        bot.add_view(PresentationStickyView())
+        sticky_view_registered = True
+
+        # Si alguien escribió mientras el bot estaba apagado, vuelve a dejarlo el último.
+        store = get_bot_context(bot).presentations
+        for guild_id in store.get_sticky_guild_ids():
+            guild = bot.get_guild(guild_id)
+            channel_id = store.get_channel_id(guild_id)
+            channel = guild.get_channel(channel_id) if guild and channel_id else None
+            if not isinstance(channel, discord.TextChannel):
+                continue
+
+            stored = store.get_sticky_message(guild_id)
+            if stored is not None and stored == (channel.id, channel.last_message_id):
+                continue
+            await _repost_sticky(guild)
+
+    @bot.listen("on_message")
+    async def _keep_presentation_sticky_last(message: discord.Message) -> None:
+        if message.guild is None or _is_sticky_message(bot, message):
+            return
+
+        store = get_bot_context(bot).presentations
+        if not store.is_sticky_enabled(message.guild.id):
+            return
+
+        if message.channel.id != store.get_channel_id(message.guild.id):
+            return
+
+        if is_guard_active(bot, message.guild.id):
+            return
+
+        _schedule_sticky_repost(message.guild)
+
     @bot.listen("on_message")
     async def _handle_presentations(message: discord.Message) -> None:
         if message.author.bot or message.guild is None:
@@ -314,6 +518,8 @@ def register_presentations_commands(bot: commands.Bot, noah_group: commands.Grou
 
         store = get_bot_context(ctx.bot).presentations
         store.set_channel(ctx.guild.id, channel.id)
+        if store.is_sticky_enabled(ctx.guild.id):
+            await _repost_sticky(ctx.guild)
 
         status_message = await ctx.send(
             f"⏳ Canal de presentaciones configurado en {channel.mention}. "
@@ -390,6 +596,46 @@ def register_presentations_commands(bot: commands.Bot, noah_group: commands.Grou
         await ctx.send("✅ Presentaciones obligatorias desactivadas.")
 
     @presentations.command()
+    async def sticky(ctx: commands.Context, mode: str | None = None) -> None:
+        if not await _check_admin(ctx):
+            return
+
+        store = get_bot_context(ctx.bot).presentations
+        normalized = (mode or "").strip().casefold()
+
+        if normalized in {"on", "enable", "activar"}:
+            channel_id = store.get_channel_id(ctx.guild.id)
+            if channel_id is None:
+                await ctx.send(
+                    "❌ Primero configura el canal con "
+                    "`.noah presentations setchannel <#canal>`."
+                )
+                return
+
+            store.set_sticky_enabled(ctx.guild.id, True)
+            sticky_message = await _repost_sticky(ctx.guild)
+            if sticky_message is None:
+                await ctx.send(
+                    f"⚠️ Mensaje fijo activado, pero no he podido publicarlo en <#{channel_id}>. "
+                    "Revisa que pueda escribir y enviar embeds allí."
+                )
+                return
+
+            await ctx.send(
+                f"✅ Mensaje fijo de presentaciones activado en <#{channel_id}>. "
+                "Se quedará siempre el último del canal."
+            )
+            return
+
+        if normalized in {"off", "disable", "desactivar"}:
+            store.set_sticky_enabled(ctx.guild.id, False)
+            await _remove_sticky(ctx.guild)
+            await ctx.send("✅ Mensaje fijo de presentaciones desactivado.")
+            return
+
+        await ctx.send("❌ Usa `.noah presentations sticky on` o `.noah presentations sticky off`.")
+
+    @presentations.command()
     async def status(ctx: commands.Context) -> None:
         if not await _check_admin(ctx):
             return
@@ -405,6 +651,11 @@ def register_presentations_commands(bot: commands.Bot, noah_group: commands.Grou
         embed.add_field(
             name="Estado",
             value="Activado" if store.is_enabled(ctx.guild.id) else "Desactivado",
+            inline=True,
+        )
+        embed.add_field(
+            name="Mensaje fijo",
+            value="Activado" if store.is_sticky_enabled(ctx.guild.id) else "Desactivado",
             inline=True,
         )
         embed.add_field(

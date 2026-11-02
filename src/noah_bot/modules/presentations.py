@@ -63,6 +63,67 @@ class PresentationsStore:
             return False
         return guild_data.get("enabled") is True
 
+    def _sticky_data(self, guild_id: int) -> dict[str, Any] | None:
+        guild_data = self._guilds.get(str(guild_id))
+        if not isinstance(guild_data, dict):
+            return None
+        sticky = guild_data.get("sticky")
+        return sticky if isinstance(sticky, dict) else None
+
+    def set_sticky_enabled(self, guild_id: int, enabled: bool) -> None:
+        guild_data = self._guild_data(guild_id)
+        sticky = guild_data.get("sticky")
+        if not isinstance(sticky, dict):
+            sticky = {}
+            guild_data["sticky"] = sticky
+        sticky["enabled"] = enabled
+        self._save()
+
+    def is_sticky_enabled(self, guild_id: int) -> bool:
+        sticky = self._sticky_data(guild_id)
+        return sticky is not None and sticky.get("enabled") is True
+
+    def get_sticky_message(self, guild_id: int) -> tuple[int, int] | None:
+        """Devuelve (canal, mensaje) del mensaje fijo de presentaciones actual."""
+        sticky = self._sticky_data(guild_id)
+        if sticky is None:
+            return None
+        try:
+            return int(sticky["channel_id"]), int(sticky["message_id"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def set_sticky_message(
+        self,
+        guild_id: int,
+        channel_id: int | None,
+        message_id: int | None,
+    ) -> None:
+        guild_data = self._guild_data(guild_id)
+        sticky = guild_data.get("sticky")
+        if not isinstance(sticky, dict):
+            sticky = {}
+            guild_data["sticky"] = sticky
+
+        if channel_id is None or message_id is None:
+            sticky.pop("channel_id", None)
+            sticky.pop("message_id", None)
+        else:
+            sticky["channel_id"] = str(channel_id)
+            sticky["message_id"] = str(message_id)
+        self._save()
+
+    def get_sticky_guild_ids(self) -> list[int]:
+        guild_ids: list[int] = []
+        for guild_key in self._guilds:
+            try:
+                guild_id = int(guild_key)
+            except ValueError:
+                continue
+            if self.is_sticky_enabled(guild_id):
+                guild_ids.append(guild_id)
+        return guild_ids
+
     def has_completed(self, guild_id: int, user_id: int) -> bool:
         guild_data = self._guilds.get(str(guild_id))
         if not isinstance(guild_data, dict):
