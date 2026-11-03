@@ -278,7 +278,7 @@ class PresentationStickyView(discord.ui.View):
 
     @discord.ui.button(
         label="Presentarse",
-        style=discord.ButtonStyle.primary,
+        style=discord.ButtonStyle.secondary,
         custom_id=PRESENTATION_STICKY_BUTTON_ID,
     )
     async def introduce(
