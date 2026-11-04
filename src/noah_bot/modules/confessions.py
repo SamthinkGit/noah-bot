@@ -72,6 +72,25 @@ class ConfessionsStore:
             self._get_int(guild_id, "panel_message_id"),
         )
 
+    def set_sticky(self, guild_id: int, enabled: bool) -> None:
+        self._guild_data(guild_id)["sticky"] = enabled
+        self._save()
+
+    def is_sticky(self, guild_id: int) -> bool:
+        guild_data = self._guilds.get(str(guild_id))
+        return isinstance(guild_data, dict) and guild_data.get("sticky") is True
+
+    def get_sticky_guild_ids(self) -> list[int]:
+        guild_ids: list[int] = []
+        for guild_key in self._guilds:
+            try:
+                guild_id = int(guild_key)
+            except ValueError:
+                continue
+            if self.is_sticky(guild_id):
+                guild_ids.append(guild_id)
+        return guild_ids
+
     def get_count(self, guild_id: int) -> int:
         return self._get_int(guild_id, "count") or 0
 

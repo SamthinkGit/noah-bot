@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import suppress
 
 import discord
@@ -6,12 +7,15 @@ from discord.ext import commands
 from noah_bot.modules.bot_context import get_bot_context, is_guard_active
 from noah_bot.modules.confessions import ConfessionsStore
 
-
 CONFESS_COLOR = discord.Color.from_rgb(230, 126, 34)
 PANEL_BUTTON_ID = "noah:confess:open"
 CONFESSION_LIMIT = 2000
 DESCRIPTION_LIMIT = 4096
 PROMPT_TIMEOUT = 60
+PANEL_STICKY_REPOST_DELAY = 2.0
+
+# Evita que dos publicaciones del panel a la vez dejen paneles duplicados.
+_panel_locks: dict[int, asyncio.Lock] = {}
 
 
 def _is_confess_admin(member: discord.abc.User) -> bool:
@@ -224,6 +228,14 @@ def _build_help_embed() -> discord.Embed:
         value="Elige el canal de confesiones y dónde va el panel (solo admins).",
         inline=False,
     )
+    embed.add_field(
+        name=".noah confess sticky on / off",
+        value=(
+            "Mantiene el panel siempre como último mensaje de su canal: cada vez que "
+            "alguien escribe, se borra y se vuelve a publicar abajo (solo admins)."
+        ),
+        inline=False,
+    )
     return embed
 
 
@@ -254,6 +266,11 @@ def _build_config_embed(guild: discord.Guild, store: ConfessionsStore) -> discor
         inline=True,
     )
     embed.add_field(
+        name="Mensaje fijo",
+        value="Activado" if store.is_sticky(guild.id) else "Desactivado",
+        inline=True,
+    )
+    embed.add_field(
         name="Confesiones enviadas", value=f"`{store.get_count(guild.id)}`", inline=True
     )
 
@@ -268,6 +285,13 @@ async def _publish_panel(
     guild: discord.Guild, store: ConfessionsStore, channel: discord.TextChannel
 ) -> str | None:
     """Publica el panel en `channel` y borra el anterior. Devuelve el error, si hay."""
+    async with _panel_locks.setdefault(guild.id, asyncio.Lock()):
+        return await _publish_panel_unlocked(guild, store, channel)
+
+
+async def _publish_panel_unlocked(
+    guild: discord.Guild, store: ConfessionsStore, channel: discord.TextChannel
+) -> str | None:
     problem = _channel_problem(channel)
     if problem is not None:
         return problem
@@ -324,6 +348,10 @@ class ConfessConfigView(discord.ui.View):
         )
         self.panel_select.callback = self._on_panel
         self.add_item(self.panel_select)
+
+        self.toggle_sticky.label = (
+            "Mensaje fijo: activado" if store.is_sticky(guild.id) else "Mensaje fijo: desactivado"
+        )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
@@ -388,6 +416,24 @@ class ConfessConfigView(discord.ui.View):
         await self._republish(interaction, panel_channel_id)
         await self.refresh(interaction)
 
+    @discord.ui.button(label="Mensaje fijo", style=discord.ButtonStyle.secondary, row=2)
+    async def toggle_sticky(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        _ = button
+        enabled = not self.store.is_sticky(self.guild.id)
+        self.store.set_sticky(self.guild.id, enabled)
+
+        panel_channel_id, _ = self.store.get_panel(self.guild.id)
+        if not enabled or panel_channel_id is None:
+            await self.refresh(interaction)
+            return
+
+        # Al activarlo, el panel se vuelve a publicar para quedar el último.
+        await interaction.response.defer()
+        await self._republish(interaction, panel_channel_id)
+        await self.refresh(interaction)
+
     @discord.ui.button(label="Cerrar", style=discord.ButtonStyle.secondary, row=2)
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         _ = button
@@ -400,15 +446,96 @@ class ConfessConfigView(discord.ui.View):
                 await self.message.edit(view=None)
 
 
+def _is_panel_message(bot: commands.Bot, message: discord.Message) -> bool:
+    if bot.user is None or message.author.id != bot.user.id:
+        return False
+    return any(
+        getattr(child, "custom_id", None) == PANEL_BUTTON_ID
+        for row in message.components
+        for child in getattr(row, "children", [])
+    )
+
+
+async def _repost_sticky_panel(bot: commands.Bot, guild: discord.Guild) -> str | None:
+    """Vuelve a publicar el panel al final de su canal si el modo fijo está activo."""
+    store = get_bot_context(bot).confessions
+    if not store.is_sticky(guild.id):
+        return None
+
+    panel_channel_id, _ = store.get_panel(guild.id)
+    channel = guild.get_channel(panel_channel_id) if panel_channel_id is not None else None
+    if not isinstance(channel, discord.TextChannel):
+        return "Primero publica el panel con `.noah confess config`."
+    return await _publish_panel(guild, store, channel)
+
+
 def register_confess_commands(bot: commands.Bot, noah_group: commands.Group) -> None:
     panel_view_registered = False
+    sticky_tasks: dict[int, asyncio.Task] = {}
+    sticky_dirty: set[int] = set()
+
+    async def _sticky_repost_worker(guild: discord.Guild) -> None:
+        try:
+            while True:
+                await asyncio.sleep(PANEL_STICKY_REPOST_DELAY)
+                sticky_dirty.discard(guild.id)
+                await _repost_sticky_panel(bot, guild)
+                # Si llegó otro mensaje mientras se reenviaba, hay que repetir.
+                if guild.id not in sticky_dirty:
+                    return
+        finally:
+            if sticky_tasks.get(guild.id) is asyncio.current_task():
+                sticky_tasks.pop(guild.id, None)
+
+    def _schedule_sticky_repost(guild: discord.Guild) -> None:
+        """Agrupa ráfagas de mensajes en un único reenvío del panel."""
+        sticky_dirty.add(guild.id)
+        pending = sticky_tasks.get(guild.id)
+        if pending is not None and not pending.done():
+            return
+        sticky_tasks[guild.id] = asyncio.create_task(_sticky_repost_worker(guild))
 
     @bot.listen("on_ready")
     async def _register_confess_panel() -> None:
         nonlocal panel_view_registered
-        if not panel_view_registered:
-            bot.add_view(ConfessPanelView())
-            panel_view_registered = True
+        if panel_view_registered:
+            return
+        bot.add_view(ConfessPanelView())
+        panel_view_registered = True
+
+        # Si alguien escribió mientras el bot estaba apagado, vuelve a dejarlo el último.
+        store = get_bot_context(bot).confessions
+        for guild_id in store.get_sticky_guild_ids():
+            guild = bot.get_guild(guild_id)
+            panel_channel_id, panel_message_id = store.get_panel(guild_id)
+            channel = (
+                guild.get_channel(panel_channel_id)
+                if guild is not None and panel_channel_id is not None
+                else None
+            )
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            if channel.last_message_id == panel_message_id:
+                continue
+            await _repost_sticky_panel(bot, guild)
+
+    @bot.listen("on_message")
+    async def _keep_confess_panel_last(message: discord.Message) -> None:
+        if message.guild is None or _is_panel_message(bot, message):
+            return
+
+        store = get_bot_context(bot).confessions
+        if not store.is_sticky(message.guild.id):
+            return
+
+        panel_channel_id, _ = store.get_panel(message.guild.id)
+        if panel_channel_id is None or message.channel.id != panel_channel_id:
+            return
+
+        if is_guard_active(bot, message.guild.id):
+            return
+
+        _schedule_sticky_repost(message.guild)
 
     @bot.listen("on_raw_message_delete")
     async def _forget_confess_panel(payload: discord.RawMessageDeleteEvent) -> None:
@@ -465,3 +592,45 @@ def register_confess_commands(bot: commands.Bot, noah_group: commands.Group) -> 
         view.message = await ctx.send(
             embed=_build_config_embed(ctx.guild, store), view=view
         )
+
+    @confess.command()
+    async def sticky(ctx: commands.Context, mode: str | None = None) -> None:
+        if ctx.guild is None:
+            await ctx.send("❌ Este comando solo funciona dentro de un servidor.")
+            return
+
+        if not _is_confess_admin(ctx.author):
+            await ctx.send("❌ Solo los administradores pueden usar este comando.")
+            return
+
+        store = get_bot_context(ctx.bot).confessions
+        normalized = (mode or "").strip().casefold()
+
+        if normalized in {"on", "enable", "activar"}:
+            panel_channel_id, _ = store.get_panel(ctx.guild.id)
+            if panel_channel_id is None:
+                await ctx.send(
+                    "❌ Primero publica el panel eligiendo su canal en `.noah confess config`."
+                )
+                return
+
+            store.set_sticky(ctx.guild.id, True)
+            problem = await _repost_sticky_panel(ctx.bot, ctx.guild)
+            if problem is not None:
+                await ctx.send(f"⚠️ Mensaje fijo activado, pero: {problem}")
+                return
+
+            await ctx.send(
+                f"✅ Panel de confesiones fijo activado en <#{panel_channel_id}>. "
+                "Se quedará siempre el último del canal."
+            )
+            return
+
+        if normalized in {"off", "disable", "desactivar"}:
+            store.set_sticky(ctx.guild.id, False)
+            await ctx.send(
+                "✅ Panel de confesiones fijo desactivado. El panel se queda donde está."
+            )
+            return
+
+        await ctx.send("❌ Usa `.noah confess sticky on` o `.noah confess sticky off`.")
