@@ -186,18 +186,12 @@ class ConfessPromptView(discord.ui.View):
                 await self.message.delete()
 
 
-def _build_panel_embed(confessions_channel: discord.TextChannel | None) -> discord.Embed:
-    target = (
-        confessions_channel.mention
-        if confessions_channel is not None
-        else "el canal de confesiones"
-    )
+def _build_panel_embed() -> discord.Embed:
     return discord.Embed(
         title="Confesiones anónimas",
         description=(
-            "Pulsa el botón y escribe tu confesión en el formulario. "
-            f"Se publicará en {target} de forma totalmente anónima: "
-            "nadie ve que la has escrito y el bot no guarda quién la envía."
+            "Usa este botón para escribir tu confesión. "
+            "El bot no guarda quién la ha enviado. <3"
         ),
         color=CONFESS_COLOR,
     )
@@ -300,7 +294,7 @@ async def _publish_panel_unlocked(
 
     try:
         message = await channel.send(
-            embed=_build_panel_embed(_confessions_channel(guild, store)),
+            embed=_build_panel_embed(),
             view=ConfessPanelView(),
         )
     except discord.HTTPException:
@@ -386,15 +380,6 @@ class ConfessConfigView(discord.ui.View):
 
     async def _on_channel(self, interaction: discord.Interaction) -> None:
         self.store.set_channel(self.guild.id, self.channel_select.values[0].id)
-
-        # El panel menciona el canal de confesiones, así que se rehace con el nuevo.
-        panel_channel_id, _ = self.store.get_panel(self.guild.id)
-        if panel_channel_id is None:
-            await self.refresh(interaction)
-            return
-
-        await interaction.response.defer()
-        await self._republish(interaction, panel_channel_id)
         await self.refresh(interaction)
 
     async def _on_panel(self, interaction: discord.Interaction) -> None:
