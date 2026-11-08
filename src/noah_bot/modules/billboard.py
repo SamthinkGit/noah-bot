@@ -264,6 +264,15 @@ class BillboardStore:
         self._save()
         return joined
 
+    def set_attendees(self, guild_id: int, item_id: str, user_ids: list[int]) -> bool:
+        """Sustituye la lista de apuntados (lo usa el editor), sin repetidos."""
+        item = self._items(guild_id).get(item_id)
+        if not isinstance(item, dict):
+            return False
+        item["attendees"] = [str(user_id) for user_id in dict.fromkeys(user_ids)]
+        self._save()
+        return True
+
     def mark_reminded(
         self, guild_id: int, item_id: str, channel_id: int | None, message_id: int | None
     ) -> None:

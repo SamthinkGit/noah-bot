@@ -58,6 +58,8 @@ SELECT_LIMIT = 25
 PANEL_ANNOUNCEMENTS_SHOWN = 2
 PANEL_MOVIES_SHOWN = 7
 ATTENDEES_SHOWN = 30
+# Máximo de usuarios que admite un selector de Discord.
+ATTENDEES_EDITABLE = 25
 MESSAGE_LIMIT = 1900
 POSTER_MAX_BYTES = 10 * 1024 * 1024
 POSTER_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -942,6 +944,8 @@ class ItemManageView(_EditorBaseView):
             self._add_button(
                 f"Quitar {noun}", None, discord.ButtonStyle.secondary, self._remove_poster
             )
+        if _is_movie(item):
+            self._add_button("Apuntados", "👥", discord.ButtonStyle.secondary, self._attendees)
         self._add_button("Eliminar", "🗑️", discord.ButtonStyle.danger, self._ask_delete)
         self._add_button("Volver", "◀️", discord.ButtonStyle.secondary, self._back)
 
@@ -1016,8 +1020,83 @@ class ItemManageView(_EditorBaseView):
             await _delete_reminder(self.guild, removed)
             _request_panel_refresh(interaction.client, self.guild)
 
+    async def _attendees(self, interaction: discord.Interaction) -> None:
+        item = _store(interaction.client).get_item(self.guild.id, self.item_id)
+        if item is None:
+            await _show_editor(
+                interaction, self.guild, self.author_id, "❌ Eso ya no está en la cartelera."
+            )
+            return
+
+        content = (
+            "👥 Marca en el menú a todos los que van (los apuntados ya salen marcados). "
+            "Quita la marca para desapuntar a alguien."
+        )
+        if len(item_attendees(item)) > ATTENDEES_EDITABLE:
+            content += (
+                f"\n-# Solo caben {ATTENDEES_EDITABLE} en el menú: el resto de apuntados "
+                "se mantiene tal cual."
+            )
+        await _respond_edit(
+            interaction,
+            content=content,
+            view=AttendeesView(self.guild, self.author_id, item),
+        )
+
     async def _back(self, interaction: discord.Interaction) -> None:
         await _show_editor(interaction, self.guild, self.author_id)
+
+
+class AttendeesView(_EditorBaseView):
+    """Selector para que el editor apunte o desapunte a gente a mano."""
+
+    def __init__(self, guild: discord.Guild, author_id: int, item: dict[str, Any]) -> None:
+        super().__init__(guild, author_id)
+        self.item_id = str(item["id"])
+        self.shown = item_attendees(item)[:ATTENDEES_EDITABLE]
+
+        self.user_select = discord.ui.UserSelect(
+            placeholder="Elige quién va a ir",
+            min_values=0,
+            max_values=ATTENDEES_EDITABLE,
+            default_values=[discord.Object(id=user_id) for user_id in self.shown],
+            row=0,
+        )
+        self.user_select.callback = self._on_select
+        self.add_item(self.user_select)
+
+        back = discord.ui.Button(label="Volver", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+        back.callback = self._back
+        self.add_item(back)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        store = _store(interaction.client)
+        item = store.get_item(self.guild.id, self.item_id)
+        if item is None:
+            await _show_editor(
+                interaction, self.guild, self.author_id, "❌ Eso ya no está en la cartelera."
+            )
+            return
+
+        selected = [user.id for user in self.user_select.values if not user.bot]
+        # Los que no cabían en el menú (o se apuntaron mientras tanto) se mantienen.
+        kept = [
+            user_id
+            for user_id in item_attendees(item)
+            if user_id not in self.shown and user_id not in selected
+        ]
+        store.set_attendees(self.guild.id, self.item_id, selected + kept)
+        total = len(selected) + len(kept)
+        await _show_item(
+            interaction,
+            self.guild,
+            self.author_id,
+            self.item_id,
+            f"✅ Apuntados actualizados: ahora hay **{total}**.",
+        )
+
+    async def _back(self, interaction: discord.Interaction) -> None:
+        await _show_item(interaction, self.guild, self.author_id, self.item_id)
 
 
 def _language_options(current: str) -> list[discord.SelectOption]:
