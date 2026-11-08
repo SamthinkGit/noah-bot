@@ -1,7 +1,7 @@
 import json
 import re
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -14,61 +14,35 @@ except Exception:
 KIND_MOVIE = "movie"
 KIND_ANNOUNCEMENT = "announcement"
 
-_DATE_PATTERN = re.compile(
-    r"^\s*(?:(?P<word>hoy|ma[nñ]ana|pasado\s+ma[nñ]ana)"
-    r"|(?P<day>\d{1,2})\s*[/\-.]\s*(?P<month>\d{1,2})"
-    r"(?:\s*[/\-.]\s*(?P<year>\d{4}|\d{2}))?)"
-    r"\s*(?:,|a\s+las|-)?\s*"
-    r"(?P<hour>\d{1,2})\s*(?:[:.h]\s*(?P<minute>\d{2})?)?\s*h?\s*$",
+_TIME_PATTERN = re.compile(
+    r"^\s*(?P<hour>\d{1,2})\s*(?:[:.h]\s*(?P<minute>\d{2})?)?\s*h?\s*$",
     re.IGNORECASE,
 )
 
 
-def parse_local_datetime(text: str, now: datetime | None = None) -> datetime:
-    """Convierte «14/11 22:00», «14/11/2026 22h» o «mañana 21:30» en hora de Madrid.
+def local_today(now: datetime | None = None) -> date:
+    return (now or datetime.now(timezone.utc)).astimezone(LOCAL_TIMEZONE).date()
 
-    Sin año se usa el actual, o el siguiente si esa fecha ya pasó hace días.
+
+def parse_local_time(text: str) -> tuple[int, int]:
+    """Convierte «22:00», «22.30», «22h» o «22» en (hora, minuto).
+
     Lanza `ValueError` con un mensaje para el usuario si no se entiende.
     """
-    match = _DATE_PATTERN.match(text or "")
+    match = _TIME_PATTERN.match(text or "")
     if match is None:
-        raise ValueError(
-            "No entiendo la fecha. Usa por ejemplo `14/11 22:00`, `14/11/2026 22:00` "
-            "o `mañana 21:30`."
-        )
+        raise ValueError("No entiendo la hora. Escríbela así: `22:00` o `21:30`.")
 
-    local_now = (now or datetime.now(timezone.utc)).astimezone(LOCAL_TIMEZONE)
     hour = int(match["hour"])
     minute = int(match["minute"] or 0)
     if hour > 23 or minute > 59:
         raise ValueError("La hora no es válida (usa 00:00 – 23:59).")
-
-    word = (match["word"] or "").casefold()
-    if word:
-        offset = 0 if word == "hoy" else 2 if word.startswith("pasado") else 1
-        base = local_now.date() + timedelta(days=offset)
-        day, month, year = base.day, base.month, base.year
-    else:
-        day, month = int(match["day"]), int(match["month"])
-        year_text = match["year"]
-        if year_text:
-            year = int(year_text) + (2000 if len(year_text) == 2 else 0)
-        else:
-            year = local_now.year
-
-    try:
-        result = datetime(year, month, day, hour, minute, tzinfo=LOCAL_TIMEZONE)
-    except ValueError as error:
-        raise ValueError("Esa fecha no existe en el calendario.") from error
-
-    if not word and not match["year"] and result < local_now - timedelta(days=7):
-        result = result.replace(year=year + 1)
-    return result
+    return hour, minute
 
 
-def format_local_datetime(value: datetime) -> str:
-    """Formato que entiende `parse_local_datetime`, para rellenar formularios."""
-    return value.astimezone(LOCAL_TIMEZONE).strftime("%d/%m/%Y %H:%M")
+def combine_local(day: date, hour: int, minute: int) -> datetime:
+    """Fecha y hora de Madrid como datetime con zona horaria."""
+    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=LOCAL_TIMEZONE)
 
 
 def item_start(item: dict[str, Any]) -> datetime | None:

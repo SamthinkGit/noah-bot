@@ -14,10 +14,11 @@ from noah_bot.modules.billboard import (
     KIND_MOVIE,
     LOCAL_TIMEZONE,
     BillboardStore,
-    format_local_datetime,
+    combine_local,
     item_attendees,
     item_start,
-    parse_local_datetime,
+    local_today,
+    parse_local_time,
 )
 from noah_bot.modules.bot_context import get_bot_context, is_guard_active
 
@@ -30,7 +31,8 @@ PANEL_PREV_ID = "noah:billboard:prev"
 PANEL_TODAY_ID = "noah:billboard:today"
 PANEL_NEXT_ID = "noah:billboard:next"
 PANEL_SELECT_ID = "noah:billboard:select"
-PANEL_IDS = {PANEL_PREV_ID, PANEL_TODAY_ID, PANEL_NEXT_ID, PANEL_SELECT_ID}
+PANEL_EDIT_ID = "noah:billboard:edit"
+PANEL_IDS = {PANEL_PREV_ID, PANEL_TODAY_ID, PANEL_NEXT_ID, PANEL_SELECT_ID, PANEL_EDIT_ID}
 
 # Si alguien navega por las semanas y se va, el panel vuelve solo a «esta semana».
 PANEL_RESET_AFTER = 300
@@ -61,6 +63,8 @@ POSTER_CONTENT_TYPES = {
 }
 
 WEEKDAYS = ("LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM")
+WEEKDAY_NAMES = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
+DATE_OPTIONS_DAYS = 25
 MONTHS = (
     "ene", "feb", "mar", "abr", "may", "jun",
     "jul", "ago", "sep", "oct", "nov", "dic",
@@ -170,20 +174,16 @@ async def _respond_edit(interaction: discord.Interaction, **kwargs: Any) -> None
 
 
 # ---------------------------------------------------------------------------
-# Panel (agenda semanal)
+# Panel (agenda de 7 días)
 
 
 def _week_start(offset: int, now: datetime) -> date:
-    today = _local(now).date()
-    return today - timedelta(days=today.weekday()) + timedelta(weeks=offset)
+    """Primer día del bloque: hoy, y cada página son los 7 días siguientes."""
+    return _local(now).date() + timedelta(weeks=offset)
 
 
-def _week_title(offset: int) -> str:
-    if offset == 0:
-        return "Esta semana"
-    if offset == 1:
-        return "La semana que viene"
-    return f"Dentro de {offset} semanas"
+def _week_title(offset: int, start: date) -> str:
+    return "Próximos 7 días" if offset == 0 else _week_range(start)
 
 
 def _week_range(start: date) -> str:
@@ -277,14 +277,11 @@ def build_panel_embed(
         lines.append("_No hay nada programado todavía._")
 
     embed = discord.Embed(
-        title=f"🎬 Cartelera · {_week_title(offset)}",
+        title=f"🎬 Cartelera · {_week_title(offset, start_day)}",
         description="\n".join(lines)[:4096],
         color=BILLBOARD_COLOR,
     )
-    footer = "🎟️ Elige una sesión en el menú para ver la ficha y apuntarte."
-    if offset:
-        footer += " El panel vuelve a esta semana tras 5 min sin uso."
-    embed.set_footer(text=footer)
+    embed.set_footer(text="🎟️ Elige una sesión en el menú para ver la ficha y apuntarte.")
     return embed
 
 
@@ -328,15 +325,15 @@ class BillboardPanelView(discord.ui.View):
     ) -> None:
         super().__init__(timeout=None)
         self.prev_week.disabled = offset <= 0
-        self.this_week.disabled = offset == 0
+        self.today.disabled = offset == 0
         self.next_week.disabled = offset >= MAX_WEEKS_AHEAD
         if options:
             self.session_select.options = options
         else:
             self.session_select.options = [
-                discord.SelectOption(label="No hay sesiones esta semana", value="none")
+                discord.SelectOption(label="No hay sesiones estos días", value="none")
             ]
-            self.session_select.placeholder = "No hay sesiones esta semana"
+            self.session_select.placeholder = "No hay sesiones estos días"
             self.session_select.disabled = True
 
     @discord.ui.button(
@@ -353,13 +350,13 @@ class BillboardPanelView(discord.ui.View):
         await _navigate(interaction, lambda offset: offset - 1)
 
     @discord.ui.button(
-        label="Esta semana",
+        label="Hoy",
         emoji="📅",
         style=discord.ButtonStyle.secondary,
         custom_id=PANEL_TODAY_ID,
         row=0,
     )
-    async def this_week(
+    async def today(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         _ = button
@@ -377,6 +374,17 @@ class BillboardPanelView(discord.ui.View):
     ) -> None:
         _ = button
         await _navigate(interaction, lambda offset: offset + 1)
+
+    @discord.ui.button(
+        label="Editar",
+        emoji="✏️",
+        style=discord.ButtonStyle.secondary,
+        custom_id=PANEL_EDIT_ID,
+        row=0,
+    )
+    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        _ = button
+        await _open_editor(interaction)
 
     @discord.ui.select(
         custom_id=PANEL_SELECT_ID,
@@ -415,7 +423,7 @@ def _cancel_reset(guild_id: int) -> None:
 
 
 def _schedule_reset(bot: discord.Client, guild: discord.Guild) -> None:
-    """Reinicia la cuenta atrás para volver a «esta semana» tras un rato sin uso."""
+    """Reinicia la cuenta atrás para volver a los próximos 7 días tras un rato sin uso."""
     _cancel_reset(guild.id)
 
     async def _reset() -> None:
@@ -903,13 +911,17 @@ class ItemManageView(_EditorBaseView):
             self._add_button("Cancelar", None, discord.ButtonStyle.secondary, self._cancel)
             return
 
+        noun = "póster" if _is_movie(item) else "imagen"
         self._add_button("Editar", "✏️", discord.ButtonStyle.secondary, self._edit)
+        self._add_button(
+            f"Cambiar {noun}" if item.get("poster") else f"Subir {noun}",
+            "🖼️",
+            discord.ButtonStyle.secondary,
+            self._upload_poster,
+        )
         if item.get("poster"):
             self._add_button(
-                "Quitar póster" if _is_movie(item) else "Quitar imagen",
-                "🖼️",
-                discord.ButtonStyle.secondary,
-                self._remove_poster,
+                f"Quitar {noun}", None, discord.ButtonStyle.secondary, self._remove_poster
             )
         self._add_button("Eliminar", "🗑️", discord.ButtonStyle.danger, self._ask_delete)
         self._add_button("Volver", "◀️", discord.ButtonStyle.secondary, self._back)
@@ -937,12 +949,18 @@ class ItemManageView(_EditorBaseView):
         start = item_start(item)
         values = {
             "title": item.get("title") or "",
-            "when": format_local_datetime(start) if start is not None else "",
+            "date": _local(start).date().isoformat() if start is not None else "",
+            "time": f"{_local(start):%H:%M}" if start is not None else "",
             "language": item.get("language") or "",
             "description": item.get("description") or "",
         }
         await interaction.response.send_modal(
             ItemModal(self.guild, self.author_id, self.kind, self.item_id, values)
+        )
+
+    async def _upload_poster(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(
+            PosterModal(self.guild, self.author_id, self.kind, self.item_id)
         )
 
     async def _remove_poster(self, interaction: discord.Interaction) -> None:
@@ -1012,8 +1030,43 @@ async def _read_poster(attachment: discord.Attachment) -> tuple[bytes, str]:
     return data, extension
 
 
+def _date_label(day: date, today: date) -> str:
+    text = f"{WEEKDAY_NAMES[day.weekday()]} {day.day} {MONTHS[day.month - 1]}"
+    if day == today:
+        return f"Hoy · {text}"
+    if day == today + timedelta(days=1):
+        return f"Mañana · {text}"
+    return text[0].upper() + text[1:]
+
+
+def _date_options(current: str) -> list[discord.SelectOption]:
+    """Los próximos días para elegir en el formulario (Discord no tiene calendario)."""
+    today = local_today()
+    days = [today + timedelta(days=offset) for offset in range(DATE_OPTIONS_DAYS)]
+    try:
+        current_day = date.fromisoformat(current) if current else None
+    except ValueError:
+        current_day = None
+    if current_day is not None and current_day not in days:
+        # Al editar una sesión lejana (o en curso) su día tiene que seguir saliendo.
+        days = sorted([*days[: DATE_OPTIONS_DAYS - 1], current_day])
+
+    return [
+        discord.SelectOption(
+            label=_date_label(day, today),
+            value=day.isoformat(),
+            default=day == current_day,
+        )
+        for day in days
+    ]
+
+
 class ItemModal(discord.ui.Modal):
-    """Formulario para crear o editar una película o un anuncio."""
+    """Formulario para crear o editar una película o un anuncio.
+
+    Discord admite 5 campos por formulario: el póster de las películas se sube
+    aparte desde su ficha; los anuncios sí llevan la imagen aquí.
+    """
 
     def __init__(
         self,
@@ -1044,20 +1097,19 @@ class ItemModal(discord.ui.Modal):
             default=values.get("title") or None,
             placeholder="Dune: Parte 2" if is_movie else "Maratón de Halloween",
         )
-        self.add_item(
-            discord.ui.Label(
-                text="Nombre de la película" if is_movie else "Título",
-                component=self.title_input,
-            )
-        )
-
-        self.when_input = discord.ui.TextInput(
-            max_length=40,
+        self.date_select = discord.ui.Select(
+            placeholder="Elige el día",
+            options=_date_options(values.get("date") or ""),
+            min_values=1 if is_movie else 0,
+            max_values=1,
             required=is_movie,
-            default=values.get("when") or None,
-            placeholder="14/11 22:00  ·  mañana 21:30",
         )
-        self.language_select: discord.ui.Select | None = None
+        self.time_input = discord.ui.TextInput(
+            max_length=8,
+            required=is_movie,
+            default=values.get("time") or None,
+            placeholder="22:00",
+        )
         self.description_input = discord.ui.TextInput(
             style=discord.TextStyle.paragraph,
             required=False,
@@ -1065,13 +1117,22 @@ class ItemModal(discord.ui.Modal):
             default=values.get("description") or None,
             placeholder="De qué va, quién la propone…" if is_movie else "Lo que quieras contar.",
         )
+        self.language_select: discord.ui.Select | None = None
+        self.poster_input: discord.ui.FileUpload | None = None
 
+        self.add_item(
+            discord.ui.Label(
+                text="Nombre de la película" if is_movie else "Título",
+                component=self.title_input,
+            )
+        )
         if is_movie:
+            self.add_item(discord.ui.Label(text="Día", component=self.date_select))
             self.add_item(
                 discord.ui.Label(
-                    text="Fecha y hora",
-                    description="Hora de España. Ej: 14/11 22:00, 14/11/2026 22:00 o mañana 21:30.",
-                    component=self.when_input,
+                    text="Hora",
+                    description="Hora de España. Ej: 22:00 o 21:30.",
+                    component=self.time_input,
                 )
             )
             self.language_select = discord.ui.Select(
@@ -1085,18 +1146,23 @@ class ItemModal(discord.ui.Modal):
                 discord.ui.Label(text="Idioma y subtítulos", component=self.language_select)
             )
             self.add_item(discord.ui.Label(text="Descripción", component=self.description_input))
-        else:
-            self.add_item(
-                discord.ui.Label(text="Texto del anuncio", component=self.description_input)
-            )
-            self.add_item(
-                discord.ui.Label(
-                    text="Fecha y hora (opcional)",
-                    description="Si la pones, sale en el anuncio y se quita solo unas horas después.",
-                    component=self.when_input,
-                )
-            )
+            return
 
+        self.add_item(discord.ui.Label(text="Texto del anuncio", component=self.description_input))
+        self.add_item(
+            discord.ui.Label(
+                text="Día (opcional)",
+                description="Si lo pones, sale en el anuncio y se quita solo unas horas después.",
+                component=self.date_select,
+            )
+        )
+        self.add_item(
+            discord.ui.Label(
+                text="Hora (opcional)",
+                description="Solo si has elegido día. Ej: 22:00.",
+                component=self.time_input,
+            )
+        )
         self.poster_input = discord.ui.FileUpload(required=False, min_values=0, max_values=1)
         if pending_poster is not None:
             poster_help = "Ya tengo la imagen que subiste: súbela solo si quieres cambiarla."
@@ -1105,11 +1171,7 @@ class ItemModal(discord.ui.Modal):
         else:
             poster_help = "Opcional. Solo se ve al abrir la ficha."
         self.add_item(
-            discord.ui.Label(
-                text="Póster" if is_movie else "Imagen",
-                description=poster_help,
-                component=self.poster_input,
-            )
+            discord.ui.Label(text="Imagen", description=poster_help, component=self.poster_input)
         )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -1128,7 +1190,8 @@ class ItemModal(discord.ui.Modal):
         is_movie = self.kind == KIND_MOVIE
         values = {
             "title": self.title_input.value.strip(),
-            "when": self.when_input.value.strip(),
+            "date": self.date_select.values[0] if self.date_select.values else "",
+            "time": self.time_input.value.strip(),
             "language": (
                 self.language_select.values[0]
                 if self.language_select is not None and self.language_select.values
@@ -1139,7 +1202,7 @@ class ItemModal(discord.ui.Modal):
 
         errors: list[str] = []
         poster = self.pending_poster
-        if self.poster_input.values:
+        if self.poster_input is not None and self.poster_input.values:
             try:
                 poster = await _read_poster(self.poster_input.values[0])
             except ValueError as error:
@@ -1158,17 +1221,21 @@ class ItemModal(discord.ui.Modal):
             return
 
         starts_at: datetime | None = None
-        if values["when"]:
-            try:
-                starts_at = parse_local_datetime(values["when"])
-            except ValueError as error:
-                errors.append(str(error))
-            else:
-                previous = item_start(existing) if existing is not None else None
-                if starts_at <= _now() and starts_at != previous:
-                    errors.append("Esa fecha ya ha pasado.")
-        elif is_movie:
-            errors.append("Falta la fecha y hora.")
+        if values["date"] or values["time"] or is_movie:
+            if not values["date"]:
+                errors.append("Elige el día.")
+            if not values["time"]:
+                errors.append("Falta la hora.")
+            if values["date"] and values["time"]:
+                try:
+                    hour, minute = parse_local_time(values["time"])
+                    starts_at = combine_local(date.fromisoformat(values["date"]), hour, minute)
+                except ValueError as error:
+                    errors.append(str(error))
+                else:
+                    previous = item_start(existing) if existing is not None else None
+                    if starts_at <= _now() and starts_at != previous:
+                        errors.append("Esa hora ya ha pasado.")
 
         if errors:
             await interaction.followup.send(
@@ -1192,7 +1259,9 @@ class ItemModal(discord.ui.Modal):
                 created_by=interaction.user.id,
             )
             content = (
-                "✅ Película añadida a la cartelera." if is_movie else "✅ Anuncio publicado."
+                "✅ Película añadida a la cartelera. Pulsa 🖼️ **Subir póster** si quieres ponerle uno."
+                if is_movie
+                else "✅ Anuncio publicado."
             )
         else:
             item_id = str(existing["id"])
@@ -1217,12 +1286,63 @@ class ItemModal(discord.ui.Modal):
         await _show_item(interaction, self.guild, self.author_id, item_id, content)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        _log.exception("Error en el formulario de la cartelera", exc_info=error)
-        message = "❌ No he podido guardar los cambios. Inténtalo de nuevo más tarde."
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
+        await _modal_error(interaction, error)
+
+
+async def _modal_error(interaction: discord.Interaction, error: Exception) -> None:
+    _log.exception("Error en un formulario de la cartelera", exc_info=error)
+    message = "❌ No he podido guardar los cambios. Inténtalo de nuevo más tarde."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+class PosterModal(discord.ui.Modal):
+    """Subir o cambiar el póster (o la imagen de un anuncio) desde su ficha."""
+
+    def __init__(self, guild: discord.Guild, author_id: int, kind: str, item_id: str) -> None:
+        is_movie = kind == KIND_MOVIE
+        super().__init__(title="Póster de la película" if is_movie else "Imagen del anuncio")
+        self.guild = guild
+        self.author_id = author_id
+        self.item_id = item_id
+        self.poster_input = discord.ui.FileUpload(required=True, min_values=1, max_values=1)
+        self.add_item(
+            discord.ui.Label(
+                text="Póster" if is_movie else "Imagen",
+                description="png, jpg, gif o webp (máximo 10 MB). Solo se ve al abrir la ficha.",
+                component=self.poster_input,
+            )
+        )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        store = _store(interaction.client)
+        if not _can_edit(interaction.user, store):
+            await interaction.response.send_message(
+                "❌ No tienes permiso para editar la cartelera.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+        if not self.poster_input.values:
+            await interaction.followup.send("❌ No has subido ninguna imagen.", ephemeral=True)
+            return
+        try:
+            data, extension = await _read_poster(self.poster_input.values[0])
+        except ValueError as error:
+            await interaction.followup.send(f"❌ {error}", ephemeral=True)
+            return
+
+        if not store.set_poster(self.guild.id, self.item_id, data, extension):
+            await _show_editor(
+                interaction, self.guild, self.author_id, "❌ Eso ya no está en la cartelera."
+            )
+            return
+        await _show_item(interaction, self.guild, self.author_id, self.item_id, "🖼️ Imagen guardada.")
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await _modal_error(interaction, error)
 
 
 class RetryView(_EditorBaseView):
@@ -1258,6 +1378,25 @@ class RetryView(_EditorBaseView):
         )
 
 
+async def _open_editor(interaction: discord.Interaction) -> bool:
+    """Abre el gestor en un mensaje privado si quien lo pide tiene permiso."""
+    guild = interaction.guild
+    store = _store(interaction.client)
+    if guild is None or not _can_edit(interaction.user, store):
+        await interaction.response.send_message(
+            "❌ Solo el rol editor de la cartelera (o un admin) puede editarla.",
+            ephemeral=True,
+        )
+        return False
+
+    await interaction.response.send_message(
+        embed=_editor_embed(store, guild),
+        view=EditorView(store, guild, interaction.user.id),
+        ephemeral=True,
+    )
+    return True
+
+
 class EditorPromptView(discord.ui.View):
     """Botón temporal de `.noah billboard edit` para abrir el gestor en privado."""
 
@@ -1280,18 +1419,8 @@ class EditorPromptView(discord.ui.View):
     )
     async def open(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         _ = button
-        store = _store(interaction.client)
-        if not _can_edit(interaction.user, store):
-            await interaction.response.send_message(
-                "❌ No tienes permiso para editar la cartelera.", ephemeral=True
-            )
+        if not await _open_editor(interaction):
             return
-
-        await interaction.response.send_message(
-            embed=_editor_embed(store, self.guild),
-            view=EditorView(store, self.guild, self.author_id),
-            ephemeral=True,
-        )
         self.stop()
         with suppress(discord.HTTPException):
             await interaction.message.delete()
@@ -1468,7 +1597,8 @@ def _build_help_embed() -> discord.Embed:
     embed.add_field(
         name="Panel",
         value=(
-            "◀️ / ▶️ cambian de semana (vuelve solo a esta semana tras 5 min sin uso). "
+            "Muestra los próximos 7 días; ◀️ / ▶️ pasan de 7 en 7 y ✏️ **Editar** abre el "
+            "gestor (rol editor). "
             "El menú abre la ficha privada con el botón **Apuntarme / Desapuntarme**."
         ),
         inline=False,
