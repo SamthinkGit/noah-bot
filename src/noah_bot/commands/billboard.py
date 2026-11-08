@@ -1,5 +1,7 @@
 import asyncio
+import io
 import logging
+import re
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import date, datetime, timedelta, timezone
@@ -20,6 +22,7 @@ from noah_bot.modules.billboard import (
     local_today,
     parse_local_time,
 )
+from noah_bot.modules.billboard_banner import render_banner
 from noah_bot.modules.bot_context import get_bot_context, is_guard_active
 
 _log = logging.getLogger(__name__)
@@ -30,9 +33,10 @@ ANNOUNCEMENT_COLOR = discord.Color.from_rgb(241, 196, 15)
 PANEL_PREV_ID = "noah:billboard:prev"
 PANEL_TODAY_ID = "noah:billboard:today"
 PANEL_NEXT_ID = "noah:billboard:next"
-PANEL_SELECT_ID = "noah:billboard:select"
 PANEL_EDIT_ID = "noah:billboard:edit"
-PANEL_IDS = {PANEL_PREV_ID, PANEL_TODAY_ID, PANEL_NEXT_ID, PANEL_SELECT_ID, PANEL_EDIT_ID}
+PANEL_CARD_PREFIX = "noah:billboard:card:"
+PANEL_IDS = {PANEL_PREV_ID, PANEL_TODAY_ID, PANEL_NEXT_ID, PANEL_EDIT_ID}
+PANEL_BANNER_NAME = "cartelera.png"
 
 # Si alguien navega por las semanas y se va, el panel vuelve solo a «esta semana».
 PANEL_RESET_AFTER = 300
@@ -50,7 +54,9 @@ MOVIE_EXPIRE_AFTER = timedelta(hours=4)
 ANNOUNCEMENT_EXPIRE_AFTER = timedelta(hours=6)
 MAX_WEEKS_AHEAD = 52
 SELECT_LIMIT = 25
-PANEL_ANNOUNCEMENTS_SHOWN = 6
+# Discord admite 40 componentes por mensaje: con estos topes el panel no pasa de 39.
+PANEL_ANNOUNCEMENTS_SHOWN = 2
+PANEL_MOVIES_SHOWN = 7
 ATTENDEES_SHOWN = 30
 MESSAGE_LIMIT = 1900
 POSTER_MAX_BYTES = 10 * 1024 * 1024
@@ -174,7 +180,7 @@ async def _respond_edit(interaction: discord.Interaction, **kwargs: Any) -> None
 
 
 # ---------------------------------------------------------------------------
-# Panel (agenda de 7 días)
+# Panel (marquesina con la agenda de los próximos 7 días)
 
 
 def _week_start(offset: int, now: datetime) -> date:
@@ -182,15 +188,15 @@ def _week_start(offset: int, now: datetime) -> date:
     return _local(now).date() + timedelta(weeks=offset)
 
 
-def _week_title(offset: int, start: date) -> str:
-    return "Próximos 7 días" if offset == 0 else _week_range(start)
-
-
 def _week_range(start: date) -> str:
     end = start + timedelta(days=6)
     if start.month == end.month:
         return f"{start.day} – {end.day} {MONTHS[end.month - 1]}"
     return f"{start.day} {MONTHS[start.month - 1]} – {end.day} {MONTHS[end.month - 1]}"
+
+
+def _week_subtitle(offset: int, start: date) -> str:
+    return f"Próximos 7 días · {_week_range(start)}" if offset == 0 else _week_range(start)
 
 
 def _week_movies(
@@ -205,60 +211,135 @@ def _week_movies(
     return movies
 
 
-def _movie_line(item: dict[str, Any], now: datetime) -> str:
+def _day_label(day: date, today: date) -> str:
+    name = f"{WEEKDAY_NAMES[day.weekday()]} {day.day}".upper()
+    if day == today:
+        return f"HOY · {name}"
+    if day == today + timedelta(days=1):
+        return f"MAÑANA · {name}"
+    return name
+
+
+def _movie_text(item: dict[str, Any], now: datetime, today: date) -> str:
     start = item_start(item)
-    parts = [f"🎬 **{_truncate(item.get('title') or 'Sin título', 60)}**"]
-    if start is not None:
-        parts.append(_ts(start, "t"))
-    language = item.get("language")
-    if language:
-        parts.append(str(language))
-    if start is not None and start <= now:
-        parts.append("🔴 en curso")
-    attendees = len(item_attendees(item))
-    if attendees:
-        parts.append(f"👥 {attendees}")
-    return " · ".join(parts)
-
-
-def build_panel_embed(
-    store: BillboardStore, guild_id: int, offset: int, now: datetime
-) -> discord.Embed:
-    start_day = _week_start(offset, now)
-    today = _local(now).date()
     lines: list[str] = []
+    if start is not None:
+        lines.append(f"-# **{_day_label(_local(start).date(), today)}**")
+    lines.append(f"**{_truncate(item.get('title') or 'Sin título', 80)}**")
+
+    meta: list[str] = []
+    if start is not None:
+        meta.append(_ts(start, "t"))
+    if item.get("language"):
+        meta.append(str(item["language"]))
+    if start is not None and start <= now:
+        meta.append("🔴 en curso")
+    attendees = len(item_attendees(item))
+    meta.append(f"👥 {attendees} apuntado{'' if attendees == 1 else 's'}")
+    lines.append(" · ".join(meta))
+    return "\n".join(lines)
+
+
+def _announcement_text(item: dict[str, Any]) -> str:
+    start = item_start(item)
+    text = f"📢 **{_truncate(item.get('title') or 'Anuncio', 80)}**"
+    if start is not None:
+        text += f" · {_ts(start, 'f')}"
+    description = (item.get("description") or "").strip()
+    if description:
+        text += f"\n-# {_truncate(description, 120)}"
+    return text
+
+
+class CardButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"noah:billboard:card:(?P<item_id>[0-9a-f]+)",
+):
+    """Botón «Ficha» de cada sesión. Persistente aunque el bot se reinicie."""
+
+    def __init__(self, item_id: str, *, label: str = "Ficha", emoji: str = "🎟️") -> None:
+        super().__init__(
+            discord.ui.Button(
+                label=label,
+                emoji=emoji,
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"{PANEL_CARD_PREFIX}{item_id}",
+            )
+        )
+        self.item_id = item_id
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Button,
+        match: re.Match[str],
+        /,
+    ) -> "CardButton":
+        _ = interaction, item
+        return cls(match["item_id"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await _open_detail(interaction, self.item_id)
+
+
+def _build_panel_container(
+    store: BillboardStore, guild_id: int, offset: int, now: datetime
+) -> discord.ui.Container:
+    today = _local(now).date()
+    start_day = _week_start(offset, now)
+    container = discord.ui.Container(accent_color=BILLBOARD_COLOR)
+    container.add_item(
+        discord.ui.MediaGallery(
+            discord.MediaGalleryItem(
+                f"attachment://{PANEL_BANNER_NAME}",
+                description=f"Cartelera · {_week_subtitle(offset, start_day)}",
+            )
+        )
+    )
 
     announcements = store.list_items(guild_id, KIND_ANNOUNCEMENT)
-    if announcements:
-        lines.append("📢 **Anuncios**")
-        for item in announcements[:PANEL_ANNOUNCEMENTS_SHOWN]:
-            start = item_start(item)
-            when = f" · {_ts(start, 'f')}" if start is not None else ""
-            lines.append(f"> **{_truncate(item.get('title') or 'Anuncio', 60)}**{when}")
-        hidden = len(announcements) - PANEL_ANNOUNCEMENTS_SHOWN
-        if hidden > 0:
-            lines.append(f"> …y {hidden} más en el menú")
-        lines.append("")
+    for item in announcements[:PANEL_ANNOUNCEMENTS_SHOWN]:
+        container.add_item(
+            discord.ui.Section(
+                discord.ui.TextDisplay(_announcement_text(item)),
+                accessory=CardButton(item["id"], label="Ver", emoji="📢"),
+            )
+        )
+    hidden = len(announcements) - PANEL_ANNOUNCEMENTS_SHOWN
+    if hidden > 0:
+        container.add_item(
+            discord.ui.TextDisplay(f"-# …y {hidden} anuncio{'' if hidden == 1 else 's'} más")
+        )
+    container.add_item(discord.ui.Separator())
 
-    lines.append(f"🗓️ **{_week_range(start_day)}**")
-    by_day: dict[date, list[dict[str, Any]]] = {}
-    for item in _week_movies(store, guild_id, start_day):
-        start = item_start(item)
-        if start is not None:
-            by_day.setdefault(_local(start).date(), []).append(item)
+    movies = _week_movies(store, guild_id, start_day)
+    for item in movies[:PANEL_MOVIES_SHOWN]:
+        container.add_item(
+            discord.ui.Section(
+                discord.ui.TextDisplay(_movie_text(item, now, today)),
+                accessory=CardButton(item["id"]),
+            )
+        )
+    hidden = len(movies) - PANEL_MOVIES_SHOWN
+    if hidden > 0:
+        container.add_item(
+            discord.ui.TextDisplay(f"-# …y {hidden} {'sesión' if hidden == 1 else 'sesiones'} más")
+        )
+    if not movies:
+        container.add_item(discord.ui.TextDisplay("🍿 No hay sesiones estos días."))
+    container.add_item(discord.ui.Separator())
 
-    for index in range(7):
-        day = start_day + timedelta(days=index)
-        code = "HOY" if day == today else WEEKDAYS[day.weekday()]
-        label = f"`{code} {day.day:02d}`"
-        movies = by_day.get(day, [])
-        if not movies:
-            lines.append(f"{label} ─")
-            continue
-        for position, item in enumerate(movies):
-            prefix = label if position == 0 else "`      `"
-            lines.append(f"{prefix} {_movie_line(item, now)}")
-
+    footer: list[str] = []
+    if movies:
+        busy = {_local(start).date() for item in movies if (start := item_start(item))}
+        empty = [
+            f"{WEEKDAYS[day.weekday()].lower()} {day.day}"
+            for day in (start_day + timedelta(days=index) for index in range(7))
+            if day not in busy
+        ]
+        if empty:
+            footer.append(f"-# Sin sesiones: {' · '.join(empty)}")
     upcoming = [
         item
         for item in store.list_items(guild_id, KIND_MOVIE)
@@ -267,153 +348,94 @@ def build_panel_embed(
     if upcoming:
         start = item_start(upcoming[0])
         assert start is not None
-        lines.append("")
-        lines.append(
+        footer.append(
             f"⏭️ Próxima: **{_truncate(upcoming[0].get('title') or 'Sin título', 60)}** "
-            f"{_ts(start, 'R')}"
+            f"· {_ts(start, 'R')}"
         )
-    elif not announcements:
-        lines.append("")
-        lines.append("_No hay nada programado todavía._")
-
-    embed = discord.Embed(
-        title=f"🎬 Cartelera · {_week_title(offset, start_day)}",
-        description="\n".join(lines)[:4096],
-        color=BILLBOARD_COLOR,
-    )
-    embed.set_footer(text="🎟️ Elige una sesión en el menú para ver la ficha y apuntarte.")
-    return embed
+    else:
+        footer.append("-# Un editor puede añadir pelis con ✏️ Editar.")
+    container.add_item(discord.ui.TextDisplay("\n".join(footer)))
+    return container
 
 
-def _panel_options(
-    store: BillboardStore, guild_id: int, offset: int, now: datetime
-) -> list[discord.SelectOption]:
-    options: list[discord.SelectOption] = []
-    for item in _week_movies(store, guild_id, _week_start(offset, now)):
-        start = item_start(item)
-        details = [_short_when(start)] if start is not None else []
-        if item.get("language"):
-            details.append(str(item["language"]))
-        details.append(f"👥 {len(item_attendees(item))}")
-        options.append(
-            discord.SelectOption(
-                label=_truncate(item.get("title") or "Sin título", 100),
-                description=_truncate(" · ".join(details), 100),
-                value=item["id"],
-                emoji="🎬",
-            )
-        )
-    for item in store.list_items(guild_id, KIND_ANNOUNCEMENT):
-        start = item_start(item)
-        description = "Anuncio" + (f" · {_short_when(start)}" if start is not None else "")
-        options.append(
-            discord.SelectOption(
-                label=_truncate(item.get("title") or "Anuncio", 100),
-                description=_truncate(description, 100),
-                value=item["id"],
-                emoji="📢",
-            )
-        )
-    return options[:SELECT_LIMIT]
-
-
-class BillboardPanelView(discord.ui.View):
-    """Panel fijo de la cartelera. Persistente: sigue funcionando tras reiniciar el bot."""
-
-    def __init__(
-        self, options: list[discord.SelectOption] | None = None, offset: int = 0
-    ) -> None:
-        super().__init__(timeout=None)
-        self.prev_week.disabled = offset <= 0
+class PanelNavRow(discord.ui.ActionRow):
+    def __init__(self, offset: int = 0) -> None:
+        super().__init__()
+        self.prev_days.disabled = offset <= 0
         self.today.disabled = offset == 0
-        self.next_week.disabled = offset >= MAX_WEEKS_AHEAD
-        if options:
-            self.session_select.options = options
-        else:
-            self.session_select.options = [
-                discord.SelectOption(label="No hay sesiones estos días", value="none")
-            ]
-            self.session_select.placeholder = "No hay sesiones estos días"
-            self.session_select.disabled = True
+        self.next_days.disabled = offset >= MAX_WEEKS_AHEAD
 
     @discord.ui.button(
-        label="Anterior",
-        emoji="◀️",
-        style=discord.ButtonStyle.secondary,
-        custom_id=PANEL_PREV_ID,
-        row=0,
+        label="Anterior", emoji="◀️", style=discord.ButtonStyle.secondary, custom_id=PANEL_PREV_ID
     )
-    async def prev_week(
+    async def prev_days(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         _ = button
         await _navigate(interaction, lambda offset: offset - 1)
 
     @discord.ui.button(
-        label="Hoy",
-        emoji="📅",
-        style=discord.ButtonStyle.secondary,
-        custom_id=PANEL_TODAY_ID,
-        row=0,
+        label="Hoy", emoji="📅", style=discord.ButtonStyle.secondary, custom_id=PANEL_TODAY_ID
     )
-    async def today(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
+    async def today(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         _ = button
         await _navigate(interaction, lambda offset: 0)
 
     @discord.ui.button(
-        label="Siguiente",
-        emoji="▶️",
-        style=discord.ButtonStyle.secondary,
-        custom_id=PANEL_NEXT_ID,
-        row=0,
+        label="Siguiente", emoji="▶️", style=discord.ButtonStyle.secondary, custom_id=PANEL_NEXT_ID
     )
-    async def next_week(
+    async def next_days(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         _ = button
         await _navigate(interaction, lambda offset: offset + 1)
 
     @discord.ui.button(
-        label="Editar",
-        emoji="✏️",
-        style=discord.ButtonStyle.secondary,
-        custom_id=PANEL_EDIT_ID,
-        row=0,
+        label="Editar", emoji="✏️", style=discord.ButtonStyle.secondary, custom_id=PANEL_EDIT_ID
     )
     async def edit(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         _ = button
         await _open_editor(interaction)
 
-    @discord.ui.select(
-        custom_id=PANEL_SELECT_ID,
-        placeholder="🎟️ Ver ficha y apuntarme…",
-        options=[discord.SelectOption(label="Cargando…", value="none")],
-        row=1,
-    )
-    async def session_select(
-        self, interaction: discord.Interaction, select: discord.ui.Select
+
+class BillboardPanelView(discord.ui.LayoutView):
+    """Panel fijo de la cartelera. Sin datos solo lleva los botones: así se registra
+    como vista persistente para que sigan funcionando tras reiniciar el bot."""
+
+    def __init__(
+        self,
+        store: BillboardStore | None = None,
+        guild_id: int | None = None,
+        offset: int = 0,
+        now: datetime | None = None,
     ) -> None:
-        await _open_detail(interaction, select.values[0] if select.values else "none")
+        super().__init__(timeout=None)
+        if store is not None and guild_id is not None:
+            self.add_item(_build_panel_container(store, guild_id, offset, now or _now()))
+        self.add_item(PanelNavRow(offset))
+
+
+def _component_key(item: discord.ui.Item[Any]) -> tuple[Any, ...]:
+    inner = getattr(item, "item", item)
+    return (
+        type(inner).__name__,
+        getattr(inner, "content", None),
+        getattr(inner, "custom_id", None),
+        getattr(inner, "label", None),
+        getattr(inner, "disabled", None),
+    )
 
 
 def _render_panel(
     store: BillboardStore, guild_id: int
-) -> tuple[discord.Embed, BillboardPanelView, Any]:
+) -> tuple[BillboardPanelView, discord.File, Any]:
     now = _now()
     offset = _week_offsets.get(guild_id, 0)
-    embed = build_panel_embed(store, guild_id, offset, now)
-    options = _panel_options(store, guild_id, offset, now)
-    view = BillboardPanelView(options, offset)
-    signature = (
-        offset,
-        embed.title,
-        embed.description,
-        embed.footer.text,
-        tuple((option.value, option.label, option.description) for option in options),
-    )
-    return embed, view, signature
+    subtitle = _week_subtitle(offset, _week_start(offset, now))
+    view = BillboardPanelView(store, guild_id, offset, now)
+    banner = discord.File(io.BytesIO(render_banner(subtitle)), filename=PANEL_BANNER_NAME)
+    signature = (subtitle, tuple(_component_key(item) for item in view.walk_children()))
+    return view, banner, signature
 
 
 def _cancel_reset(guild_id: int) -> None:
@@ -455,9 +477,9 @@ async def _navigate(
     else:
         _cancel_reset(guild.id)
 
-    embed, view, signature = _render_panel(store, guild.id)
+    view, banner, signature = _render_panel(store, guild.id)
     _last_rendered[guild.id] = signature
-    await interaction.response.edit_message(embed=embed, view=view)
+    await interaction.response.edit_message(view=view, attachments=[banner])
 
 
 async def _open_detail(interaction: discord.Interaction, item_id: str) -> None:
@@ -466,16 +488,12 @@ async def _open_detail(interaction: discord.Interaction, item_id: str) -> None:
         return
 
     store = _store(interaction.client)
-    # Se vuelve a pintar el panel para que el menú no se quede marcado.
-    embed, view, signature = _render_panel(store, guild.id)
-    _last_rendered[guild.id] = signature
-    await interaction.response.edit_message(embed=embed, view=view)
     if _week_offsets.get(guild.id, 0):
         _schedule_reset(interaction.client, guild)
 
-    item = store.get_item(guild.id, item_id) if item_id != "none" else None
+    item = store.get_item(guild.id, item_id)
     if item is None:
-        await interaction.followup.send(
+        await interaction.response.send_message(
             "❌ Eso ya no está en la cartelera.", ephemeral=True
         )
         return
@@ -486,7 +504,7 @@ async def _open_detail(interaction: discord.Interaction, item_id: str) -> None:
         kwargs["file"] = poster
     if _is_movie(item):
         kwargs["view"] = DetailView(guild.id, item, interaction.user.id)
-    await interaction.followup.send(**kwargs)
+    await interaction.response.send_message(**kwargs)
 
 
 async def _publish_panel_unlocked(
@@ -496,10 +514,11 @@ async def _publish_panel_unlocked(
     if problem is not None:
         return problem
 
-    embed, view, signature = _render_panel(store, guild.id)
+    view, banner, signature = _render_panel(store, guild.id)
     try:
-        message = await channel.send(embed=embed, view=view)
+        message = await channel.send(view=view, file=banner)
     except discord.HTTPException:
+        _log.exception("No se ha podido publicar el panel de la cartelera")
         return f"No he podido publicar el panel en {channel.mention}."
 
     old_channel_id, old_message_id = store.get_panel(guild.id)
@@ -535,16 +554,16 @@ async def _refresh_panel(
         if message_id is None:
             return await _publish_panel_unlocked(guild, store, channel)
 
-        embed, view, signature = _render_panel(store, guild.id)
+        view, banner, signature = _render_panel(store, guild.id)
         if not force and _last_rendered.get(guild.id) == signature:
             return None
 
         try:
-            await channel.get_partial_message(message_id).edit(embed=embed, view=view)
-        except discord.NotFound:
-            return await _publish_panel_unlocked(guild, store, channel)
+            await channel.get_partial_message(message_id).edit(view=view, attachments=[banner])
         except discord.HTTPException:
-            return "No he podido actualizar el panel."
+            # Borrado, o un panel antiguo que no se puede convertir al formato nuevo:
+            # se publica uno nuevo en su lugar.
+            return await _publish_panel_unlocked(guild, store, channel)
 
         _last_rendered[guild.id] = signature
         return None
@@ -1589,7 +1608,7 @@ def _build_help_embed() -> discord.Embed:
         title="Cartelera",
         description=(
             "Agenda de las pelis que vemos en el server. El panel se queda siempre abajo "
-            "en su canal: navega por semanas, abre la ficha de cada sesión (con póster) y "
+            "en su canal: navega por los próximos días, abre la ficha de cada sesión (con póster) y "
             "apúntate. A los apuntados se les menciona 1 h antes de empezar."
         ),
         color=BILLBOARD_COLOR,
@@ -1599,7 +1618,7 @@ def _build_help_embed() -> discord.Embed:
         value=(
             "Muestra los próximos 7 días; ◀️ / ▶️ pasan de 7 en 7 y ✏️ **Editar** abre el "
             "gestor (rol editor). "
-            "El menú abre la ficha privada con el botón **Apuntarme / Desapuntarme**."
+            "🎟️ **Ficha** abre en privado el póster y el botón **Apuntarme / Desapuntarme**."
         ),
         inline=False,
     )
@@ -1744,6 +1763,7 @@ def register_billboard_commands(bot: commands.Bot, noah_group: commands.Group) -
             return
         started = True
         bot.add_view(BillboardPanelView())
+        bot.add_dynamic_items(CardButton)
         asyncio.create_task(_billboard_loop(bot))
 
         # Si alguien escribió mientras el bot estaba apagado, vuelve a dejarlo el último.
