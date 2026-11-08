@@ -21,6 +21,7 @@ dependencies = [
     "requests>=2.32.0",
     "rich>=14.2.0",
     "tinydb>=4.8.2",
+    "tzdata>=2026.6",
 ]
 
 [project.scripts]

@@ -6,7 +6,11 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-LOCAL_TIMEZONE = ZoneInfo("Europe/Madrid")
+# En Windows hace falta el paquete `tzdata`; si aun así falla, se usa la hora del equipo.
+try:
+    LOCAL_TIMEZONE = ZoneInfo("Europe/Madrid")
+except Exception:
+    LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
 KIND_MOVIE = "movie"
 KIND_ANNOUNCEMENT = "announcement"
 
