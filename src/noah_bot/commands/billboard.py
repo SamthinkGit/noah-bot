@@ -234,9 +234,9 @@ def _movie_text(item: dict[str, Any], now: datetime, today: date) -> str:
         meta.append(str(item["language"]))
     if start is not None and start <= now:
         meta.append("🔴 en curso")
-    attendees = len(item_attendees(item))
-    meta.append(f"👥 {attendees} apuntado{'' if attendees == 1 else 's'}")
-    lines.append(" · ".join(meta))
+    # Sin contador de apuntados a propósito: que nadie elija por lo que hacen los demás.
+    if meta:
+        lines.append(" · ".join(meta))
     return "\n".join(lines)
 
 
