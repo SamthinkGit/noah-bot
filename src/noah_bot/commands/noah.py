@@ -8,6 +8,7 @@ from discord.ext import commands
 
 from noah_bot.commands.autobump import register_autobump_commands
 from noah_bot.commands.autogami import register_autogami_commands
+from noah_bot.commands.billboard import register_billboard_commands
 from noah_bot.commands.confess import register_confess_commands
 from noah_bot.commands.gochi import register_gotchi_commands
 from noah_bot.commands.guard import register_guard_commands
@@ -294,6 +295,9 @@ def register_noah_commands(bot: commands.Bot) -> None:
         )
         chart.add_row(
             [".noah confess help", "Confesiones totalmente anónimas."]
+        )
+        chart.add_row(
+            [".noah billboard help", "Cartelera de pelis del server."]
         )
         chart.add_row(
             [".waifuracer setemoji <emoji>", "Set your claim reaction emoji."]
@@ -722,3 +726,4 @@ def register_noah_commands(bot: commands.Bot) -> None:
     register_guard_commands(bot, noah)
     register_rrpp_points_commands(bot, register_rrpp_commands(bot, noah))
     register_confess_commands(bot, noah)
+    register_billboard_commands(bot, noah)
