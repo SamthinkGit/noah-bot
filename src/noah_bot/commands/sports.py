@@ -77,9 +77,10 @@ EDITOR_TIMEOUT = 840
 DETAIL_TIMEOUT = 600
 LOOP_INTERVAL = 30
 REMINDER_BEFORE = timedelta(hours=1)
-# Tiempo que un evento sigue en el panel después de terminar.
-EXPIRE_AFTER_END = timedelta(hours=1)
 MAX_WEEKS_AHEAD = 52
+# Los eventos pasados se guardan para verlos con ◀️ Anterior; los de hace más de
+# un año se borran para que el archivo no crezca sin límite.
+MAX_WEEKS_BACK = 52
 SELECT_LIMIT = 25
 # Discord admite 40 componentes por mensaje: con 7 eventos (3 componentes cada uno:
 # sección, texto y botón) el panel no pasa de 35.
@@ -199,14 +200,32 @@ def _when_long(event: dict[str, Any]) -> str:
     return f"{_ts(start, 'F')} → {_ts(end, 't')} ({duration}) · {_ts(start, 'R')}"
 
 
+def _has_ended(event: dict[str, Any], now: datetime) -> bool:
+    end = event_end(event)
+    return end is not None and now >= end
+
+
+def _editor_order(events: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
+    """Para el gestor: primero lo que está por venir y luego lo pasado, de lo más
+    reciente a lo más antiguo (para duplicar un evento de otras semanas)."""
+    upcoming = [event for event in events if not _has_ended(event, now)]
+    past = [event for event in events if _has_ended(event, now)]
+    return upcoming + past[::-1]
+
+
 def _attendees_text(event: dict[str, Any]) -> str:
     attendees = item_attendees(event)
     capacity = event_capacity(event)
-    header = (
-        f"**Van {len(attendees)} de {capacity}**"
-        if capacity is not None
-        else f"**Van {len(attendees)}** · sin límite de plazas"
-    )
+    if _has_ended(event, _now()):
+        if not attendees:
+            return "**Fueron 0**\nNadie se apuntó."
+        header = f"**Fueron {len(attendees)}**"
+    else:
+        header = (
+            f"**Van {len(attendees)} de {capacity}**"
+            if capacity is not None
+            else f"**Van {len(attendees)}** · sin límite de plazas"
+        )
     if not attendees:
         return f"{header}\nNadie todavía. ¡Sé el primero!"
     shown = " ".join(f"<@{user_id}>" for user_id in attendees[:ATTENDEES_SHOWN])
@@ -250,6 +269,12 @@ def _week_events(store: SportsStore, guild_id: int, start_day: date) -> list[dic
 
 def _panel_event_text(event: dict[str, Any], now: datetime, today: date) -> str:
     start = item_start(event)
+    if _has_ended(event, now):
+        # Los pasados van en gris y tachados para que se note que ya no están activos.
+        return (
+            f"-# ✔️ terminado · {_when_short(event, today)}\n"
+            f"-# ~~{_title(event)}~~ · {_place(event, 80)}"
+        )
     meta = [_location_link(event, 100)]
     if start is not None and start <= now:
         meta.append("🔴 en curso")
@@ -294,6 +319,8 @@ class JoinButton(
 
 def _join_button(event: dict[str, Any], now: datetime) -> JoinButton:
     start = item_start(event)
+    if _has_ended(event, now):
+        return JoinButton(str(event["id"]), label="Terminado", disabled=True)
     if start is not None and start <= now:
         return JoinButton(str(event["id"]), label="En curso", disabled=True)
     if is_full(event):
@@ -460,7 +487,11 @@ def _pick_options(events: list[dict[str, Any]], today: date) -> list[discord.Sel
         options.append(
             discord.SelectOption(
                 label=_title(event, 100),
-                description=_truncate(f"{when} · {_place(event)}", 100),
+                description=_truncate(
+                    ("✔️ terminado · " if _has_ended(event, _now()) else "")
+                    + f"{when} · {_place(event)}",
+                    100,
+                ),
                 value=str(event["id"]),
             )
         )
@@ -530,7 +561,7 @@ def _build_panel_container(
 class PanelNavRow(discord.ui.ActionRow):
     def __init__(self, offset: int = 0) -> None:
         super().__init__()
-        self.prev_days.disabled = offset <= 0
+        self.prev_days.disabled = offset <= -MAX_WEEKS_BACK
         self.today.disabled = offset == 0
         self.next_days.disabled = offset >= MAX_WEEKS_AHEAD
 
@@ -634,7 +665,7 @@ async def _navigate(interaction: discord.Interaction, target: Callable[[int], in
         return
 
     store = _store(interaction.client)
-    offset = max(0, min(MAX_WEEKS_AHEAD, target(_week_offsets.get(guild.id, 0))))
+    offset = max(-MAX_WEEKS_BACK, min(MAX_WEEKS_AHEAD, target(_week_offsets.get(guild.id, 0))))
     _week_offsets[guild.id] = offset
     if offset:
         _schedule_reset(interaction.client, guild)
@@ -828,7 +859,12 @@ class DetailView(discord.ui.LayoutView):
         row = discord.ui.ActionRow()
         joined = user_id in item_attendees(event)
         start = item_start(event)
-        if start is not None and start <= _now():
+        if _has_ended(event, _now()):
+            button = discord.ui.Button(
+                label="Ya ha terminado", emoji="✔️", style=discord.ButtonStyle.secondary,
+                disabled=True,
+            )
+        elif start is not None and start <= _now():
             button = discord.ui.Button(
                 label="Ya ha empezado", emoji="🔴", style=discord.ButtonStyle.secondary,
                 disabled=True,
@@ -984,7 +1020,7 @@ def _editor_line(event: dict[str, Any]) -> str:
 
 
 def _editor_embed(store: SportsStore, guild: discord.Guild) -> discord.Embed:
-    events = store.list_events(guild.id)
+    events = _editor_order(store.list_events(guild.id), _now())
     lines = [_editor_line(event) for event in events[:SELECT_LIMIT]]
     if len(events) > SELECT_LIMIT:
         lines.append(f"…y {len(events) - SELECT_LIMIT} más")
@@ -1107,7 +1143,7 @@ class _EditorBaseView(discord.ui.View):
 class EditorView(_EditorBaseView):
     def __init__(self, store: SportsStore, guild: discord.Guild, author_id: int) -> None:
         super().__init__(guild, author_id)
-        events = store.list_events(guild.id)[:SELECT_LIMIT]
+        events = _editor_order(store.list_events(guild.id), _now())[:SELECT_LIMIT]
         if events:
             options = []
             for event in events:
@@ -1116,7 +1152,11 @@ class EditorView(_EditorBaseView):
                 options.append(
                     discord.SelectOption(
                         label=_title(event, 100),
-                        description=_truncate(f"{when} · {_place(event)}", 100),
+                        description=_truncate(
+                    ("✔️ terminado · " if _has_ended(event, _now()) else "")
+                    + f"{when} · {_place(event)}",
+                    100,
+                ),
                         value=str(event["id"]),
                         emoji="🏅",
                     )
@@ -1143,6 +1183,21 @@ class EditorView(_EditorBaseView):
             await interaction.delete_original_response()
 
 
+def _modal_values(event: dict[str, Any]) -> dict[str, str]:
+    """Lo que ya tiene un evento, para rellenar el formulario de editar o duplicar."""
+    start = item_start(event)
+    return {
+        "title": event.get("title") or "",
+        "date": _local(start).date().isoformat() if start is not None else "",
+        "time": f"{_local(start):%H:%M}" if start is not None else "",
+        # «1 h 30 min» → «1h30», que el formulario vuelve a entender.
+        "duration": format_duration(int(event_duration(event).total_seconds() // 60))
+        .replace(" min", "")
+        .replace(" ", ""),
+        "location": event.get("location") or "",
+    }
+
+
 class EventManageView(_EditorBaseView):
     def __init__(
         self,
@@ -1163,6 +1218,7 @@ class EventManageView(_EditorBaseView):
         self._add_button(
             "Plazas, texto y foto", "📝", discord.ButtonStyle.secondary, self._details
         )
+        self._add_button("Duplicar", "📄", discord.ButtonStyle.secondary, self._duplicate)
         if event.get("photo"):
             self._add_button("Quitar foto", None, discord.ButtonStyle.secondary, self._remove_photo)
         if event.get("location") and not event.get("map"):
@@ -1192,18 +1248,26 @@ class EventManageView(_EditorBaseView):
         if event is None:
             await self._missing(interaction)
             return
-        start = item_start(event)
-        values = {
-            "title": event.get("title") or "",
-            "date": _local(start).date().isoformat() if start is not None else "",
-            "time": f"{_local(start):%H:%M}" if start is not None else "",
-            "duration": format_duration(int(event_duration(event).total_seconds() // 60))
-            .replace(" min", "")
-            .replace(" ", ""),
-            "location": event.get("location") or "",
-        }
         await interaction.response.send_modal(
-            EventModal(self.guild, self.author_id, self.event_id, values)
+            EventModal(self.guild, self.author_id, self.event_id, _modal_values(event))
+        )
+
+    async def _duplicate(self, interaction: discord.Interaction) -> None:
+        event = _store(interaction.client).get_event(self.guild.id, self.event_id)
+        if event is None:
+            await self._missing(interaction)
+            return
+        values = _modal_values(event)
+        start = item_start(event)
+        if start is not None:
+            # Se propone el mismo día de la semana, la próxima vez que toque.
+            day = _local(start).date() + timedelta(weeks=1)
+            today = _local(_now()).date()
+            while day < today:
+                day += timedelta(weeks=1)
+            values["date"] = day.isoformat()
+        await interaction.response.send_modal(
+            EventModal(self.guild, self.author_id, values=values, source_id=self.event_id)
         )
 
     async def _details(self, interaction: discord.Interaction) -> None:
@@ -1371,11 +1435,20 @@ class EventModal(discord.ui.Modal):
         author_id: int,
         event_id: str | None = None,
         values: dict[str, str] | None = None,
+        source_id: str | None = None,
     ) -> None:
-        super().__init__(title="Editar evento" if event_id else "Nuevo evento", timeout=900)
+        if event_id:
+            title = "Editar evento"
+        elif source_id:
+            title = "Duplicar evento"
+        else:
+            title = "Nuevo evento"
+        super().__init__(title=title, timeout=900)
         self.guild = guild
         self.author_id = author_id
         self.event_id = event_id
+        # Al duplicar: el evento del que se copian plazas, descripción, foto y mapa.
+        self.source_id = source_id
         values = values or {}
 
         self.title_input = discord.ui.TextInput(
@@ -1472,7 +1545,9 @@ class EventModal(discord.ui.Modal):
                 view=RetryView(
                     self.guild,
                     self.author_id,
-                    lambda: EventModal(self.guild, self.author_id, self.event_id, values),
+                    lambda: EventModal(
+                        self.guild, self.author_id, self.event_id, values, self.source_id
+                    ),
                 ),
                 ephemeral=True,
             )
@@ -1488,10 +1563,21 @@ class EventModal(discord.ui.Modal):
                 location=values["location"],
                 created_by=interaction.user.id,
             )
-            content = (
-                "✅ Evento creado. Pulsa 📝 **Plazas, texto y foto** para poner un límite de "
-                "plazas, una descripción o una foto del sitio."
-            )
+            if self.source_id is not None and store.copy_extras(
+                self.guild.id, self.source_id, event_id
+            ):
+                created = store.get_event(self.guild.id, event_id) or {}
+                # Si la ubicación es la misma, el mapa ya viene copiado.
+                location_changed = not created.get("map")
+                content = (
+                    "✅ Evento duplicado con sus plazas, descripción y foto. Los apuntados "
+                    "empiezan de cero."
+                )
+            else:
+                content = (
+                    "✅ Evento creado. Pulsa 📝 **Plazas, texto y foto** para poner un límite "
+                    "de plazas, una descripción o una foto del sitio."
+                )
         else:
             event_id = str(existing["id"])
             if starts_at != item_start(existing):
@@ -1862,7 +1948,8 @@ def _build_help_embed() -> discord.Embed:
             "**Apuntarme** (a la derecha de cada evento) te apunta al momento; si te arrepientes, "
             "la respuesta trae **Desapuntarme**. En el menú **Ver ficha…** se abre en privado "
             "la ficha con el mapa, la foto, quién va y **Abrir en Maps**. ◀️ / ▶️ pasan de 7 "
-            "en 7 días y ✏️ **Editar** abre el gestor (rol editor)."
+            "en 7 días (◀️ también enseña los eventos que ya pasaron, en gris) y ✏️ **Editar** "
+            "abre el gestor (rol editor), donde puedes 📄 **Duplicar** un evento."
         ),
         inline=False,
     )
@@ -1940,8 +2027,14 @@ async def _tick(bot: commands.Bot) -> None:
             if start is None or end is None:
                 continue
 
-            if now >= end + EXPIRE_AFTER_END:
+            if now >= start + timedelta(weeks=MAX_WEEKS_BACK):
                 await _delete_reminder(guild, store.remove_event(guild_id, event["id"]))
+                continue
+            if now >= end:
+                # El evento se queda en la agenda como pasado; solo se limpia el aviso.
+                if event.get("reminder_message"):
+                    await _delete_reminder(guild, event)
+                    store.mark_reminded(guild_id, event["id"], None, None)
                 continue
 
             if not event.get("reminded") and now >= start - REMINDER_BEFORE:

@@ -49,10 +49,13 @@ EDITOR_TIMEOUT = 840
 DETAIL_TIMEOUT = 600
 LOOP_INTERVAL = 30
 REMINDER_BEFORE = timedelta(hours=1)
-# Tiempo que una película sigue en la cartelera («en curso») después de empezar.
-MOVIE_EXPIRE_AFTER = timedelta(hours=4)
+# Duración de una película: hasta entonces sale «en curso» y después «terminada».
+MOVIE_DURATION = timedelta(hours=2)
 ANNOUNCEMENT_EXPIRE_AFTER = timedelta(hours=6)
 MAX_WEEKS_AHEAD = 52
+# Las películas pasadas se guardan para verlas con ◀️ Anterior; las de hace más de
+# un año se borran para que el archivo no crezca sin límite.
+MAX_WEEKS_BACK = 52
 SELECT_LIMIT = 25
 # Discord admite 40 componentes por mensaje: con estos topes el panel no pasa de 39.
 PANEL_ANNOUNCEMENTS_SHOWN = 2
@@ -143,8 +146,20 @@ def _is_movie(item: dict[str, Any]) -> bool:
     return item.get("kind") == KIND_MOVIE
 
 
-def _expire_delta(item: dict[str, Any]) -> timedelta:
-    return MOVIE_EXPIRE_AFTER if _is_movie(item) else ANNOUNCEMENT_EXPIRE_AFTER
+def _has_ended(item: dict[str, Any], now: datetime) -> bool:
+    """Si la película ya ha terminado (o el anuncio ya ha caducado)."""
+    start = item_start(item)
+    if start is None:
+        return False
+    return now >= start + (MOVIE_DURATION if _is_movie(item) else ANNOUNCEMENT_EXPIRE_AFTER)
+
+
+def _editor_order(items: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
+    """Para el gestor: primero lo que está por venir y luego lo pasado, de lo más
+    reciente a lo más antiguo."""
+    upcoming = [item for item in items if not _has_ended(item, now)]
+    past = [item for item in items if _has_ended(item, now)]
+    return upcoming + past[::-1]
 
 
 def _jump_url(guild_id: int, channel_id: int, message_id: int) -> str:
@@ -224,10 +239,21 @@ def _day_label(day: date, today: date) -> str:
 
 def _movie_text(item: dict[str, Any], now: datetime, today: date) -> str:
     start = item_start(item)
+    title = _truncate(item.get("title") or "Sin título", 80)
+    if _has_ended(item, now):
+        # Las pasadas van en gris y pequeño para que se note que ya no están activas.
+        day = f"**{_day_label(_local(start).date(), today)}** · " if start is not None else ""
+        meta = [title]
+        if start is not None:
+            meta.append(_ts(start, "t"))
+        if item.get("language"):
+            meta.append(str(item["language"]))
+        return f"-# {day}✔️ terminada\n-# ~~{' · '.join(meta)}~~"
+
     lines: list[str] = []
     if start is not None:
         lines.append(f"-# **{_day_label(_local(start).date(), today)}**")
-    lines.append(f"**{_truncate(item.get('title') or 'Sin título', 80)}**")
+    lines.append(f"**{title}**")
 
     meta: list[str] = []
     if start is not None:
@@ -235,7 +261,7 @@ def _movie_text(item: dict[str, Any], now: datetime, today: date) -> str:
     if item.get("language"):
         meta.append(str(item["language"]))
     if start is not None and start <= now:
-        meta.append("🔴 en curso")
+        meta.append(f"🔴 en curso hasta las {_ts(start + MOVIE_DURATION, 't')}")
     # Sin contador de apuntados a propósito: que nadie elija por lo que hacen los demás.
     if meta:
         lines.append(" · ".join(meta))
@@ -363,7 +389,7 @@ def _build_panel_container(
 class PanelNavRow(discord.ui.ActionRow):
     def __init__(self, offset: int = 0) -> None:
         super().__init__()
-        self.prev_days.disabled = offset <= 0
+        self.prev_days.disabled = offset <= -MAX_WEEKS_BACK
         self.today.disabled = offset == 0
         self.next_days.disabled = offset >= MAX_WEEKS_AHEAD
 
@@ -472,7 +498,7 @@ async def _navigate(
         return
 
     store = _store(interaction.client)
-    offset = max(0, min(MAX_WEEKS_AHEAD, target(_week_offsets.get(guild.id, 0))))
+    offset = max(-MAX_WEEKS_BACK, min(MAX_WEEKS_AHEAD, target(_week_offsets.get(guild.id, 0))))
     _week_offsets[guild.id] = offset
     if offset:
         _schedule_reset(interaction.client, guild)
@@ -649,17 +675,23 @@ def build_item_card(
     is_movie = _is_movie(item)
     title = item.get("title") or ("Sin título" if is_movie else "Anuncio")
     description = (item.get("description") or "").strip()
+    ended = is_movie and _has_ended(item, _now())
     embed = discord.Embed(
         title=_truncate(f"{'🎬' if is_movie else '📢'} {title}", 256),
         description=description[:4096] or None,
-        color=BILLBOARD_COLOR if is_movie else ANNOUNCEMENT_COLOR,
+        color=(
+            discord.Color.dark_grey()
+            if ended
+            else BILLBOARD_COLOR if is_movie else ANNOUNCEMENT_COLOR
+        ),
     )
 
     start = item_start(item)
     if start is not None:
-        embed.add_field(
-            name="📅 Cuándo", value=f"{_ts(start, 'F')}\n{_ts(start, 'R')}", inline=True
-        )
+        when = f"{_ts(start, 'F')}\n{_ts(start, 'R')}"
+        if ended:
+            when = f"✔️ Ya terminó · {when}"
+        embed.add_field(name="📅 Cuándo", value=when, inline=True)
 
     if is_movie:
         language = item.get("language")
@@ -678,8 +710,11 @@ def build_item_card(
             value = shown + (f" y {hidden} más" if hidden > 0 else "")
         else:
             value = "Nadie todavía. ¡Sé el primero!"
-        embed.add_field(name=f"👥 Apuntados ({len(attendees)})", value=value, inline=False)
-        embed.set_footer(text="Si te apuntas, te mencionaré 1 h antes de que empiece.")
+        if ended:
+            embed.add_field(name=f"👥 Fueron ({len(attendees)})", value=value if attendees else "Nadie se apuntó.", inline=False)
+        else:
+            embed.add_field(name=f"👥 Apuntados ({len(attendees)})", value=value, inline=False)
+            embed.set_footer(text="Si te apuntas, te mencionaré 1 h antes de que empiece.")
 
     poster: discord.File | None = None
     path = store.poster_path(item)
@@ -702,7 +737,12 @@ class DetailView(discord.ui.View):
         joined = user_id in item_attendees(item)
         start = item_start(item)
         started = start is not None and start <= _now()
-        if started:
+        if _has_ended(item, _now()):
+            button = discord.ui.Button(
+                label="Ya ha terminado", emoji="✔️", style=discord.ButtonStyle.secondary,
+                disabled=True,
+            )
+        elif started:
             button = discord.ui.Button(
                 label="Ya ha empezado", emoji="🔴", style=discord.ButtonStyle.secondary,
                 disabled=True,
@@ -771,7 +811,7 @@ def _editor_line(item: dict[str, Any]) -> str:
 
 
 def _editor_embed(store: BillboardStore, guild: discord.Guild) -> discord.Embed:
-    items = store.list_items(guild.id)
+    items = _editor_order(store.list_items(guild.id), _now())
     lines = [_editor_line(item) for item in items[:SELECT_LIMIT]]
     if len(items) > SELECT_LIMIT:
         lines.append(f"…y {len(items) - SELECT_LIMIT} más")
@@ -858,7 +898,7 @@ class _EditorBaseView(discord.ui.View):
 class EditorView(_EditorBaseView):
     def __init__(self, store: BillboardStore, guild: discord.Guild, author_id: int) -> None:
         super().__init__(guild, author_id)
-        items = store.list_items(guild.id)[:SELECT_LIMIT]
+        items = _editor_order(store.list_items(guild.id), _now())[:SELECT_LIMIT]
         if items:
             options = []
             for item in items:
@@ -1695,7 +1735,8 @@ def _build_help_embed() -> discord.Embed:
     embed.add_field(
         name="Panel",
         value=(
-            "Muestra los próximos 7 días; ◀️ / ▶️ pasan de 7 en 7 y ✏️ **Editar** abre el "
+            "Muestra los próximos 7 días; ◀️ / ▶️ pasan de 7 en 7 (◀️ también enseña las pelis "
+            "que ya pasaron, en gris) y ✏️ **Editar** abre el "
             "gestor (rol editor). "
             "🎟️ **Ficha** abre en privado el póster y el botón **Apuntarme / Desapuntarme**."
         ),
@@ -1775,8 +1816,17 @@ async def _tick(bot: commands.Bot) -> None:
             if start is None:
                 continue
 
-            if now >= start + _expire_delta(item):
+            if not _is_movie(item) and _has_ended(item, now):
                 await _delete_reminder(guild, store.remove_item(guild_id, item["id"]))
+                continue
+            if now >= start + timedelta(weeks=MAX_WEEKS_BACK):
+                await _delete_reminder(guild, store.remove_item(guild_id, item["id"]))
+                continue
+            if _has_ended(item, now):
+                # La peli se queda en la cartelera como pasada; solo se limpia el aviso.
+                if item.get("reminder_message"):
+                    await _delete_reminder(guild, item)
+                    store.mark_reminded(guild_id, item["id"], None, None)
                 continue
 
             if _is_movie(item) and not item.get("reminded") and now >= start - REMINDER_BEFORE:

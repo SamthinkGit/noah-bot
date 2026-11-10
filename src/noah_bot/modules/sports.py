@@ -306,6 +306,30 @@ class SportsStore:
         self._save()
         return True
 
+    def copy_extras(self, guild_id: int, source_id: str, target_id: str) -> bool:
+        """Copia plazas, descripción y foto de un evento a otro (al duplicar). El
+        mapa también, si los dos están en el mismo sitio. Los apuntados no."""
+        events = self._events(guild_id)
+        source, target = events.get(source_id), events.get(target_id)
+        if not isinstance(source, dict) or not isinstance(target, dict):
+            return False
+
+        target["description"] = source.get("description") or ""
+        target["capacity"] = source.get("capacity")
+        keys = ["photo", "thumb"]
+        if source.get("location") == target.get("location"):
+            keys.append("map")
+            target["geo"] = source.get("geo")
+            target["place"] = source.get("place")
+        for key in keys:
+            path = self.media_path(source, key)
+            if path is not None:
+                target[key] = self._write_media(
+                    guild_id, target_id, key, path.read_bytes(), path.suffix
+                )
+        self._save()
+        return True
+
     def remove_event(self, guild_id: int, event_id: str) -> dict[str, Any] | None:
         event = self._events(guild_id).pop(event_id, None)
         if not isinstance(event, dict):
