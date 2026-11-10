@@ -301,7 +301,7 @@ def register_noah_commands(bot: commands.Bot) -> None:
             [".noah billboard help", "Cartelera de pelis del server."]
         )
         chart.add_row(
-            [".noah events help", "Quedadas para hacer deporte (con mapa y plazas)."]
+            [".noah sports help", "Quedadas para hacer deporte (con mapa y plazas)."]
         )
         chart.add_row(
             [".waifuracer setemoji <emoji>", "Set your claim reaction emoji."]

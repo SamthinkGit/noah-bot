@@ -1489,7 +1489,7 @@ async def _open_editor(interaction: discord.Interaction) -> bool:
 
 
 class EditorPromptView(discord.ui.View):
-    """Botón temporal de `.noah events edit` para abrir el gestor en privado."""
+    """Botón temporal de `.noah sports edit` para abrir el gestor en privado."""
 
     def __init__(self, author_id: int) -> None:
         super().__init__(timeout=PROMPT_TIMEOUT)
@@ -1499,7 +1499,7 @@ class EditorPromptView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(
-                "Este botón no es para ti. Usa `.noah events edit`.", ephemeral=True
+                "Este botón no es para ti. Usa `.noah sports edit`.", ephemeral=True
             )
             return False
         return True
@@ -1533,7 +1533,7 @@ def _build_config_embed(guild: discord.Guild, store: SportsStore) -> discord.Emb
         title="Configuración de eventos deportivos",
         description=(
             "Elige el canal del panel (se publica ahí y se queda siempre abajo) y el rol "
-            "que puede usar `.noah events edit`. Los admins siempre pueden."
+            "que puede usar `.noah sports edit`. Los admins siempre pueden."
         ),
         color=SPORTS_COLOR,
     )
@@ -1681,7 +1681,7 @@ def _build_help_embed() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name=".noah events edit",
+        name=".noah sports edit",
         value=(
             "Abre el gestor para añadir, editar o quitar eventos: nombre, día, hora, duración, "
             "ubicación, plazas, descripción y foto (rol editor)."
@@ -1689,7 +1689,7 @@ def _build_help_embed() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name=".noah events config",
+        name=".noah sports config",
         value="Elige el canal del panel y el rol editor (solo admins).",
         inline=False,
     )
@@ -1858,16 +1858,16 @@ def register_sports_commands(bot: commands.Bot, noah_group: commands.Group) -> N
         if guild is not None:
             _request_panel_refresh(bot, guild)
 
-    @noah_group.group(name="events", aliases=["eventos", "sports"], invoke_without_command=True)
-    async def events(ctx: commands.Context) -> None:
+    @noah_group.group(name="sports", invoke_without_command=True)
+    async def sports(ctx: commands.Context) -> None:
         await ctx.send(embed=_build_help_embed())
 
-    @events.command(name="help")
-    async def events_help(ctx: commands.Context) -> None:
+    @sports.command(name="help")
+    async def sports_help(ctx: commands.Context) -> None:
         await ctx.send(embed=_build_help_embed())
 
-    @events.command(name="config")
-    async def events_config(ctx: commands.Context) -> None:
+    @sports.command(name="config")
+    async def sports_config(ctx: commands.Context) -> None:
         if ctx.guild is None:
             await ctx.send("❌ Este comando solo funciona dentro de un servidor.")
             return
@@ -1878,8 +1878,8 @@ def register_sports_commands(bot: commands.Bot, noah_group: commands.Group) -> N
         view = SportsConfigView(ctx.guild, store, ctx.author.id)
         view.message = await ctx.send(embed=_build_config_embed(ctx.guild, store), view=view)
 
-    @events.command(name="edit")
-    async def events_edit(ctx: commands.Context) -> None:
+    @sports.command(name="edit")
+    async def sports_edit(ctx: commands.Context) -> None:
         # Se borra el comando para no ensuciar el canal ni mover el panel.
         _mark_transient(ctx.message.id)
         with suppress(discord.HTTPException):
@@ -1895,7 +1895,7 @@ def register_sports_commands(bot: commands.Bot, noah_group: commands.Group) -> N
         if _panel_channel(ctx.guild, store) is None:
             await _notice(
                 ctx,
-                "❌ Los eventos no están configurados. Un admin debe usar `.noah events config`.",
+                "❌ Los eventos no están configurados. Un admin debe usar `.noah sports config`.",
             )
             return
 
