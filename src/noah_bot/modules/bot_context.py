@@ -16,6 +16,7 @@ from noah_bot.modules.noah_gochi_ai import NoahGochiStoryService
 from noah_bot.modules.presentations import PresentationsStore
 from noah_bot.modules.relics_game import RelicsGameManager
 from noah_bot.modules.rrpp import RrppStore
+from noah_bot.modules.sports import SportsStore
 from noah_bot.modules.spotify_player import (
     SpotifyAccessStore,
     SpotifyGuildState,
@@ -41,6 +42,7 @@ class BotContext:
     rrpp: RrppStore = field(default_factory=RrppStore)
     confessions: ConfessionsStore = field(default_factory=ConfessionsStore)
     billboard: BillboardStore = field(default_factory=BillboardStore)
+    sports: SportsStore = field(default_factory=SportsStore)
     waifu_manager: WaifuGameManager = field(
         default_factory=lambda: WaifuGameManager(json_path="waifu_game.json")
     )

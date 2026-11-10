@@ -17,6 +17,7 @@ from noah_bot.commands.relics import register_relics_commands
 from noah_bot.commands.rrpp import register_rrpp_commands
 from noah_bot.commands.rrpp_points import register_rrpp_points_commands
 from noah_bot.commands.spotify import register_spotify_commands
+from noah_bot.commands.sports import register_sports_commands
 from noah_bot.commands.tts import register_tts_commands
 from noah_bot.commands.vc_stats import register_vc_stats_commands
 from noah_bot.commands.waifu import register_waifu_commands
@@ -298,6 +299,9 @@ def register_noah_commands(bot: commands.Bot) -> None:
         )
         chart.add_row(
             [".noah billboard help", "Cartelera de pelis del server."]
+        )
+        chart.add_row(
+            [".noah events help", "Quedadas para hacer deporte (con mapa y plazas)."]
         )
         chart.add_row(
             [".waifuracer setemoji <emoji>", "Set your claim reaction emoji."]
@@ -727,3 +731,4 @@ def register_noah_commands(bot: commands.Bot) -> None:
     register_rrpp_points_commands(bot, register_rrpp_commands(bot, noah))
     register_confess_commands(bot, noah)
     register_billboard_commands(bot, noah)
+    register_sports_commands(bot, noah)
