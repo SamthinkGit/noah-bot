@@ -7,7 +7,7 @@ import io
 import logging
 import math
 import re
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, unquote_plus
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -17,6 +17,7 @@ _log = logging.getLogger(__name__)
 # Las políticas de Nominatim y de los tiles de OSM piden identificar la aplicación.
 USER_AGENT = "noah-bot/0.1 (Discord bot)"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 TIMEOUT = 10
 
@@ -58,7 +59,7 @@ def maps_url(location: str) -> str:
 
 
 def _coords_from_url(session: requests.Session, url: str) -> tuple[tuple[float, float] | None, str]:
-    """Saca coordenadas (o un nombre de sitio) de un enlace de mapas."""
+    """Saca coordenadas y el nombre del sitio (si lo trae) de un enlace de mapas."""
     final_url = url
     try:
         # Los enlaces cortos (maps.app.goo.gl) redirigen al enlace completo.
@@ -67,15 +68,20 @@ def _coords_from_url(session: requests.Session, url: str) -> tuple[tuple[float, 
     except requests.RequestException:
         pass
 
+    # Google a veces redirige a una página de cookies con el enlace codificado dentro:
+    # primero se mira el enlace original y luego el final, ya descodificado.
+    name = ""
+    for candidate in (url, unquote(final_url)):
+        if match := _URL_PLACE.search(candidate):
+            name = unquote_plus(match[1]).strip()
+            break
+
     for candidate in (final_url, url):
         for pattern in _URL_COORDS:
             if match := pattern.search(candidate):
                 coords = _valid(float(match[1]), float(match[2]))
                 if coords is not None:
-                    return coords, ""
-
-    match = _URL_PLACE.search(final_url)
-    name = unquote(match[1]).replace("+", " ") if match else ""
+                    return coords, name
     return None, name
 
 
@@ -99,23 +105,60 @@ def _geocode(session: requests.Session, query: str) -> tuple[float, float] | Non
         return None
 
 
-def locate(location: str) -> tuple[float, float] | None:
-    """Coordenadas de una dirección, unas coordenadas o un enlace de Google Maps."""
+def _reverse_name(session: requests.Session, lat: float, lon: float) -> str:
+    """Nombre legible de unas coordenadas: el sitio, o la calle y la ciudad."""
+    try:
+        response = session.get(
+            NOMINATIM_REVERSE_URL,
+            params={
+                "lat": lat, "lon": lon, "format": "jsonv2", "zoom": 18, "accept-language": "es",
+            },
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except (requests.RequestException, ValueError):
+        _log.warning("No se ha podido buscar el nombre del sitio en Nominatim", exc_info=True)
+        return ""
+    if not isinstance(result, dict):
+        return ""
+
+    address = result.get("address") if isinstance(result.get("address"), dict) else {}
+    street = " ".join(
+        str(part) for part in (address.get("road"), address.get("house_number")) if part
+    )
+    city = next(
+        (address[key] for key in ("city", "town", "village", "municipality") if address.get(key)),
+        "",
+    )
+    parts = [str(result.get("name") or ""), street, str(city)]
+    return ", ".join(dict.fromkeys(part for part in parts if part))
+
+
+def locate(location: str) -> tuple[tuple[float, float] | None, str]:
+    """Coordenadas de una dirección, unas coordenadas o un enlace de Google Maps.
+
+    También devuelve el nombre del sitio cuando la ubicación es un enlace (si no,
+    ya es legible tal cual y el nombre va vacío).
+    """
     location = location.strip()
     if not location:
-        return None
+        return None, ""
     if not is_url(location) and (match := _COORDS.search(location)):
         coords = _valid(float(match[1]), float(match[2]))
         if coords is not None:
-            return coords
+            return coords, ""
 
     session = _session()
-    if is_url(location):
-        coords, name = _coords_from_url(session, location)
-        if coords is not None or not name:
-            return coords
-        return _geocode(session, name)
-    return _geocode(session, location)
+    if not is_url(location):
+        return _geocode(session, location), ""
+
+    coords, name = _coords_from_url(session, location)
+    if coords is None and name:
+        coords = _geocode(session, name)
+    if coords is not None and not name:
+        name = _reverse_name(session, *coords)
+    return coords, name
 
 
 def _world_pixel(lat: float, lon: float) -> tuple[float, float]:
@@ -189,13 +232,16 @@ def render_map(lat: float, lon: float) -> bytes | None:
     return buffer.getvalue()
 
 
-def build_map(location: str) -> tuple[tuple[float, float] | None, bytes | None]:
-    """Busca la ubicación y dibuja el mapa. Nunca lanza excepciones."""
+def build_map(location: str) -> tuple[tuple[float, float] | None, bytes | None, str]:
+    """Busca la ubicación y dibuja el mapa: (coordenadas, PNG, nombre del sitio).
+
+    Nunca lanza excepciones.
+    """
     try:
-        coords = locate(location)
+        coords, name = locate(location)
         if coords is None:
-            return None, None
-        return coords, render_map(*coords)
+            return None, None, name
+        return coords, render_map(*coords), name
     except Exception:
         _log.exception("Error generando el mapa de un evento")
-        return None, None
+        return None, None, ""

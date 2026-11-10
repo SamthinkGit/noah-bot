@@ -255,6 +255,7 @@ class SportsStore:
             "location": location,
             "geo": None,
             "map": None,
+            "place": None,
             "description": "",
             "capacity": None,
             "photo": None,
@@ -290,6 +291,7 @@ class SportsStore:
             self._delete_media(event.get("map"))
             event["map"] = None
             event["geo"] = None
+            event["place"] = None
         event.update(title=title, starts_at=new_start, duration=duration, location=location)
         self._save()
         return True
@@ -401,14 +403,17 @@ class SportsStore:
         location: str,
         geo: tuple[float, float] | None,
         image: bytes | None,
+        place: str = "",
     ) -> bool:
-        """Guarda el mapa si la ubicación sigue siendo la misma que se buscó."""
+        """Guarda el mapa (y el nombre del sitio, si la ubicación es un enlace) si la
+        ubicación sigue siendo la misma que se buscó."""
         event = self._events(guild_id).get(event_id)
         if not isinstance(event, dict) or event.get("location") != location:
             return False
 
         self._delete_media(event.get("map"))
         event["geo"] = list(geo) if geo is not None else None
+        event["place"] = place or None
         event["map"] = (
             self._write_media(guild_id, event_id, "map", image, ".png") if image else None
         )

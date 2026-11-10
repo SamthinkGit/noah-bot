@@ -1,4 +1,4 @@
-"""Agenda de eventos deportivos: panel fijo con fotos, ficha con mapa y apuntarse.
+"""Agenda de eventos deportivos: panel fijo con botón para apuntarse y ficha con mapa.
 
 Funciona igual que la cartelera (`billboard.py`): un panel que se queda abajo en su
 canal con los próximos 7 días, una ficha privada por evento y un gestor para el rol
@@ -63,6 +63,7 @@ PANEL_TODAY_ID = "noah:sports:today"
 PANEL_NEXT_ID = "noah:sports:next"
 PANEL_EDIT_ID = "noah:sports:edit"
 PANEL_PICK_ID = "noah:sports:pick"
+PANEL_JOIN_PREFIX = "noah:sports:join:"
 PANEL_IDS = {PANEL_PREV_ID, PANEL_TODAY_ID, PANEL_NEXT_ID, PANEL_EDIT_ID, PANEL_PICK_ID}
 PANEL_BANNER_NAME = "agenda-deportiva.png"
 
@@ -80,8 +81,8 @@ REMINDER_BEFORE = timedelta(hours=1)
 EXPIRE_AFTER_END = timedelta(hours=1)
 MAX_WEEKS_AHEAD = 52
 SELECT_LIMIT = 25
-# Discord admite 40 componentes y 10 adjuntos por mensaje: con 7 eventos (3
-# componentes y 1 miniatura cada uno) más el banner, el panel no pasa de ninguno.
+# Discord admite 40 componentes por mensaje: con 7 eventos (3 componentes cada uno:
+# sección, texto y botón) el panel no pasa de 35.
 PANEL_EVENTS_SHOWN = 7
 ATTENDEES_SHOWN = 30
 ATTENDEES_EDITABLE = 25
@@ -137,14 +138,15 @@ def _title(event: dict[str, Any], limit: int = 80) -> str:
     return _truncate(event.get("title") or "Sin título", limit)
 
 
-def _place(event: dict[str, Any], limit: int = 40) -> str:
-    """Nombre corto del sitio: lo que va antes de la primera coma."""
+def _place(event: dict[str, Any], limit: int = 100) -> str:
+    """Ubicación legible: lo que escribió el editor o, si pegó un enlace de Maps,
+    el nombre del sitio que se sacó al generar el mapa."""
     location = str(event.get("location") or "").strip()
     if not location:
         return "Sin ubicación"
     if is_url(location):
-        return "Ver en el mapa"
-    return _truncate(location.split(",")[0], limit)
+        return _truncate(event.get("place") or "Ubicación en Google Maps", limit)
+    return _truncate(location, limit)
 
 
 def _location_link(event: dict[str, Any]) -> str:
@@ -152,8 +154,7 @@ def _location_link(event: dict[str, Any]) -> str:
     if not location:
         return "Sin ubicación"
     url = maps_url(location)
-    label = "Ver ubicación" if is_url(location) else _truncate(location, 150)
-    label = label.replace("[", "(").replace("]", ")")
+    label = _place(event, 150).replace("[", "(").replace("]", ")")
     return f"[{label}](<{url}>)"
 
 
@@ -224,7 +225,7 @@ def _media_files(
 
 
 # ---------------------------------------------------------------------------
-# Panel (agenda de los próximos 7 días, con la foto de cada sitio)
+# Panel (agenda de los próximos 7 días, con un botón para apuntarse a cada evento)
 
 
 def _week_start(offset: int, now: datetime) -> date:
@@ -247,13 +248,156 @@ def _week_events(store: SportsStore, guild_id: int, start_day: date) -> list[dic
 
 def _panel_event_text(event: dict[str, Any], now: datetime, today: date) -> str:
     start = item_start(event)
-    meta = [f"📍 {_place(event)}", _spots(event)]
+    meta = [_place(event)]
     if start is not None and start <= now:
         meta.append("🔴 en curso")
     return (
         f"**{_title(event)}**\n"
         f"{_when_short(event, today)}\n"
         f"-# {' · '.join(meta)}"
+    )
+
+
+class JoinButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"noah:sports:join:(?P<event_id>[0-9a-f]+)",
+):
+    """Botón «Apuntarme» de cada evento del panel. Persistente tras reiniciar."""
+
+    def __init__(self, event_id: str, *, label: str = "Apuntarme", disabled: bool = False) -> None:
+        super().__init__(
+            discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.secondary if disabled else discord.ButtonStyle.success,
+                disabled=disabled,
+                custom_id=f"{PANEL_JOIN_PREFIX}{event_id}",
+            )
+        )
+        self.event_id = event_id
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Button,
+        match: re.Match[str],
+        /,
+    ) -> "JoinButton":
+        _ = interaction, item
+        return cls(match["event_id"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await _join_from_panel(interaction, self.event_id)
+
+
+def _join_button(event: dict[str, Any], now: datetime) -> JoinButton:
+    start = item_start(event)
+    if start is not None and start <= now:
+        return JoinButton(str(event["id"]), label="En curso", disabled=True)
+    if is_full(event):
+        return JoinButton(str(event["id"]), label="Completo", disabled=True)
+    return JoinButton(str(event["id"]))
+
+
+def _join_summary(event: dict[str, Any]) -> str:
+    start = item_start(event)
+    when = f" · {_ts(start, 'f')}" if start is not None else ""
+    return f"**{_title(event)}**{when}"
+
+
+class JoinResultView(discord.ui.View):
+    """Respuesta privada al botón del panel: deshacer y abrir la ficha."""
+
+    def __init__(self, guild_id: int, event: dict[str, Any], user_id: int) -> None:
+        super().__init__(timeout=DETAIL_TIMEOUT)
+        self.guild_id = guild_id
+        self.event_id = str(event["id"])
+
+        start = item_start(event)
+        if start is None or start > _now():
+            if user_id in item_attendees(event):
+                toggle = discord.ui.Button(
+                    label="Desapuntarme", emoji="❌", style=discord.ButtonStyle.secondary
+                )
+                toggle.callback = self._leave
+                self.add_item(toggle)
+            elif not is_full(event):
+                toggle = discord.ui.Button(
+                    label="Apuntarme", emoji="✅", style=discord.ButtonStyle.success
+                )
+                toggle.callback = self._join
+                self.add_item(toggle)
+
+        detail = discord.ui.Button(
+            label="Ver ficha", emoji="🗺️", style=discord.ButtonStyle.secondary
+        )
+        detail.callback = self._detail
+        self.add_item(detail)
+
+    async def _leave(self, interaction: discord.Interaction) -> None:
+        store = _store(interaction.client)
+        store.leave(self.guild_id, self.event_id, interaction.user.id)
+        await self._update(interaction, "Te has desapuntado de {event}.")
+
+    async def _join(self, interaction: discord.Interaction) -> None:
+        result = _store(interaction.client).join(
+            self.guild_id, self.event_id, interaction.user.id
+        )
+        await self._update(
+            interaction,
+            "🚫 Ya no quedan plazas en {event}."
+            if result == "full"
+            else "✅ Apuntado a {event}. Te mencionaré 1 h antes de que empiece.",
+        )
+
+    async def _update(self, interaction: discord.Interaction, template: str) -> None:
+        event = _store(interaction.client).get_event(self.guild_id, self.event_id)
+        if event is None:
+            await interaction.response.edit_message(
+                content="❌ Este evento ya no está en la agenda.", view=None
+            )
+            return
+        await interaction.response.edit_message(
+            content=template.format(event=_join_summary(event)),
+            view=JoinResultView(self.guild_id, event, interaction.user.id),
+        )
+        if interaction.guild is not None:
+            _request_panel_refresh(interaction.client, interaction.guild)
+
+    async def _detail(self, interaction: discord.Interaction) -> None:
+        await _open_detail(interaction, self.event_id)
+
+
+async def _join_from_panel(interaction: discord.Interaction, event_id: str) -> None:
+    guild = interaction.guild
+    if guild is None:
+        return
+
+    store = _store(interaction.client)
+    event = store.get_event(guild.id, event_id)
+    if event is None:
+        await interaction.response.send_message(
+            "❌ Ese evento ya no está en la agenda.", ephemeral=True
+        )
+        return
+
+    user_id = interaction.user.id
+    start = item_start(event)
+    if start is not None and start <= _now():
+        content = f"🔴 {_join_summary(event)} ya ha empezado."
+    elif user_id in item_attendees(event):
+        content = f"Ya estás apuntado a {_join_summary(event)}."
+    elif store.join(guild.id, event_id, user_id) == "full":
+        content = f"🚫 Ya no quedan plazas en {_join_summary(event)}."
+    else:
+        content = (
+            f"✅ Apuntado a {_join_summary(event)}. Te mencionaré 1 h antes de que empiece."
+        )
+        _request_panel_refresh(interaction.client, guild)
+
+    event = store.get_event(guild.id, event_id) or event
+    await interaction.response.send_message(
+        content, view=JoinResultView(guild.id, event, user_id), ephemeral=True
     )
 
 
@@ -267,7 +411,7 @@ class PickSelect(
         super().__init__(
             discord.ui.Select(
                 custom_id=PANEL_PICK_ID,
-                placeholder="Ver un evento y apuntarte…",
+                placeholder="Ver ficha: mapa, foto y quién va…",
                 options=options or [discord.SelectOption(label="—", value="none")],
             )
         )
@@ -284,11 +428,22 @@ class PickSelect(
         return cls()
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        values = (interaction.data or {}).get("values") or []  # type: ignore[union-attr]
-        if not values or values[0] == "none":
-            await interaction.response.defer()
+        guild = interaction.guild
+        if guild is None:
             return
-        await _open_detail(interaction, str(values[0]))
+        values = (interaction.data or {}).get("values") or []  # type: ignore[union-attr]
+
+        # Volver a pintar el panel deja el menú sin nada elegido. Si no, Discord lo
+        # deja marcado y no se puede volver a elegir el mismo evento.
+        view, files, signature = _render_panel(_store(interaction.client), guild.id)
+        kwargs: dict[str, Any] = {"view": view}
+        if _last_rendered.get(guild.id) != signature:
+            kwargs["attachments"] = files
+        await interaction.response.edit_message(**kwargs)
+        _last_rendered[guild.id] = signature
+
+        if values and values[0] != "none":
+            await _open_detail(interaction, str(values[0]))
 
 
 def _pick_options(events: list[dict[str, Any]], today: date) -> list[discord.SelectOption]:
@@ -303,7 +458,7 @@ def _pick_options(events: list[dict[str, Any]], today: date) -> list[discord.Sel
         options.append(
             discord.SelectOption(
                 label=_title(event, 100),
-                description=_truncate(f"{when} · {_place(event)} · {_spots(event)}", 100),
+                description=_truncate(f"{when} · {_place(event)}", 100),
                 value=str(event["id"]),
             )
         )
@@ -312,7 +467,7 @@ def _pick_options(events: list[dict[str, Any]], today: date) -> list[discord.Sel
 
 def _build_panel_container(
     store: SportsStore, guild_id: int, offset: int, now: datetime
-) -> tuple[discord.ui.Container, list[discord.File]]:
+) -> discord.ui.Container:
     today = _local(now).date()
     start_day = _week_start(offset, now)
     container = discord.ui.Container(accent_color=SPORTS_COLOR)
@@ -325,23 +480,12 @@ def _build_panel_container(
         )
     )
 
-    files: list[discord.File] = []
     events = _week_events(store, guild_id, start_day)
     for event in events[:PANEL_EVENTS_SHOWN]:
-        text = discord.ui.TextDisplay(_panel_event_text(event, now, today))
-        thumb = store.media_path(event, "thumb")
-        if thumb is None:
-            container.add_item(text)
-            continue
-        # El nombre incluye el del archivo para que cambiar la foto cambie el panel.
-        filename = thumb.name
-        files.append(discord.File(thumb, filename=filename))
         container.add_item(
             discord.ui.Section(
-                text,
-                accessory=discord.ui.Thumbnail(
-                    f"attachment://{filename}", description=_title(event, 100)
-                ),
+                discord.ui.TextDisplay(_panel_event_text(event, now, today)),
+                accessory=_join_button(event, now),
             )
         )
 
@@ -378,7 +522,7 @@ def _build_panel_container(
             container.add_item(
                 discord.ui.TextDisplay("-# Un editor puede añadir eventos con ✏️ Editar.")
             )
-    return container, files
+    return container
 
 
 class PanelNavRow(discord.ui.ActionRow):
@@ -452,11 +596,10 @@ def _render_panel(
     now = _now()
     offset = _week_offsets.get(guild_id, 0)
     subtitle = _week_subtitle(offset, _week_start(offset, now))
-    container, thumbs = _build_panel_container(store, guild_id, offset, now)
-    view = SportsPanelView(container, offset)
+    view = SportsPanelView(_build_panel_container(store, guild_id, offset, now), offset)
     banner = discord.File(io.BytesIO(render_banner(subtitle)), filename=PANEL_BANNER_NAME)
     signature = (subtitle, tuple(_component_key(item) for item in view.walk_children()))
-    return view, [banner, *thumbs], signature
+    return view, [banner], signature
 
 
 def _cancel_reset(guild_id: int) -> None:
@@ -764,13 +907,22 @@ async def _open_detail(interaction: discord.Interaction, event_id: str) -> None:
 
     event = store.get_event(guild.id, event_id)
     if event is None:
-        await interaction.response.send_message(
-            "❌ Ese evento ya no está en la agenda.", ephemeral=True
-        )
+        if interaction.response.is_done():
+            await interaction.followup.send("❌ Ese evento ya no está en la agenda.", ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                "❌ Ese evento ya no está en la agenda.", ephemeral=True
+            )
         return
 
     files = _media_files(store, event)
-    await interaction.response.send_message(
+    # Desde el menú del panel ya se ha respondido (editando el panel): va como followup.
+    send = (
+        interaction.followup.send
+        if interaction.response.is_done()
+        else interaction.response.send_message
+    )
+    await send(
         view=DetailView(guild.id, event, interaction.user.id, files),
         files=list(files.values()),
         ephemeral=True,
@@ -899,8 +1051,8 @@ async def _delete_reminder(guild: discord.Guild, event: dict[str, Any] | None) -
 
 async def _update_map(store: SportsStore, guild_id: int, event_id: str, location: str) -> bool:
     """Busca la ubicación y guarda el mapa. Devuelve si se ha podido dibujar."""
-    geo, image = await asyncio.to_thread(build_map, location)
-    store.set_map(guild_id, event_id, location, geo, image)
+    geo, image, place = await asyncio.to_thread(build_map, location)
+    store.set_map(guild_id, event_id, location, geo, image, place)
     return image is not None
 
 
@@ -1665,8 +1817,8 @@ def _build_help_embed() -> discord.Embed:
         title="Eventos deportivos",
         description=(
             "Agenda de las quedadas para hacer deporte. El panel se queda siempre abajo en "
-            "su canal con los próximos 7 días y la foto de cada sitio. Abre un evento para "
-            "ver el mapa, la foto y quién va, y apúntate. A los apuntados se les menciona "
+            "su canal con los próximos 7 días: apúntate con el botón de cada evento o abre su "
+            "ficha para ver el mapa, la foto y quién va. A los apuntados se les menciona "
             "1 h antes de empezar."
         ),
         color=SPORTS_COLOR,
@@ -1674,9 +1826,10 @@ def _build_help_embed() -> discord.Embed:
     embed.add_field(
         name="Panel",
         value=(
-            "◀️ / ▶️ pasan de 7 en 7 días y ✏️ **Editar** abre el gestor (rol editor). "
-            "En el menú **Ver un evento y apuntarte…** se abre en privado la ficha con el "
-            "mapa, el botón **Apuntarme / Desapuntarme** y **Abrir en Maps**."
+            "**Apuntarme** (a la derecha de cada evento) te apunta al momento; si te arrepientes, "
+            "la respuesta trae **Desapuntarme**. En el menú **Ver ficha…** se abre en privado "
+            "la ficha con el mapa, la foto, quién va y **Abrir en Maps**. ◀️ / ▶️ pasan de 7 "
+            "en 7 días y ✏️ **Editar** abre el gestor (rol editor)."
         ),
         inline=False,
     )
@@ -1819,7 +1972,7 @@ def register_sports_commands(bot: commands.Bot, noah_group: commands.Group) -> N
             return
         started = True
         bot.add_view(SportsPanelView())
-        bot.add_dynamic_items(PickSelect)
+        bot.add_dynamic_items(PickSelect, JoinButton)
         asyncio.create_task(_sports_loop(bot))
 
         store = _store(bot)
