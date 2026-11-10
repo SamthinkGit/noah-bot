@@ -145,16 +145,18 @@ def _place(event: dict[str, Any], limit: int = 100) -> str:
     if not location:
         return "Sin ubicación"
     if is_url(location):
-        return _truncate(event.get("place") or "Ubicación en Google Maps", limit)
+        # Si el enlace no trae ningún nombre que se pueda sacar, queda el enlace.
+        return _truncate(event.get("place") or "Abrir en Google Maps", limit)
     return _truncate(location, limit)
 
 
-def _location_link(event: dict[str, Any]) -> str:
+def _location_link(event: dict[str, Any], limit: int = 150) -> str:
+    """La ubicación como enlace a Google Maps."""
     location = str(event.get("location") or "").strip()
     if not location:
         return "Sin ubicación"
     url = maps_url(location)
-    label = _place(event, 150).replace("[", "(").replace("]", ")")
+    label = _place(event, limit).replace("[", "(").replace("]", ")")
     return f"[{label}](<{url}>)"
 
 
@@ -248,7 +250,7 @@ def _week_events(store: SportsStore, guild_id: int, start_day: date) -> list[dic
 
 def _panel_event_text(event: dict[str, Any], now: datetime, today: date) -> str:
     start = item_start(event)
-    meta = [_place(event)]
+    meta = [_location_link(event, 100)]
     if start is not None and start <= now:
         meta.append("🔴 en curso")
     return (
@@ -1054,6 +1056,37 @@ async def _update_map(store: SportsStore, guild_id: int, event_id: str, location
     geo, image, place = await asyncio.to_thread(build_map, location)
     store.set_map(guild_id, event_id, location, geo, image, place)
     return image is not None
+
+
+def _needs_map(event: dict[str, Any]) -> bool:
+    """Eventos sin mapa, o con un enlace de Maps del que aún no se sacó el nombre."""
+    location = str(event.get("location") or "").strip()
+    if not location:
+        return False
+    return not event.get("map") or (is_url(location) and not event.get("place"))
+
+
+async def _fill_missing_maps(bot: commands.Bot) -> None:
+    """Al arrancar, completa el mapa y el nombre del sitio de los eventos que no lo
+    tienen (p. ej. los creados con una versión anterior del bot)."""
+    store = _store(bot)
+    for guild_id in store.guild_ids():
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            continue
+        changed = False
+        for event in store.list_events(guild_id):
+            if not _needs_map(event):
+                continue
+            try:
+                await _update_map(store, guild_id, str(event["id"]), str(event["location"]))
+                changed = True
+            except Exception:
+                _log.exception("No se ha podido completar el mapa de un evento")
+            # Nominatim pide no hacer más de una petición por segundo.
+            await asyncio.sleep(2)
+        if changed:
+            _request_panel_refresh(bot, guild)
 
 
 class _EditorBaseView(discord.ui.View):
@@ -1974,6 +2007,7 @@ def register_sports_commands(bot: commands.Bot, noah_group: commands.Group) -> N
         bot.add_view(SportsPanelView())
         bot.add_dynamic_items(PickSelect, JoinButton)
         asyncio.create_task(_sports_loop(bot))
+        asyncio.create_task(_fill_missing_maps(bot))
 
         store = _store(bot)
         for guild_id in store.guild_ids():

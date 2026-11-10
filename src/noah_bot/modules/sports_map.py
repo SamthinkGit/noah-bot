@@ -7,7 +7,8 @@ import io
 import logging
 import math
 import re
-from urllib.parse import quote, unquote, unquote_plus
+import time
+from urllib.parse import parse_qs, quote, unquote, unquote_plus, urljoin, urlparse
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -20,6 +21,9 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 TIMEOUT = 10
+MAX_REDIRECTS = 6
+# Nominatim pide como mucho una petición por segundo.
+NOMINATIM_DELAY = 1.1
 
 TILE_SIZE = 256
 ZOOM = 16
@@ -58,31 +62,70 @@ def maps_url(location: str) -> str:
     return f"https://www.google.com/maps/search/?api=1&query={quote(location)}"
 
 
+def _redirect_chain(session: requests.Session, url: str) -> list[str]:
+    """El enlace y todos a los que redirige (los cortos, como maps.app.goo.gl,
+    llevan al enlace completo). La página de cookies de Google no se abre: solo se
+    saca de ella el enlace al que iba, que viene en `continue`."""
+    chain = [url]
+    current = url
+    for _ in range(MAX_REDIRECTS):
+        host = urlparse(current).netloc.lower()
+        if host.startswith("consent."):
+            chain.extend(parse_qs(urlparse(current).query).get("continue", []))
+            break
+        try:
+            response = session.get(current, timeout=TIMEOUT, allow_redirects=False)
+        except requests.RequestException:
+            break
+        location = response.headers.get("Location")
+        if not response.is_redirect or not location:
+            break
+        current = urljoin(current, location)
+        chain.append(current)
+    return chain
+
+
+def _name_from_url(url: str) -> str:
+    """Nombre o dirección que trae un enlace de Google Maps, si trae alguno."""
+    parsed = urlparse(url)
+    if match := _URL_PLACE.search(parsed.path):
+        return unquote_plus(match[1]).strip()
+    params = parse_qs(parsed.query)
+    # Los enlaces que se comparten desde el móvil son tipo `maps.google.com/?q=Sitio, Calle 1`.
+    for key in ("q", "query", "destination", "daddr"):
+        for value in params.get(key, []):
+            value = " ".join(value.split())
+            if value and not _COORDS.fullmatch(value):
+                return value
+    return ""
+
+
 def _coords_from_url(session: requests.Session, url: str) -> tuple[tuple[float, float] | None, str]:
     """Saca coordenadas y el nombre del sitio (si lo trae) de un enlace de mapas."""
-    final_url = url
-    try:
-        # Los enlaces cortos (maps.app.goo.gl) redirigen al enlace completo.
-        response = session.get(url, timeout=TIMEOUT, allow_redirects=True)
-        final_url = response.url
-    except requests.RequestException:
-        pass
+    chain = _redirect_chain(session, url)
+    candidates = [*chain, *(unquote(link) for link in chain)]
 
-    # Google a veces redirige a una página de cookies con el enlace codificado dentro:
-    # primero se mira el enlace original y luego el final, ya descodificado.
-    name = ""
-    for candidate in (url, unquote(final_url)):
-        if match := _URL_PLACE.search(candidate):
-            name = unquote_plus(match[1]).strip()
-            break
-
-    for candidate in (final_url, url):
+    name = next((found for link in chain if (found := _name_from_url(link))), "")
+    for candidate in candidates:
         for pattern in _URL_COORDS:
             if match := pattern.search(candidate):
                 coords = _valid(float(match[1]), float(match[2]))
                 if coords is not None:
                     return coords, name
     return None, name
+
+
+def _geocode_name(session: requests.Session, name: str) -> tuple[float, float] | None:
+    """Busca un sitio por su nombre. Si no aparece (pasa con muchos clubs), prueba
+    quitando trozos del principio: «Club X, Calle Y 3, Madrid» → «Calle Y 3, Madrid»."""
+    parts = [part.strip() for part in name.split(",") if part.strip()]
+    for start in range(max(1, len(parts) - 1)):
+        if start:
+            time.sleep(NOMINATIM_DELAY)
+        coords = _geocode(session, ", ".join(parts[start:]) or name)
+        if coords is not None:
+            return coords
+    return None
 
 
 def _geocode(session: requests.Session, query: str) -> tuple[float, float] | None:
@@ -151,11 +194,11 @@ def locate(location: str) -> tuple[tuple[float, float] | None, str]:
 
     session = _session()
     if not is_url(location):
-        return _geocode(session, location), ""
+        return _geocode_name(session, location), ""
 
     coords, name = _coords_from_url(session, location)
     if coords is None and name:
-        coords = _geocode(session, name)
+        coords = _geocode_name(session, name)
     if coords is not None and not name:
         name = _reverse_name(session, *coords)
     return coords, name
