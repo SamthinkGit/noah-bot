@@ -15,6 +15,7 @@ PROMPT_TIMEOUT = 60
 PANEL_STICKY_REPOST_DELAY = 2.0
 PANEL_STICKY_NOTICE_DELETE_AFTER = 8
 PANEL_STICKY_HISTORY_LOOKUP = 10
+CHANNEL_CLEANUP_NOTICE_DELETE_AFTER = 30
 
 # Evita que dos publicaciones del panel a la vez dejen paneles duplicados.
 _panel_locks: dict[int, asyncio.Lock] = {}
@@ -225,6 +226,15 @@ def _build_help_embed() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
+        name="Canal de confesiones",
+        value=(
+            "Solo se quedan los mensajes de Noah: cualquier otro mensaje se borra al "
+            f"momento y Noah avisa con un mensaje que desaparece a los "
+            f"{CHANNEL_CLEANUP_NOTICE_DELETE_AFTER}s."
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name=".noah confess sticky [on / off]",
         value=(
             "Mantiene el panel siempre como último mensaje de su canal: cada vez que "
@@ -272,6 +282,11 @@ def _build_config_embed(guild: discord.Guild, store: ConfessionsStore) -> discor
 
     if channel is not None:
         problem = _channel_problem(channel)
+        if problem is None and not channel.permissions_for(guild.me).manage_messages:
+            problem = (
+                f"No tengo permiso de gestionar mensajes en {channel.mention}: no puedo "
+                "borrar los mensajes que no sean confesiones."
+            )
         if problem is not None:
             embed.add_field(name="⚠️ Problema", value=problem, inline=False)
     return embed
@@ -530,6 +545,64 @@ def register_confess_commands(bot: commands.Bot, noah_group: commands.Group) -> 
             return
         sticky_tasks[guild.id] = asyncio.create_task(_sticky_repost_worker(guild))
 
+    # Último aviso de "aquí solo hay confesiones" por canal, para no acumular varios.
+    cleanup_notices: dict[int, discord.Message] = {}
+
+    def _is_cleanup_target(message: discord.Message) -> bool:
+        """Mensajes del canal de confesiones que no son de Noah: se borran."""
+        if message.guild is None or bot.user is None or message.author.id == bot.user.id:
+            return False
+        store = get_bot_context(bot).confessions
+        return message.channel.id == store.get_channel_id(message.guild.id)
+
+    async def _send_cleanup_notice(message: discord.Message) -> None:
+        channel = message.channel
+        previous = cleanup_notices.pop(channel.id, None)
+        if previous is not None:
+            with suppress(discord.HTTPException):
+                await previous.delete()
+
+        with suppress(discord.HTTPException):
+            notice = await channel.send(
+                f"🧹 {message.author.mention}, en este canal solo se publican las "
+                "confesiones anónimas de Noah: **todo lo demás se borra automáticamente**. "
+                "Usa el panel o `.noah confess` para enviar la tuya.",
+                delete_after=CHANNEL_CLEANUP_NOTICE_DELETE_AFTER,
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False, roles=False, users=[message.author]
+                ),
+            )
+            # Así el aviso no baja el panel fijo si está en este mismo canal.
+            transient_ids.add(notice.id)
+            asyncio.get_running_loop().call_later(
+                CHANNEL_CLEANUP_NOTICE_DELETE_AFTER + 5, transient_ids.discard, notice.id
+            )
+            cleanup_notices[channel.id] = notice
+
+    @bot.listen("on_message")
+    async def _clean_confessions_channel(message: discord.Message) -> None:
+        if not _is_cleanup_target(message):
+            return
+
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass  # Ya lo ha borrado otro (p. ej. `.noah confess`).
+        except discord.HTTPException:
+            return  # Sin permisos: no se avisa de algo que no se ha hecho.
+
+        # Los comandos ya responden por su cuenta; el aviso es para mensajes normales.
+        ctx = await bot.get_context(message)
+        if ctx.valid:
+            return
+        await _send_cleanup_notice(message)
+
+    @bot.listen("on_raw_message_delete")
+    async def _drop_cleanup_notice(payload: discord.RawMessageDeleteEvent) -> None:
+        notice = cleanup_notices.get(payload.channel_id)
+        if notice is not None and notice.id == payload.message_id:
+            cleanup_notices.pop(payload.channel_id, None)
+
     @bot.listen("on_ready")
     async def _register_confess_panel() -> None:
         nonlocal panel_view_registered
@@ -559,7 +632,8 @@ def register_confess_commands(bot: commands.Bot, noah_group: commands.Group) -> 
         if message.guild is None or _is_panel_message(bot, message):
             return
 
-        if message.id in transient_ids:
+        # Los mensajes que se borran del canal de confesiones no deben mover el panel.
+        if message.id in transient_ids or _is_cleanup_target(message):
             return
 
         store = get_bot_context(bot).confessions
