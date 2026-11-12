@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+RECENT_SESSIONS_LIMIT = 10
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -250,6 +252,32 @@ class VoiceManager:
         user["updated_at"] = _to_iso(_utc_now())
         self._save()
 
+    def _record_recent_session(
+        self,
+        user: dict[str, Any],
+        session: dict[str, Any],
+        started_at: datetime,
+        elapsed_seconds: int,
+    ) -> None:
+        """Guarda la primera sesión y las últimas para `.noah rrpp inspect`."""
+        if elapsed_seconds <= 0:
+            return
+
+        user.setdefault("first_session_at", _to_iso(started_at))
+        recent = user.get("recent_sessions")
+        if not isinstance(recent, list):
+            recent = []
+        recent.insert(
+            0,
+            {
+                "started_at": _to_iso(started_at),
+                "seconds": elapsed_seconds,
+                "channel_id": session.get("channel_id"),
+                "channel_name": session.get("channel_name"),
+            },
+        )
+        user["recent_sessions"] = recent[:RECENT_SESSIONS_LIMIT]
+
     def end_session(
         self,
         user_id: int,
@@ -285,6 +313,7 @@ class VoiceManager:
         user["last_channel_id"] = session.get("channel_id")
         user["last_channel_name"] = session.get("channel_name")
         user["updated_at"] = _to_iso(finished_at)
+        self._record_recent_session(user, session, started_at, elapsed_seconds)
 
         if guild_id is not None:
             user["last_guild_id"] = guild_id

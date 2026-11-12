@@ -1,5 +1,6 @@
 import json
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -184,6 +185,23 @@ class RrppStore:
             and user_key in payload["notified_users"]
             for _, payload in self.list_messages(guild_id)
         )
+
+    def help_requested_at(self, guild_id: int, user_id: int) -> float | None:
+        """Cuándo reaccionó el usuario a una cita RRPP por primera vez, si lo hizo."""
+        guild_data = self._guilds.get(str(guild_id))
+        help_users = guild_data.get("help_users") if isinstance(guild_data, dict) else None
+        if isinstance(help_users, dict):
+            with suppress(KeyError, TypeError, ValueError):
+                return float(help_users[str(user_id)])
+        return None
+
+    def list_claims_about(self, guild_id: int, target_id: int) -> list[dict[str, Any]]:
+        """Claims de cualquier RRPP sobre el usuario, del más reciente al más antiguo."""
+        return [
+            claim
+            for claim in self.list_claims(guild_id)
+            if claim.get("target_id") == str(target_id)
+        ]
 
     def unmark_notified(self, guild_id: int, message_id: int, user_id: int) -> None:
         payload = self.get_message(guild_id, message_id)

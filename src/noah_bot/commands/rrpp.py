@@ -94,6 +94,14 @@ def _build_help_embed() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
+        name=".noah rrpp inspect [@user]",
+        value=(
+            "Ficha de un usuario: cuenta, presentación, mensajes, voz y claims. "
+            "Busca a quien quieras o recorre a los recién llegados con ◀ ▶."
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name=".noah rrpp top",
         value="Ranking de niveles de los RRPP.",
         inline=False,

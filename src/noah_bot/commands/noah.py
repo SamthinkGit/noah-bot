@@ -15,6 +15,7 @@ from noah_bot.commands.guard import register_guard_commands
 from noah_bot.commands.presentations import register_presentations_commands
 from noah_bot.commands.relics import register_relics_commands
 from noah_bot.commands.rrpp import register_rrpp_commands
+from noah_bot.commands.rrpp_inspect import register_rrpp_inspect_commands
 from noah_bot.commands.rrpp_points import register_rrpp_points_commands
 from noah_bot.commands.spotify import register_spotify_commands
 from noah_bot.commands.sports import register_sports_commands
@@ -728,7 +729,9 @@ def register_noah_commands(bot: commands.Bot) -> None:
     register_vc_stats_commands(bot, noah)
     register_presentations_commands(bot, noah)
     register_guard_commands(bot, noah)
-    register_rrpp_points_commands(bot, register_rrpp_commands(bot, noah))
+    rrpp_group = register_rrpp_commands(bot, noah)
+    register_rrpp_points_commands(bot, rrpp_group)
+    register_rrpp_inspect_commands(bot, rrpp_group)
     register_confess_commands(bot, noah)
     register_billboard_commands(bot, noah)
     register_sports_commands(bot, noah)
