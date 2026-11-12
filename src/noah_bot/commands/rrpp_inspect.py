@@ -1,7 +1,8 @@
 import asyncio
+import logging
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import discord
@@ -10,33 +11,38 @@ from discord.ext import commands
 from noah_bot.commands.presentations import find_presentation
 from noah_bot.commands.rrpp import RRPP_COLOR, is_rrpp_admin
 from noah_bot.modules.bot_context import get_bot_context
-from noah_bot.modules.rrpp import CLAIM_ACCEPTED, CLAIM_REJECTED, RrppStore, level_for_points
+from noah_bot.modules.rrpp import CLAIM_ACCEPTED, RrppStore
 from noah_bot.modules.user_activity import FIRST_MESSAGES_LIMIT, local_day, message_entry
 
 
+_log = logging.getLogger(__name__)
+
 INSPECT_TIMEOUT = 900
-NEWCOMER_DAYS = 14
 NEW_ACCOUNT_DAYS = 30
 TEXT_LIMIT = 1800
 PRESENTATION_LIMIT = 1500
 HISTORY_SCAN_PER_CHANNEL = 300
 HISTORY_SCAN_CONCURRENCY = 4
 HISTORY_SCAN_TIMEOUT = 40
-RECENT_SESSIONS_SHOWN = 5
 TOP_CHANNELS_SHOWN = 5
-SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
-WEEKDAYS = "LMXJVSD"
+WEEKDAYS = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
+MONTHS = ("ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic")
 CLOSE_DETAIL = "close"
 # Detalle: (emoji, nombre, descripción del desplegable).
 DETAILS: dict[str, tuple[str, str, str]] = {
     "presentation": ("📝", "Presentación", "Texto completo e imagen"),
     "first": ("💬", "Primeros mensajes", "Sus 5 primeros mensajes, con enlace"),
-    "activity": ("📈", "Actividad", "Mensajes por día y por canal"),
-    "voice": ("🎧", "Sesiones de voz", "Nivel, puesto y últimas sesiones"),
+    "activity": ("📈", "Actividad", "Mensajes de la semana y por canal"),
+    "voice": ("🎧", "Voz", "Tiempo, estado y nivel de .noah vc"),
     "rrpp": ("🤝", "RRPP", "Quién le saludó, presentó y llevó al VC"),
     "server": ("🏷️", "Roles y servidor", "Roles, apodo, boost y avisos"),
 }
-CLAIM_NAMES = {"greeting": ("👋", "Saludo"), "presentation": ("📝", "Presentación"), "vc": ("🎧", "VC")}
+# Tipo de claim: (emoji, nombre) en el detalle RRPP.
+CLAIM_STEPS = (
+    ("greeting", "👋", "Saludo"),
+    ("presentation", "📝", "Presentación"),
+    ("vc", "🎧", "VC"),
+)
 
 
 # -- Formato -----------------------------------------------------------------
@@ -46,32 +52,17 @@ def _plural(count: int, one: str, many: str) -> str:
     return f"{count} {one if count == 1 else many}"
 
 
-def _span(seconds: float) -> str:
-    """Tiempo aproximado en la unidad más grande: `5 años`, `3 meses`, `12 días`…"""
-    seconds = max(0, int(seconds))
-    if seconds < 3600:
-        return f"{seconds // 60} min"
-    if seconds < 86400:
-        return f"{seconds // 3600} h"
-    days = seconds // 86400
-    if days < 60:
-        return _plural(days, "día", "días")
-    if days < 730:
-        return f"{days // 30} meses"
-    return f"{days // 365} años"
+def _minutes(total_minutes: int) -> str:
+    """Mismo formato que `.noah vc`: `6h 40m` o `52 min`."""
+    hours, minutes = divmod(max(int(total_minutes), 0), 60)
+    return f"{minutes} min" if hours == 0 else f"{hours}h {minutes}m"
 
 
-def _ago(moment: float) -> str:
-    seconds = discord.utils.utcnow().timestamp() - moment
-    return "ahora" if seconds < 60 else f"hace {_span(seconds)}"
-
-
-def _duration(seconds: float) -> str:
-    minutes = max(0, int(seconds)) // 60
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours} h {minutes:02d} min" if minutes else f"{hours} h"
-    return f"{minutes} min"
+def _hours(value: Any) -> str:
+    if value is None:
+        return "-"
+    number = float(value)
+    return f"{int(number)}h" if number.is_integer() else f"{number:g}h"
 
 
 def _ts(moment: float, style: str = "f") -> str:
@@ -82,9 +73,9 @@ def _jump(guild_id: int, channel_id: Any, message_id: Any) -> str:
     return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
 
 
-def _link_label(text: str) -> str:
-    text = discord.utils.escape_markdown(text).replace("[", "(").replace("]", ")")
-    return discord.utils.escape_mentions(text)
+def _quote(text: str) -> str:
+    text = discord.utils.escape_mentions(discord.utils.escape_markdown(text))
+    return "> " + text.replace("\n", "\n> ")
 
 
 def _clip(text: str, limit: int = TEXT_LIMIT) -> str:
@@ -98,6 +89,10 @@ def _iso_ts(value: Any) -> float | None:
         return datetime.fromisoformat(value).timestamp()
     except ValueError:
         return None
+
+
+def _day_name(day: date) -> str:
+    return f"{WEEKDAYS[day.weekday()]} {day.day} {MONTHS[day.month - 1]}"
 
 
 # -- Datos del usuario -------------------------------------------------------
@@ -115,31 +110,12 @@ class Profile:
     presentation_ref: tuple[int, int] | None
     claims: list[dict[str, Any]] = field(default_factory=list)
     help_at: float | None = None
-    rrpp_points: int | None = None
 
     @property
     def joined_at(self) -> float | None:
         if self.member is None or self.member.joined_at is None:
             return None
         return self.member.joined_at.timestamp()
-
-    @property
-    def voice_seconds(self) -> int:
-        return int(self.voice.get("effective_total_seconds", 0)) if self.voice else 0
-
-    def has_claim(self, claim_type: str) -> bool:
-        return any(
-            claim.get("type") == claim_type and claim.get("status") == CLAIM_ACCEPTED
-            for claim in self.claims
-        )
-
-    def steps(self) -> list[tuple[str, bool]]:
-        return [
-            ("👋 Saludo", self.has_claim("greeting")),
-            ("📝 Presentación", bool(self.presented)),
-            ("💬 Habla", int(self.activity.get("messages", 0)) > 0),
-            ("🎧 VC", self.voice_seconds > 0 or self.has_claim("vc")),
-        ]
 
     def counts_from_join(self) -> bool:
         """True si Noah ya contaba mensajes cuando el usuario entró."""
@@ -165,8 +141,6 @@ def _load_profile(
         if presentations.get_channel_id(guild.id) is None
         else presentations.has_completed(guild.id, user.id)
     )
-    rrpp = context.rrpp
-    points = rrpp.get_points(guild.id, user.id)
     return Profile(
         guild=guild,
         user=member or user,
@@ -176,32 +150,9 @@ def _load_profile(
         voice=context.voice_manager.get_user_stats(user.id),
         presented=presented,
         presentation_ref=presentations.get_presentation_message(guild.id, user.id),
-        claims=rrpp.list_claims_about(guild.id, user.id),
-        help_at=rrpp.help_requested_at(guild.id, user.id),
-        rrpp_points=points if (points or _is_rrpp(member or user, rrpp)) else None,
+        claims=context.rrpp.list_claims_about(guild.id, user.id),
+        help_at=context.rrpp.help_requested_at(guild.id, user.id),
     )
-
-
-def _join_position(guild: discord.Guild, member: discord.Member) -> int | None:
-    if member.joined_at is None:
-        return None
-    return 1 + sum(
-        1
-        for other in guild.members
-        if other.joined_at is not None and other.joined_at < member.joined_at
-    )
-
-
-def _newcomers(guild: discord.Guild) -> list[discord.Member]:
-    """Miembros que han entrado en los últimos días, el más nuevo primero."""
-    cutoff = discord.utils.utcnow() - timedelta(days=NEWCOMER_DAYS)
-    members = [
-        member
-        for member in guild.members
-        if not member.bot and member.joined_at is not None and member.joined_at >= cutoff
-    ]
-    members.sort(key=lambda member: member.joined_at, reverse=True)
-    return members
 
 
 # -- Ficha -------------------------------------------------------------------
@@ -212,8 +163,7 @@ def _header_text(profile: Profile) -> str:
     lines = [f"## {discord.utils.escape_markdown(user.display_name)}", f"{user.mention} · `{user.id}`"]
 
     flags: list[str] = []
-    now = discord.utils.utcnow()
-    account_days = (now - user.created_at).days
+    account_days = (discord.utils.utcnow() - user.created_at).days
     if user.bot:
         flags.append("🤖 Bot")
     if account_days < NEW_ACCOUNT_DAYS:
@@ -231,70 +181,39 @@ def _header_text(profile: Profile) -> str:
     return "\n".join(lines)
 
 
-def _sheet_text(profile: Profile) -> str:
-    rows: list[tuple[str, str, str]] = []
-    now = discord.utils.utcnow()
-    user = profile.user
+def _summary_text(profile: Profile) -> str:
+    created = profile.user.created_at.timestamp()
+    lines = [f"🪪 **Cuenta:** creada el {_ts(created, 'D')} ({_ts(created, 'R')})"]
 
-    rows.append(("Cuenta", _span((now - user.created_at).total_seconds()), f"creada {user.created_at:%d/%m/%Y}"))
-
-    if profile.member is not None and profile.member.joined_at is not None:
-        position = _join_position(profile.guild, profile.member)
-        rows.append(
-            (
-                "Servidor",
-                _span((now - profile.member.joined_at).total_seconds()),
-                f"llegada nº {position:,}".replace(",", ".") if position else "",
-            )
-        )
-    else:
-        rows.append(("Servidor", "fuera", ""))
+    joined = profile.joined_at
+    if joined is not None:
+        lines.append(f"🚪 **En el servidor:** desde el {_ts(joined, 'D')} ({_ts(joined, 'R')})")
 
     if profile.presented is None:
-        rows.append(("Presentada", "-", "sin configurar"))
-    elif profile.presented:
-        extra = ""
-        joined = profile.joined_at
+        presentation = "sin configurar"
+    elif not profile.presented:
+        presentation = "❌ todavía no"
+    else:
+        presentation = "✅ hecha"
         if profile.presentation_ref is not None and joined is not None:
             presented_at = discord.utils.snowflake_time(profile.presentation_ref[1]).timestamp()
             if presented_at >= joined:
-                extra = f"+{_duration(presented_at - joined)} tras entrar"
-        rows.append(("Presentada", "sí", extra))
-    else:
-        rows.append(("Presentada", "no", ""))
+                presentation += f", {_minutes(int(presented_at - joined) // 60)} después de entrar"
+    lines.append(f"📝 **Presentación:** {presentation}")
 
-    activity = profile.activity
-    today = int(activity.get("days", {}).get(local_day().isoformat(), 0))
-    extra = f"hoy {today}"
-    last = activity.get("last")
+    messages = f"💬 **Mensajes:** {int(profile.activity.get('messages', 0))}"
+    last = profile.activity.get("last")
     if isinstance(last, dict):
-        extra += f" · último {_ago(float(last.get('at', 0)))}"
-    rows.append(("Mensajes", str(int(activity.get("messages", 0))), extra))
+        messages += f" · el último {_ts(float(last.get('at', 0)), 'R')}"
+    lines.append(messages)
 
     voice = profile.voice
     if voice is None:
-        rows.append(("Voz", "0 min", "nunca ha entrado"))
+        lines.append("🎧 **Voz:** nunca ha entrado")
     else:
-        if voice.get("is_connected"):
-            extra = "en VC ahora"
-        else:
-            extra = _plural(int(voice.get("sessions", 0)), "sesión", "ses.")
-            left = _iso_ts(voice.get("last_left_at"))
-            if left is not None:
-                extra += f" · última {_ago(left)}"
-        rows.append(("Voz", _duration(profile.voice_seconds), extra))
-
-    steps = profile.steps()
-    done = sum(1 for _, ok in steps if ok)
-    rows.append(("RRPP", f"{done}/{len(steps)} pasos", "pidió ayuda" if profile.help_at else ""))
-
-    if profile.rrpp_points is not None:
-        rows.append(
-            ("Es RRPP", f"nivel {level_for_points(profile.rrpp_points)}", f"{profile.rrpp_points} puntos")
-        )
-
-    body = "\n".join(f"{label:<11}{value:<13}{extra}".rstrip() for label, value, extra in rows)
-    return f"```\n{body}\n```"
+        status = " · 🟢 en VC ahora" if voice.get("is_connected") else ""
+        lines.append(f"🎧 **Voz:** {_minutes(int(voice.get('effective_total_minutes', 0)))}{status}")
+    return "\n".join(lines)
 
 
 # -- Detalles ----------------------------------------------------------------
@@ -359,12 +278,12 @@ async def _presentation_items(bot: commands.Bot, profile: Profile) -> list[disco
         ]
 
     meta = f"-# {_ts(message.created_at.timestamp())} en {message.channel.mention}"
-    joined = profile.joined_at
-    if joined is not None and message.created_at.timestamp() >= joined:
-        meta += f" · {_duration(message.created_at.timestamp() - joined)} tras entrar"
     content = message.content.strip() or "*Sin texto.*"
     items: list[discord.ui.Item[Any]] = [
-        discord.ui.TextDisplay(f"{title}\n{meta}\n{_clip(content, PRESENTATION_LIMIT)}")
+        discord.ui.TextDisplay(
+            f"{title}\n{meta}\n\n{_clip(content, PRESENTATION_LIMIT)}\n\n"
+            f"[↗ Ir al mensaje]({message.jump_url})"
+        )
     ]
     images = [
         attachment.url
@@ -400,172 +319,148 @@ async def _first_messages_text(bot: commands.Bot, profile: Profile) -> str:
     if not entries:
         return f"{title}\nNo he encontrado mensajes suyos."
 
-    lines = [
-        f"{_ts(float(entry.get('at', 0)))} <#{entry.get('channel_id')}> "
-        f"[{_link_label(str(entry.get('text', '…')))}]"
-        f"({_jump(profile.guild.id, entry.get('channel_id'), entry.get('message_id'))})"
-        for entry in entries
-    ]
+    blocks = [title]
+    for number, entry in enumerate(entries, start=1):
+        url = _jump(profile.guild.id, entry.get("channel_id"), entry.get("message_id"))
+        blocks.append(
+            f"**{number}.** {_ts(float(entry.get('at', 0)))} en <#{entry.get('channel_id')}>\n"
+            f"{_quote(str(entry.get('text', '…')))}\n"
+            f"[↗ Ir al mensaje]({url})"
+        )
+
     since = profile.tracking_since
     if (
         since is not None
         and not profile.counts_from_join()
         and all(float(entry.get("at", 0)) >= since for entry in entries)
     ):
-        lines.append(
+        blocks.append(
             f"-# No los encuentro en el historial; son los primeros desde que Noah cuenta "
             f"mensajes ({_ts(since, 'D')})."
         )
     elif scanned:
-        lines.append("-# Buscados en el historial de los canales.")
-    return _clip(f"{title}\n" + "\n".join(lines))
+        blocks.append("-# Buscados en el historial de los canales.")
+    return _clip("\n\n".join(blocks))
 
 
 def _activity_text(profile: Profile) -> str:
     activity = profile.activity
     days: dict[str, int] = activity.get("days", {})
     today = local_day()
-    week = [today - timedelta(days=offset) for offset in range(6, -1, -1)]
-    counts = [int(days.get(day.isoformat(), 0)) for day in week]
-    top = max(counts) or 1
+    week = [today - timedelta(days=offset) for offset in range(7)]
+    counts = {day: int(days.get(day.isoformat(), 0)) for day in week}
 
-    def _block(count: int) -> str:
-        if count == 0:
-            return " "
-        return SPARK_BLOCKS[max(0, -(-count * len(SPARK_BLOCKS) // top) - 1)]
-
-    chart = "\n".join(
-        (
-            "".join(f"{WEEKDAYS[day.weekday()]:>4}" for day in week),
-            "".join(f"{_block(count) * 2:>4}" for count in counts),
-            "".join(f"{count:>4}" for count in counts),
-        )
-    )
-    lines = [_title("activity"), f"**{sum(counts)}** mensajes en los últimos 7 días", f"```\n{chart}\n```"]
+    lines = [
+        _title("activity"),
+        f"**Hoy:** {counts[today]}",
+        f"**Últimos 7 días:** {sum(counts.values())}",
+    ]
+    busiest = max(week, key=lambda day: counts[day])
+    if counts[busiest]:
+        lines.append(f"**Día más activo:** {_day_name(busiest)} ({counts[busiest]})")
 
     channels: dict[str, int] = activity.get("channels", {})
     total = sum(channels.values())
     ranked = sorted(channels.items(), key=lambda item: item[1], reverse=True)[:TOP_CHANNELS_SHOWN]
     if ranked:
+        lines.append("")
         lines.append("**Dónde escribe**")
-        lines.extend(
-            f"<#{channel_id}> · **{count}** ({count * 100 // total} %)" for channel_id, count in ranked
-        )
+        lines.extend(f"<#{channel_id}> · {count} ({count * 100 // total} %)" for channel_id, count in ranked)
 
     last = activity.get("last")
     if isinstance(last, dict):
+        url = _jump(profile.guild.id, last.get("channel_id"), last.get("message_id"))
+        lines.append("")
         lines.append(
-            f"Último mensaje {_ts(float(last.get('at', 0)), 'R')} en <#{last.get('channel_id')}> · "
-            f"[ir al mensaje]({_jump(profile.guild.id, last.get('channel_id'), last.get('message_id'))})"
+            f"**Último mensaje:** {_ts(float(last.get('at', 0)), 'R')} en <#{last.get('channel_id')}> · "
+            f"[↗ Ir al mensaje]({url})"
         )
     if not profile.counts_from_join() and profile.tracking_since is not None:
         lines.append(f"-# Noah cuenta mensajes desde el {_ts(profile.tracking_since, 'D')}.")
     return _clip("\n".join(lines))
 
 
-def _voice_text(bot: commands.Bot, profile: Profile) -> str:
+def _voice_text(profile: Profile) -> str:
+    """Los mismos datos que `.noah vc stats`, con aire entre bloques."""
     title = _title("voice")
     voice = profile.voice
     if voice is None:
-        return f"{title}\nNunca ha entrado a un canal de voz."
+        return f"{title}\n🔇 Todavía no tiene stats de voz."
 
-    sessions = int(voice.get("sessions", 0))
-    total = profile.voice_seconds
-    summary = f"**{_duration(total)}** en {_plural(sessions, 'sesión', 'sesiones')}"
-    if sessions:
-        summary += f" · media {_duration(int(voice.get('total_seconds', 0)) / sessions)}"
-    lines = [title, summary]
+    lines = [
+        title,
+        f"**Tiempo total:** {_minutes(int(voice.get('effective_total_minutes', 0)))}",
+        f"**Sesiones:** {int(voice.get('sessions', 0))}",
+        "",
+    ]
 
-    manager = get_bot_context(bot).voice_manager
-    member_ids = {member.id for member in profile.guild.members}
-    ranking = manager.get_top_users(limit=len(member_ids) or 1, guild_member_ids=member_ids)
-    position = next(
-        (index for index, record in enumerate(ranking, start=1) if int(record["user_id"]) == profile.user.id),
-        None,
-    )
-    level = voice.get("level_data")
-    rank_parts: list[str] = []
-    if isinstance(level, dict):
-        rank_parts.append(
-            f"Nivel VC **{level['level']}** · {level['progress_percent']} % hacia el {level['next_level']}"
-        )
-    if position is not None:
-        rank_parts.append(f"puesto **#{position}** de {len(ranking)}")
-    if rank_parts:
-        lines.append(" · ".join(rank_parts))
-
-    active = voice.get("active_session")
-    if isinstance(active, dict):
-        started = _iso_ts(active.get("started_at"))
-        since = f" desde {_ts(started, 'R')}" if started is not None else ""
-        lines.append(f"🟢 Ahora en <#{active.get('channel_id')}>{since}")
-
-    recent = voice.get("recent_sessions")
-    if isinstance(recent, list) and recent:
-        lines.append("**Últimas sesiones**")
-        for session in recent[:RECENT_SESSIONS_SHOWN]:
-            started = _iso_ts(session.get("started_at"))
-            when = _ts(started) if started is not None else "?"
-            lines.append(f"{when} · {session.get('channel_name') or 'canal'} · **{_duration(session.get('seconds', 0))}**")
+    active = voice.get("active_session") or {}
+    if voice.get("is_connected"):
+        lines.append(f"**Estado:** 🟢 Conectado en {active.get('channel_name') or 'un canal'}")
+        lines.append(f"**Sesión actual:** {_minutes(int(voice.get('current_session_minutes', 0)))}")
     else:
-        last_joined = _iso_ts(voice.get("last_joined_at"))
-        if last_joined is not None:
-            lines.append(f"Última vez: {_ts(last_joined)} en {voice.get('last_channel_name') or 'un canal'}")
+        lines.append("**Estado:** ⚫ Desconectado")
+        lines.append(f"**Último canal:** {voice.get('last_channel_name') or '-'}")
 
-    first = _iso_ts(voice.get("first_session_at"))
-    if first is not None:
-        lines.append(f"-# Primera sesión registrada: {_ts(first, 'D')}")
+    joined = _iso_ts(voice.get("last_joined_at"))
+    left = _iso_ts(voice.get("last_left_at"))
+    lines.append(f"**Última entrada:** {_ts(joined, 'R') if joined is not None else '-'}")
+    lines.append(f"**Última salida:** {_ts(left, 'R') if left is not None else '-'}")
+
+    level = voice.get("level_data")
+    lines.append("")
+    if isinstance(level, dict):
+        lines.append(f"**Nivel:** {level['level']}")
+        lines.append(
+            f"**Progreso:** {_minutes(int(level['progress_minutes']))} / "
+            f"{_minutes(int(level['minutes_per_level']))} ({int(level['progress_percent'])} %)"
+        )
+        lines.append(f"**Siguiente nivel en:** {_minutes(int(level['remaining_minutes']))}")
+        lines.append(f"-# Cada nivel pide {_hours(level.get('hours_per_level'))} en voz.")
+    else:
+        lines.append("**Nivel:** sistema desactivado")
     return _clip("\n".join(lines))
 
 
 def _rrpp_text(profile: Profile) -> str:
-    lines = [_title("rrpp"), " · ".join(f"{name} {'✅' if ok else '❌'}" for name, ok in profile.steps())]
-
-    if profile.claims:
-        lines.append("**Claims sobre esta persona**")
-        for claim in profile.claims[:10]:
-            emoji, name = CLAIM_NAMES.get(str(claim.get("type")), ("❔", str(claim.get("type"))))
-            rejected = claim.get("status") == CLAIM_REJECTED
-            points = "rechazado" if rejected else f"{int(claim.get('points', 0))} p"
-            lines.append(
-                f"`#{claim.get('id')}` {emoji} {name} · <@{claim.get('rrpp_id')}> · {points} · "
-                f"{_ts(float(claim.get('created_at', 0)), 'd')}"
-            )
-    else:
-        lines.append("Ningún RRPP ha hecho claims sobre esta persona.")
+    lines = [_title("rrpp")]
+    for claim_type, emoji, name in CLAIM_STEPS:
+        rrpps: list[str] = []
+        for claim in reversed(profile.claims):
+            if claim.get("type") != claim_type or claim.get("status") != CLAIM_ACCEPTED:
+                continue
+            mention = f"<@{claim.get('rrpp_id')}>"
+            if mention not in rrpps:
+                rrpps.append(mention)
+        lines.append(f"{emoji} **{name}:** {', '.join(rrpps) if rrpps else 'nadie todavía'}")
 
     if profile.help_at is not None:
-        lines.append(f"📩 Pidió ayuda reaccionando a una cita RRPP {_ts(profile.help_at)}")
+        lines.append(f"📩 **Pidió ayuda:** sí, {_ts(profile.help_at, 'R')}")
     else:
-        lines.append("-# No ha reaccionado a ninguna cita RRPP.")
-    return _clip("\n".join(lines))
+        lines.append("📩 **Pidió ayuda:** no")
+    return "\n".join(lines)
 
 
 def _server_text(profile: Profile) -> str:
-    title = _title("server")
     member = profile.member
     user = profile.user
-    lines = [title, f"Cuenta creada {_ts(user.created_at.timestamp(), 'F')}"]
+    lines = [_title("server")]
     if member is None:
         lines.append("🚪 Ya no está en el servidor.")
         return "\n".join(lines)
 
-    if member.joined_at is not None:
-        lines.append(f"Entró {_ts(member.joined_at.timestamp(), 'F')}")
     roles = [role for role in reversed(member.roles) if not role.is_default()]
-    lines.append(
-        f"**Roles ({len(roles)})** " + (" ".join(role.mention for role in roles) if roles else "ninguno")
-    )
+    lines.append(f"**Roles ({len(roles)}):** " + (" ".join(role.mention for role in roles) if roles else "ninguno"))
+    lines.append("")
+    lines.append(f"**Usuario:** `{user.name}`")
     if member.nick:
-        lines.append(f"Apodo: **{discord.utils.escape_markdown(member.nick)}** · usuario `{user.name}`")
-    else:
-        lines.append(f"Usuario `{user.name}`")
+        lines.append(f"**Apodo:** {discord.utils.escape_markdown(member.nick)}")
     if member.premium_since is not None:
-        lines.append(f"💎 Booster desde {_ts(member.premium_since.timestamp(), 'D')}")
+        lines.append(f"💎 **Booster** desde el {_ts(member.premium_since.timestamp(), 'D')}")
     if member.guild_avatar is not None:
         lines.append("🖼️ Usa un avatar propio en este servidor")
     if member.is_timed_out() and member.timed_out_until is not None:
-        lines.append(f"⏳ Aislado hasta {_ts(member.timed_out_until.timestamp(), 'F')}")
+        lines.append(f"⏳ **Aislado** hasta {_ts(member.timed_out_until.timestamp(), 'F')}")
     if member.pending:
         lines.append("⚠️ Todavía no ha aceptado las normas del servidor")
     return _clip("\n".join(lines))
@@ -581,7 +476,7 @@ async def _detail_items(
     elif detail == "activity":
         text = _activity_text(profile)
     elif detail == "voice":
-        text = _voice_text(bot, profile)
+        text = _voice_text(profile)
     elif detail == "rrpp":
         text = _rrpp_text(profile)
     else:
@@ -590,6 +485,21 @@ async def _detail_items(
 
 
 # -- Vista -------------------------------------------------------------------
+
+
+def _loading_view(text: str) -> discord.ui.LayoutView:
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(discord.ui.Container(discord.ui.TextDisplay(f"⏳ {text}"), accent_color=RRPP_COLOR))
+    return view
+
+
+def _loading_text(user: discord.abc.User | None, detail: str | None) -> str:
+    if user is None:
+        return "Cargando…"
+    name = discord.utils.escape_markdown(user.display_name)
+    if detail in DETAILS:
+        return f"Cargando **{DETAILS[detail][1]}** de **{name}**…"
+    return f"Cargando la ficha de **{name}**…"
 
 
 class InspectSearchModal(discord.ui.Modal, title="Buscar usuario"):
@@ -637,27 +547,14 @@ class InspectView(discord.ui.LayoutView):
 
     async def _render(self) -> None:
         container = discord.ui.Container(accent_color=RRPP_COLOR)
-        newcomers = _newcomers(self.guild)
         profile = _load_profile(self.bot, self.guild, self.user) if self.user is not None else None
 
         if profile is None:
             container.add_item(
                 discord.ui.TextDisplay(
-                    "## 🔎 Inspector RRPP\n"
-                    "Pulsa **👤 Buscar** para elegir a alguien, o recorre a los recién "
-                    "llegados con ◀ ▶."
+                    "## 🔎 Inspector RRPP\nPulsa **👤 Buscar** para elegir a quién inspeccionar."
                 )
             )
-            if newcomers:
-                newest = newcomers[0]
-                assert newest.joined_at is not None
-                summary = (
-                    f"{_plural(len(newcomers), 'persona nueva', 'personas nuevas')} · la última, "
-                    f"{newest.mention}, entró {_ts(newest.joined_at.timestamp(), 'R')}"
-                )
-            else:
-                summary = "Nadie nuevo por ahora."
-            container.add_item(discord.ui.TextDisplay(summary))
         else:
             container.add_item(
                 discord.ui.Section(
@@ -666,20 +563,15 @@ class InspectView(discord.ui.LayoutView):
                 )
             )
             container.add_item(discord.ui.Separator())
-            container.add_item(discord.ui.TextDisplay(_sheet_text(profile)))
+            container.add_item(discord.ui.TextDisplay(_summary_text(profile)))
             if self.detail in DETAILS:
                 container.add_item(discord.ui.Separator())
                 for item in await _detail_items(self.bot, profile, self.detail):
                     container.add_item(item)
+            container.add_item(discord.ui.Separator())
             container.add_item(discord.ui.ActionRow(self._detail_select()))
 
-        container.add_item(self._nav_row(newcomers, profile))
-        container.add_item(
-            discord.ui.TextDisplay(
-                f"-# ◀ ▶ recorren a quienes han entrado en los últimos {NEWCOMER_DAYS} días, "
-                f"del más nuevo al más antiguo · actualizado {_ts(discord.utils.utcnow().timestamp(), 'R')}"
-            )
-        )
+        container.add_item(self._button_row(profile))
         self.add_item(container)
 
     def _detail_select(self) -> discord.ui.Select[Any]:
@@ -706,41 +598,15 @@ class InspectView(discord.ui.LayoutView):
         select.callback = _on_select
         return select
 
-    def _nav_row(
-        self, newcomers: list[discord.Member], profile: Profile | None
-    ) -> discord.ui.ActionRow[Any]:
-        ids = [member.id for member in newcomers]
-        index = ids.index(self.user.id) if self.user is not None and self.user.id in ids else None
+    def _button_row(self, profile: Profile | None) -> discord.ui.ActionRow[Any]:
         row: discord.ui.ActionRow[Any] = discord.ui.ActionRow()
+        search = discord.ui.Button(label="Buscar", emoji="👤", style=discord.ButtonStyle.primary)
 
-        def _go(target: int) -> Any:
-            async def _callback(interaction: discord.Interaction) -> None:
-                # Se recalcula por si alguien ha entrado o salido mientras tanto.
-                fresh = _newcomers(self.guild)
-                if not fresh:
-                    await self.show(interaction, self.user, self.detail)
-                    return
-                await self.show(interaction, fresh[max(0, min(target, len(fresh) - 1))], self.detail)
+        async def _search(interaction: discord.Interaction) -> None:
+            await interaction.response.send_modal(InspectSearchModal(self))
 
-            return _callback
-
-        previous = discord.ui.Button(emoji="◀️", style=discord.ButtonStyle.secondary)
-        previous.disabled = index is None or index == 0
-        previous.callback = _go((index or 0) - 1)
-        row.add_item(previous)
-
-        position = f"{index + 1}" if index is not None else "–"
-        counter = discord.ui.Button(
-            label=f"{position} / {len(newcomers)} nuevos",
-            style=discord.ButtonStyle.secondary,
-            disabled=True,
-        )
-        row.add_item(counter)
-
-        following = discord.ui.Button(emoji="▶️", style=discord.ButtonStyle.secondary)
-        following.disabled = not newcomers or (index is not None and index >= len(newcomers) - 1)
-        following.callback = _go(0 if index is None else index + 1)
-        row.add_item(following)
+        search.callback = _search
+        row.add_item(search)
 
         if profile is not None and profile.presentation_ref is not None:
             channel_id, message_id = profile.presentation_ref
@@ -751,14 +617,6 @@ class InspectView(discord.ui.LayoutView):
                     url=_jump(self.guild.id, channel_id, message_id),
                 )
             )
-
-        search = discord.ui.Button(label="Buscar", emoji="👤", style=discord.ButtonStyle.primary)
-
-        async def _search(interaction: discord.Interaction) -> None:
-            await interaction.response.send_modal(InspectSearchModal(self))
-
-        search.callback = _search
-        row.add_item(search)
         return row
 
     async def show(
@@ -767,10 +625,21 @@ class InspectView(discord.ui.LayoutView):
         user: discord.Member | discord.User | None,
         detail: str | None,
     ) -> None:
-        await interaction.response.defer()
-        view = await InspectView.create(self.bot, self.guild, self.author_id, user, detail)
-        view.message = self.message or interaction.message
         self.stop()
+        await interaction.response.edit_message(
+            view=_loading_view(_loading_text(user, detail)),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        try:
+            view = await InspectView.create(self.bot, self.guild, self.author_id, user, detail)
+        except Exception:
+            # Que la ficha no se quede en "Cargando…": se vuelve a la ficha sin detalle.
+            _log.exception("No se ha podido cargar el inspector RRPP")
+            view = await InspectView.create(self.bot, self.guild, self.author_id, user)
+            await interaction.followup.send(
+                "❌ No he podido cargar ese detalle. Inténtalo otra vez.", ephemeral=True
+            )
+        view.message = self.message or interaction.message
         await interaction.edit_original_response(
             view=view, allowed_mentions=discord.AllowedMentions.none()
         )
@@ -816,9 +685,11 @@ def register_rrpp_inspect_commands(bot: commands.Bot, rrpp_group: commands.Group
             await ctx.send("❌ Solo los RRPP y los administradores pueden usar este comando.")
             return
 
-        async with ctx.typing():
-            view = await InspectView.create(ctx.bot, ctx.guild, ctx.author.id, user)
-        view.message = await ctx.send(view=view, allowed_mentions=discord.AllowedMentions.none())
+        none = discord.AllowedMentions.none()
+        message = await ctx.send(view=_loading_view(_loading_text(user, None)), allowed_mentions=none)
+        view = await InspectView.create(ctx.bot, ctx.guild, ctx.author.id, user)
+        view.message = message
+        await message.edit(view=view, allowed_mentions=none)
 
     @inspect.error
     async def _inspect_error(ctx: commands.Context, error: commands.CommandError) -> None:
