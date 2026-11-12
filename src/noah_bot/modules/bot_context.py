@@ -24,7 +24,6 @@ from noah_bot.modules.spotify_player import (
 )
 from noah_bot.modules.steallist import StealList
 from noah_bot.modules.tts import TTSVoiceStore
-from noah_bot.modules.user_activity import UserActivityStore
 from noah_bot.modules.voice_manager import VoiceManager
 from noah_bot.modules.waifu_game import WaifuGameManager
 
@@ -57,7 +56,6 @@ class BotContext:
         default_factory=NoahGochiStoryService
     )
     daily_stats: DailyStatsManager = field(default_factory=DailyStatsManager)
-    user_activity: UserActivityStore = field(default_factory=UserActivityStore)
     spotify_player: SpotifyPlayer = field(default_factory=SpotifyPlayer)
     spotify_access: SpotifyAccessStore = field(default_factory=SpotifyAccessStore)
     spotify_states: dict[int, SpotifyGuildState] = field(default_factory=dict)

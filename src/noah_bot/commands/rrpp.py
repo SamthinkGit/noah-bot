@@ -96,7 +96,7 @@ def _build_help_embed() -> discord.Embed:
     embed.add_field(
         name=".noah rrpp inspect [@user]",
         value=(
-            "Ficha de un usuario: cuenta, presentación, mensajes, voz y claims. "
+            "Ficha de un usuario: cuenta, verificación, presentación, primeros mensajes, voz y RRPP. "
             "Pulsa 👤 Buscar para elegir a quién."
         ),
         inline=False,

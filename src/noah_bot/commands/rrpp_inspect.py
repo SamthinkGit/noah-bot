@@ -1,19 +1,22 @@
 import asyncio
+import io
 import logging
+import re
+import time
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import discord
 from discord.ext import commands
+from discord.http import Route
 
 from noah_bot.commands.presentations import find_presentation
 from noah_bot.commands.rrpp import RRPP_COLOR, is_rrpp_admin
 from noah_bot.modules.bot_context import get_bot_context
+from noah_bot.modules.inspect_card import Badge, CardData, Stat, render_card
 from noah_bot.modules.rrpp import CLAIM_ACCEPTED, RrppStore
-from noah_bot.modules.user_activity import FIRST_MESSAGES_LIMIT, local_day, message_entry
-
 
 _log = logging.getLogger(__name__)
 
@@ -21,28 +24,36 @@ INSPECT_TIMEOUT = 900
 NEW_ACCOUNT_DAYS = 30
 TEXT_LIMIT = 1800
 PRESENTATION_LIMIT = 1500
-HISTORY_SCAN_PER_CHANNEL = 300
+SNIPPET_LIMIT = 160
+CARD_NAME = "perfil.png"
+AVATAR_CACHE_SIZE = 64
+# Primeros mensajes: se piden de 5 en 5 a la búsqueda de Discord.
+PAGE_SIZE = 5
+SEARCH_MAX_OFFSET = 9975
+SEARCH_ATTEMPTS = 3
+# Respaldo si la búsqueda no está disponible: se lee el historial de cada canal.
+HISTORY_SCAN_PER_CHANNEL = 500
 HISTORY_SCAN_CONCURRENCY = 4
 HISTORY_SCAN_TIMEOUT = 40
-TOP_CHANNELS_SHOWN = 5
-WEEKDAYS = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
-MONTHS = ("ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic")
+SCAN_CACHE_SECONDS = 600
 CLOSE_DETAIL = "close"
+VERIFIED_ROLE_PATTERN = re.compile(r"^\W*(verificad[oa]s?|verified)\W*$", re.IGNORECASE)
 # Detalle: (emoji, nombre, descripción del desplegable).
 DETAILS: dict[str, tuple[str, str, str]] = {
     "presentation": ("📝", "Presentación", "Texto completo e imagen"),
-    "first": ("💬", "Primeros mensajes", "Sus 5 primeros mensajes, con enlace"),
-    "activity": ("📈", "Actividad", "Mensajes de la semana y por canal"),
+    "first": ("💬", "Primeros mensajes", "Desde el más antiguo, de 5 en 5"),
     "voice": ("🎧", "Voz", "Tiempo, estado y nivel de .noah vc"),
     "rrpp": ("🤝", "RRPP", "Quién le saludó, presentó y llevó al VC"),
-    "server": ("🏷️", "Roles y servidor", "Roles, apodo, boost y avisos"),
+    "server": ("🏷️", "Roles y servidor", "Verificación, roles, apodo y avisos"),
 }
-# Tipo de claim: (emoji, nombre) en el detalle RRPP.
 CLAIM_STEPS = (
     ("greeting", "👋", "Saludo"),
     ("presentation", "📝", "Presentación"),
     ("vc", "🎧", "VC"),
 )
+
+_avatar_cache: dict[str, bytes] = {}
+_scan_cache: dict[tuple[int, int], tuple[float, list[dict[str, Any]], bool]] = {}
 
 
 # -- Formato -----------------------------------------------------------------
@@ -50,6 +61,21 @@ CLAIM_STEPS = (
 
 def _plural(count: int, one: str, many: str) -> str:
     return f"{count} {one if count == 1 else many}"
+
+
+def _span(seconds: float) -> str:
+    """Tiempo aproximado en la unidad más grande: `5 años`, `3 meses`, `12 días`…"""
+    seconds = max(0, int(seconds))
+    if seconds < 3600:
+        return f"{seconds // 60} min"
+    if seconds < 86400:
+        return f"{seconds // 3600} h"
+    days = seconds // 86400
+    if days < 60:
+        return _plural(days, "día", "días")
+    if days < 730:
+        return f"{days // 30} meses"
+    return f"{days // 365} años"
 
 
 def _minutes(total_minutes: int) -> str:
@@ -67,6 +93,10 @@ def _hours(value: Any) -> str:
 
 def _ts(moment: float, style: str = "f") -> str:
     return f"<t:{int(moment)}:{style}>"
+
+
+def _date(moment: datetime) -> str:
+    return moment.astimezone().strftime("%d/%m/%Y")
 
 
 def _jump(guild_id: int, channel_id: Any, message_id: Any) -> str:
@@ -91,11 +121,21 @@ def _iso_ts(value: Any) -> float | None:
         return None
 
 
-def _day_name(day: date) -> str:
-    return f"{WEEKDAYS[day.weekday()]} {day.day} {MONTHS[day.month - 1]}"
+def _snippet(content: str, attachments: int, stickers: int) -> str:
+    text = " ".join(content.split())
+    if not text:
+        text = "📎 adjunto" if attachments else "🏷️ sticker" if stickers else "…"
+    return text if len(text) <= SNIPPET_LIMIT else text[: SNIPPET_LIMIT - 1] + "…"
 
 
 # -- Datos del usuario -------------------------------------------------------
+
+
+@dataclass
+class Verification:
+    badge: str | None
+    tone: str
+    sentence: str
 
 
 @dataclass
@@ -103,11 +143,10 @@ class Profile:
     guild: discord.Guild
     user: discord.Member | discord.User
     member: discord.Member | None
-    activity: dict[str, Any]
-    tracking_since: float | None
     voice: dict[str, Any] | None
     presented: bool | None
     presentation_ref: tuple[int, int] | None
+    is_rrpp: bool
     claims: list[dict[str, Any]] = field(default_factory=list)
     help_at: float | None = None
 
@@ -116,11 +155,6 @@ class Profile:
         if self.member is None or self.member.joined_at is None:
             return None
         return self.member.joined_at.timestamp()
-
-    def counts_from_join(self) -> bool:
-        """True si Noah ya contaba mensajes cuando el usuario entró."""
-        joined = self.joined_at
-        return self.tracking_since is not None and joined is not None and joined >= self.tracking_since
 
 
 def _is_rrpp(member: discord.abc.User, store: RrppStore) -> bool:
@@ -145,84 +179,221 @@ def _load_profile(
         guild=guild,
         user=member or user,
         member=member,
-        activity=context.user_activity.get_user(guild.id, user.id),
-        tracking_since=context.user_activity.tracking_since(guild.id),
         voice=context.voice_manager.get_user_stats(user.id),
         presented=presented,
         presentation_ref=presentations.get_presentation_message(guild.id, user.id),
+        is_rrpp=member is not None and _is_rrpp(member, context.rrpp),
         claims=context.rrpp.list_claims_about(guild.id, user.id),
         help_at=context.rrpp.help_requested_at(guild.id, user.id),
     )
 
 
-# -- Ficha -------------------------------------------------------------------
+def _verified_role(guild: discord.Guild) -> discord.Role | None:
+    return next((role for role in guild.roles if VERIFIED_ROLE_PATTERN.match(role.name.strip())), None)
 
 
-def _header_text(profile: Profile) -> str:
-    user = profile.user
-    lines = [f"## {discord.utils.escape_markdown(user.display_name)}", f"{user.mention} · `{user.id}`"]
-
-    flags: list[str] = []
-    account_days = (discord.utils.utcnow() - user.created_at).days
-    if user.bot:
-        flags.append("🤖 Bot")
-    if account_days < NEW_ACCOUNT_DAYS:
-        flags.append(f"🆕 Cuenta nueva ({_plural(account_days, 'día', 'días')})")
+def _verification(profile: Profile) -> Verification:
+    """Usa el rol «Verificado» del servidor si existe; si no, si ha aceptado las normas."""
     member = profile.member
     if member is None:
-        flags.append("🚪 Ya no está en el servidor")
+        return Verification(None, "", "🚪 Ya no está en el servidor.")
+    if member.pending:
+        return Verification(
+            "Normas pendientes", "warn", "⏳ Todavía no ha aceptado las normas del servidor."
+        )
+    role = _verified_role(profile.guild)
+    if role is not None:
+        if role in member.roles:
+            return Verification("Verificado", "ok", f"✅ Tiene el rol {role.mention}.")
+        return Verification("Sin verificar", "warn", f"❌ No tiene el rol {role.mention}.")
+    return Verification("Verificado", "ok", "✅ Ha aceptado las normas del servidor.")
+
+
+# -- Tarjeta -----------------------------------------------------------------
+
+
+async def _avatar_bytes(user: discord.abc.User) -> bytes | None:
+    asset = user.display_avatar.with_static_format("png").with_size(256)
+    cached = _avatar_cache.get(asset.url)
+    if cached is not None:
+        return cached
+    try:
+        data = await asset.read()
+    except (discord.HTTPException, discord.NotFound, ValueError):
+        return None
+    if len(_avatar_cache) >= AVATAR_CACHE_SIZE:
+        _avatar_cache.pop(next(iter(_avatar_cache)))
+    _avatar_cache[asset.url] = data
+    return data
+
+
+def _card_data(profile: Profile, avatar: bytes | None) -> CardData:
+    user = profile.user
+    member = profile.member
+    now = discord.utils.utcnow()
+
+    badges: list[Badge] = []
+    verification = _verification(profile)
+    if verification.badge is not None:
+        badges.append(Badge(verification.badge, verification.tone))
+    if member is None:
+        badges.append(Badge("Fuera del servidor", "bad"))
     else:
-        if member.is_timed_out() and member.timed_out_until is not None:
-            flags.append(f"⏳ Aislado hasta {_ts(member.timed_out_until.timestamp(), 'R')}")
-        if member.pending:
-            flags.append("⚠️ No ha aceptado las normas")
-    if flags:
-        lines.append("-# " + " · ".join(flags))
-    return "\n".join(lines)
+        if member.is_timed_out():
+            badges.append(Badge("Aislado", "bad"))
+        if profile.is_rrpp:
+            badges.append(Badge("RRPP", "info"))
+        if profile.voice and profile.voice.get("is_connected"):
+            badges.append(Badge("En VC", "info"))
+        if member.premium_since is not None:
+            badges.append(Badge("Booster", "info"))
+        if member.flags.did_rejoin:
+            badges.append(Badge("Reingreso", "info"))
+    if user.bot:
+        badges.append(Badge("Bot", "info"))
+    if (now - user.created_at).days < NEW_ACCOUNT_DAYS:
+        badges.append(Badge("Cuenta nueva", "warn"))
 
-
-def _summary_text(profile: Profile) -> str:
-    created = profile.user.created_at.timestamp()
-    lines = [f"🪪 **Cuenta:** creada el {_ts(created, 'D')} ({_ts(created, 'R')})"]
-
-    joined = profile.joined_at
-    if joined is not None:
-        lines.append(f"🚪 **En el servidor:** desde el {_ts(joined, 'D')} ({_ts(joined, 'R')})")
+    stats = [Stat("Cuenta", _span((now - user.created_at).total_seconds()), _date(user.created_at))]
+    if member is not None and member.joined_at is not None:
+        stats.append(
+            Stat(
+                "En el servidor",
+                _span((now - member.joined_at).total_seconds()),
+                f"desde {_date(member.joined_at)}",
+            )
+        )
+    else:
+        stats.append(Stat("En el servidor", "—", "ya no está"))
 
     if profile.presented is None:
-        presentation = "sin configurar"
+        stats.append(Stat("Presentación", "—", "sin configurar"))
     elif not profile.presented:
-        presentation = "❌ todavía no"
+        stats.append(Stat("Presentación", "No", "todavía no"))
     else:
-        presentation = "✅ hecha"
+        sub = ""
+        joined = profile.joined_at
         if profile.presentation_ref is not None and joined is not None:
             presented_at = discord.utils.snowflake_time(profile.presentation_ref[1]).timestamp()
             if presented_at >= joined:
-                presentation += f", {_minutes(int(presented_at - joined) // 60)} después de entrar"
-    lines.append(f"📝 **Presentación:** {presentation}")
-
-    messages = f"💬 **Mensajes:** {int(profile.activity.get('messages', 0))}"
-    last = profile.activity.get("last")
-    if isinstance(last, dict):
-        messages += f" · el último {_ts(float(last.get('at', 0)), 'R')}"
-    lines.append(messages)
+                sub = f"{_minutes(int(presented_at - joined) // 60)} tras entrar"
+        stats.append(Stat("Presentación", "Sí", sub))
 
     voice = profile.voice
     if voice is None:
-        lines.append("🎧 **Voz:** nunca ha entrado")
+        stats.append(Stat("Voz", "0 min", "nunca ha entrado"))
     else:
-        status = " · 🟢 en VC ahora" if voice.get("is_connected") else ""
-        lines.append(f"🎧 **Voz:** {_minutes(int(voice.get('effective_total_minutes', 0)))}{status}")
-    return "\n".join(lines)
+        sessions = int(voice.get("sessions", 0))
+        stats.append(
+            Stat(
+                "Voz",
+                _minutes(int(voice.get("effective_total_minutes", 0))),
+                _plural(sessions, "sesión", "sesiones"),
+            )
+        )
+
+    return CardData(
+        name=user.display_name,
+        username=user.name,
+        user_id=user.id,
+        avatar=avatar,
+        badges=badges,
+        stats=stats,
+    )
 
 
-# -- Detalles ----------------------------------------------------------------
+async def _card_file(profile: Profile) -> discord.File:
+    data = _card_data(profile, await _avatar_bytes(profile.user))
+    png = await asyncio.to_thread(render_card, data)
+    return discord.File(io.BytesIO(png), filename=CARD_NAME)
 
 
-async def _scan_first_messages(
-    guild: discord.Guild, user_id: int, after: datetime
+def _card_gallery(name: str) -> discord.ui.MediaGallery[Any]:
+    return discord.ui.MediaGallery(
+        discord.MediaGalleryItem(f"attachment://{CARD_NAME}", description=f"Perfil de {name}")
+    )
+
+
+# -- Primeros mensajes -------------------------------------------------------
+
+
+@dataclass
+class FirstPage:
+    entries: list[dict[str, Any]]
+    offset: int
+    total: int | None
+    has_next: bool
+    from_history: bool = False
+
+
+def _raw_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
+    at = _iso_ts(raw.get("timestamp"))
+    if at is None or raw.get("id") is None:
+        return None
+    return {
+        "channel_id": str(raw.get("channel_id")),
+        "message_id": str(raw.get("id")),
+        "at": at,
+        "text": _snippet(
+            str(raw.get("content") or ""),
+            len(raw.get("attachments") or []),
+            len(raw.get("sticker_items") or []),
+        ),
+    }
+
+
+def _message_entry(message: discord.Message) -> dict[str, Any]:
+    return {
+        "channel_id": str(message.channel.id),
+        "message_id": str(message.id),
+        "at": message.created_at.timestamp(),
+        "text": _snippet(message.content, len(message.attachments), len(message.stickers)),
+    }
+
+
+async def _search_page(
+    bot: commands.Bot, guild_id: int, user_id: int, offset: int
+) -> FirstPage | None:
+    """Pide a la búsqueda de Discord los mensajes del usuario, del más antiguo al más nuevo."""
+    route = Route("GET", "/guilds/{guild_id}/messages/search", guild_id=guild_id)
+    params = {
+        "author_id": str(user_id),
+        "sort_by": "timestamp",
+        "sort_order": "asc",
+        "limit": PAGE_SIZE,
+        "offset": offset,
+        "include_nsfw": "true",
+    }
+    for _ in range(SEARCH_ATTEMPTS):
+        try:
+            data = await bot.http.request(route, params=params)
+        except discord.HTTPException as error:
+            _log.info("La búsqueda de mensajes de Discord no está disponible: %s", error)
+            return None
+        if not isinstance(data, dict):
+            return None
+
+        groups = data.get("messages")
+        if isinstance(groups, list):
+            entries: list[dict[str, Any]] = []
+            for group in groups:
+                raw = group[0] if isinstance(group, list) and group else group
+                entry = _raw_entry(raw) if isinstance(raw, dict) else None
+                if entry is not None:
+                    entries.append(entry)
+            total = int(data.get("total_results") or len(entries))
+            has_next = offset + PAGE_SIZE < min(total, SEARCH_MAX_OFFSET + PAGE_SIZE)
+            return FirstPage(entries, offset, total, has_next)
+
+        # 202: Discord todavía está indexando el servidor; avisa cuándo reintentar.
+        with suppress(TypeError, ValueError):
+            await asyncio.sleep(min(max(float(data.get("retry_after", 2)), 1), 5))
+    return None
+
+
+async def _scan_history(
+    guild: discord.Guild, user_id: int, after: datetime, need: int
 ) -> list[dict[str, Any]]:
-    """Busca los primeros mensajes del usuario en el historial de cada canal."""
     me = guild.me
     channels = [
         channel
@@ -241,7 +412,7 @@ async def _scan_first_messages(
                 ):
                     if message.author.id == user_id:
                         found.append(message)
-                        if len(found) >= FIRST_MESSAGES_LIMIT:
+                        if len(found) >= need:
                             break
         return found
 
@@ -253,16 +424,70 @@ async def _scan_first_messages(
         task.cancel()
     messages = [message for task in done if not task.exception() for message in task.result()]
     messages.sort(key=lambda message: message.created_at)
-    return [message_entry(message) for message in messages[:FIRST_MESSAGES_LIMIT]]
+    return [_message_entry(message) for message in messages[:need]]
 
 
-def _title(key: str) -> str:
-    emoji, name, _ = DETAILS[key]
-    return f"### {emoji} {name}"
+async def _history_page(
+    guild: discord.Guild, user_id: int, after: datetime, offset: int
+) -> FirstPage:
+    """Respaldo: lee el historial de cada canal y guarda el resultado un rato."""
+    need = offset + PAGE_SIZE + 1
+    key = (guild.id, user_id)
+    now = time.monotonic()
+    for stale in [cache_key for cache_key, value in _scan_cache.items() if value[0] <= now]:
+        del _scan_cache[stale]
+
+    cached = _scan_cache.get(key)
+    if cached is not None and (len(cached[1]) >= need or cached[2]):
+        entries, complete = cached[1], cached[2]
+    else:
+        entries = await _scan_history(guild, user_id, after, need)
+        complete = len(entries) < need
+        _scan_cache[key] = (now + SCAN_CACHE_SECONDS, entries, complete)
+
+    return FirstPage(
+        entries=entries[offset : offset + PAGE_SIZE],
+        offset=offset,
+        total=len(entries) if complete else None,
+        has_next=len(entries) > offset + PAGE_SIZE,
+        from_history=True,
+    )
+
+
+async def _first_page(bot: commands.Bot, profile: Profile, offset: int) -> FirstPage:
+    page = await _search_page(bot, profile.guild.id, profile.user.id, offset)
+    if page is not None:
+        return page
+    joined = profile.member.joined_at if profile.member is not None else None
+    after = (joined or profile.user.created_at) - timedelta(minutes=1)
+    return await _history_page(profile.guild, profile.user.id, after, offset)
+
+
+def _first_text(profile: Profile, page: FirstPage) -> str:
+    title = "### 💬 Primeros mensajes"
+    if not page.entries:
+        if page.offset:
+            return f"{title}\nNo hay más mensajes."
+        return f"{title}\nNo he encontrado mensajes suyos en el servidor."
+
+    blocks = [title]
+    for number, entry in enumerate(page.entries, start=page.offset + 1):
+        url = _jump(profile.guild.id, entry.get("channel_id"), entry.get("message_id"))
+        blocks.append(
+            f"**{number}.** {_ts(float(entry.get('at', 0)))} en <#{entry.get('channel_id')}>\n"
+            f"{_quote(str(entry.get('text', '…')))}\n"
+            f"[↗ Ir al mensaje]({url})"
+        )
+    if page.from_history:
+        blocks.append("-# Buscados en el historial reciente de cada canal; puede faltar alguno.")
+    return _clip("\n\n".join(blocks))
+
+
+# -- Otros detalles ----------------------------------------------------------
 
 
 async def _presentation_items(bot: commands.Bot, profile: Profile) -> list[discord.ui.Item[Any]]:
-    title = _title("presentation")
+    title = "### 📝 Presentación"
     if profile.presented is None:
         return [discord.ui.TextDisplay(f"{title}\nLas presentaciones no están configuradas.")]
     if not profile.presented:
@@ -295,94 +520,9 @@ async def _presentation_items(bot: commands.Bot, profile: Profile) -> list[disco
     return items
 
 
-async def _first_messages_text(bot: commands.Bot, profile: Profile) -> str:
-    title = _title("first")
-    activity = profile.activity
-    entries: list[dict[str, Any]] = list(activity.get("first_messages", []))
-    scanned = bool(activity.get("history_scanned"))
-    member = profile.member
-
-    if (
-        member is not None
-        and member.joined_at is not None
-        and not scanned
-        and not profile.counts_from_join()
-    ):
-        found = await _scan_first_messages(
-            profile.guild, member.id, member.joined_at - timedelta(minutes=1)
-        )
-        entries = get_bot_context(bot).user_activity.merge_first_messages(
-            profile.guild.id, member.id, found
-        )
-        scanned = True
-
-    if not entries:
-        return f"{title}\nNo he encontrado mensajes suyos."
-
-    blocks = [title]
-    for number, entry in enumerate(entries, start=1):
-        url = _jump(profile.guild.id, entry.get("channel_id"), entry.get("message_id"))
-        blocks.append(
-            f"**{number}.** {_ts(float(entry.get('at', 0)))} en <#{entry.get('channel_id')}>\n"
-            f"{_quote(str(entry.get('text', '…')))}\n"
-            f"[↗ Ir al mensaje]({url})"
-        )
-
-    since = profile.tracking_since
-    if (
-        since is not None
-        and not profile.counts_from_join()
-        and all(float(entry.get("at", 0)) >= since for entry in entries)
-    ):
-        blocks.append(
-            f"-# No los encuentro en el historial; son los primeros desde que Noah cuenta "
-            f"mensajes ({_ts(since, 'D')})."
-        )
-    elif scanned:
-        blocks.append("-# Buscados en el historial de los canales.")
-    return _clip("\n\n".join(blocks))
-
-
-def _activity_text(profile: Profile) -> str:
-    activity = profile.activity
-    days: dict[str, int] = activity.get("days", {})
-    today = local_day()
-    week = [today - timedelta(days=offset) for offset in range(7)]
-    counts = {day: int(days.get(day.isoformat(), 0)) for day in week}
-
-    lines = [
-        _title("activity"),
-        f"**Hoy:** {counts[today]}",
-        f"**Últimos 7 días:** {sum(counts.values())}",
-    ]
-    busiest = max(week, key=lambda day: counts[day])
-    if counts[busiest]:
-        lines.append(f"**Día más activo:** {_day_name(busiest)} ({counts[busiest]})")
-
-    channels: dict[str, int] = activity.get("channels", {})
-    total = sum(channels.values())
-    ranked = sorted(channels.items(), key=lambda item: item[1], reverse=True)[:TOP_CHANNELS_SHOWN]
-    if ranked:
-        lines.append("")
-        lines.append("**Dónde escribe**")
-        lines.extend(f"<#{channel_id}> · {count} ({count * 100 // total} %)" for channel_id, count in ranked)
-
-    last = activity.get("last")
-    if isinstance(last, dict):
-        url = _jump(profile.guild.id, last.get("channel_id"), last.get("message_id"))
-        lines.append("")
-        lines.append(
-            f"**Último mensaje:** {_ts(float(last.get('at', 0)), 'R')} en <#{last.get('channel_id')}> · "
-            f"[↗ Ir al mensaje]({url})"
-        )
-    if not profile.counts_from_join() and profile.tracking_since is not None:
-        lines.append(f"-# Noah cuenta mensajes desde el {_ts(profile.tracking_since, 'D')}.")
-    return _clip("\n".join(lines))
-
-
 def _voice_text(profile: Profile) -> str:
-    """Los mismos datos que `.noah vc stats`, con aire entre bloques."""
-    title = _title("voice")
+    """Los mismos datos que `.noah vc stats`, separados en bloques."""
+    title = "### 🎧 Voz"
     voice = profile.voice
     if voice is None:
         return f"{title}\n🔇 Todavía no tiene stats de voz."
@@ -423,7 +563,7 @@ def _voice_text(profile: Profile) -> str:
 
 
 def _rrpp_text(profile: Profile) -> str:
-    lines = [_title("rrpp")]
+    lines = ["### 🤝 RRPP"]
     for claim_type, emoji, name in CLAIM_STEPS:
         rrpps: list[str] = []
         for claim in reversed(profile.claims):
@@ -444,59 +584,49 @@ def _rrpp_text(profile: Profile) -> str:
 def _server_text(profile: Profile) -> str:
     member = profile.member
     user = profile.user
-    lines = [_title("server")]
+    lines = ["### 🏷️ Roles y servidor", f"**Verificación:** {_verification(profile).sentence}"]
+    lines.append(f"**Cuenta creada:** {_ts(user.created_at.timestamp(), 'F')}")
     if member is None:
-        lines.append("🚪 Ya no está en el servidor.")
         return "\n".join(lines)
 
+    if member.joined_at is not None:
+        lines.append(f"**Entró:** {_ts(member.joined_at.timestamp(), 'F')}")
     roles = [role for role in reversed(member.roles) if not role.is_default()]
+    lines.append("")
     lines.append(f"**Roles ({len(roles)}):** " + (" ".join(role.mention for role in roles) if roles else "ninguno"))
     lines.append("")
     lines.append(f"**Usuario:** `{user.name}`")
     if member.nick:
         lines.append(f"**Apodo:** {discord.utils.escape_markdown(member.nick)}")
     if member.premium_since is not None:
-        lines.append(f"💎 **Booster** desde el {_ts(member.premium_since.timestamp(), 'D')}")
-    if member.guild_avatar is not None:
-        lines.append("🖼️ Usa un avatar propio en este servidor")
+        lines.append(f"**Booster** desde el {_ts(member.premium_since.timestamp(), 'D')}")
     if member.is_timed_out() and member.timed_out_until is not None:
-        lines.append(f"⏳ **Aislado** hasta {_ts(member.timed_out_until.timestamp(), 'F')}")
-    if member.pending:
-        lines.append("⚠️ Todavía no ha aceptado las normas del servidor")
+        lines.append(f"**Aislado** hasta {_ts(member.timed_out_until.timestamp(), 'F')}")
     return _clip("\n".join(lines))
-
-
-async def _detail_items(
-    bot: commands.Bot, profile: Profile, detail: str
-) -> list[discord.ui.Item[Any]]:
-    if detail == "presentation":
-        return await _presentation_items(bot, profile)
-    if detail == "first":
-        text = await _first_messages_text(bot, profile)
-    elif detail == "activity":
-        text = _activity_text(profile)
-    elif detail == "voice":
-        text = _voice_text(profile)
-    elif detail == "rrpp":
-        text = _rrpp_text(profile)
-    else:
-        text = _server_text(profile)
-    return [discord.ui.TextDisplay(text)]
 
 
 # -- Vista -------------------------------------------------------------------
 
 
-def _loading_view(text: str) -> discord.ui.LayoutView:
+def _loading_view(text: str, card_name: str | None = None) -> discord.ui.LayoutView:
+    """Aviso de carga; si la persona no cambia se deja su tarjeta visible."""
+    container = discord.ui.Container(accent_color=RRPP_COLOR)
+    if card_name is not None:
+        container.add_item(_card_gallery(card_name))
+    container.add_item(discord.ui.TextDisplay(f"⏳ {text}"))
     view = discord.ui.LayoutView(timeout=None)
-    view.add_item(discord.ui.Container(discord.ui.TextDisplay(f"⏳ {text}"), accent_color=RRPP_COLOR))
+    view.add_item(container)
     return view
 
 
-def _loading_text(user: discord.abc.User | None, detail: str | None) -> str:
+def _loading_text(
+    user: discord.abc.User | None, detail: str | None, offset: int
+) -> str:
     if user is None:
         return "Cargando…"
     name = discord.utils.escape_markdown(user.display_name)
+    if detail == "first" and offset:
+        return f"Cargando los mensajes {offset + 1}–{offset + PAGE_SIZE} de **{name}**…"
     if detail in DETAILS:
         return f"Cargando **{DETAILS[detail][1]}** de **{name}**…"
     return f"Cargando la ficha de **{name}**…"
@@ -523,6 +653,7 @@ class InspectView(discord.ui.LayoutView):
         author_id: int,
         user: discord.Member | discord.User | None = None,
         detail: str | None = None,
+        offset: int = 0,
     ) -> None:
         super().__init__(timeout=INSPECT_TIMEOUT)
         self.bot = bot
@@ -530,6 +661,8 @@ class InspectView(discord.ui.LayoutView):
         self.author_id = author_id
         self.user = user
         self.detail = detail if user is not None else None
+        self.offset = offset if self.detail == "first" else 0
+        self.files: list[discord.File] = []
         self.message: discord.Message | None = None
 
     @classmethod
@@ -540,39 +673,77 @@ class InspectView(discord.ui.LayoutView):
         author_id: int,
         user: discord.Member | discord.User | None = None,
         detail: str | None = None,
+        offset: int = 0,
     ) -> "InspectView":
-        view = cls(bot, guild, author_id, user, detail)
+        view = cls(bot, guild, author_id, user, detail, offset)
         await view._render()
         return view
 
     async def _render(self) -> None:
         container = discord.ui.Container(accent_color=RRPP_COLOR)
-        profile = _load_profile(self.bot, self.guild, self.user) if self.user is not None else None
-
-        if profile is None:
+        if self.user is None:
             container.add_item(
                 discord.ui.TextDisplay(
                     "## 🔎 Inspector RRPP\nPulsa **👤 Buscar** para elegir a quién inspeccionar."
                 )
             )
-        else:
-            container.add_item(
-                discord.ui.Section(
-                    discord.ui.TextDisplay(_header_text(profile)),
-                    accessory=discord.ui.Thumbnail(profile.user.display_avatar.url),
-                )
-            )
-            container.add_item(discord.ui.Separator())
-            container.add_item(discord.ui.TextDisplay(_summary_text(profile)))
-            if self.detail in DETAILS:
-                container.add_item(discord.ui.Separator())
-                for item in await _detail_items(self.bot, profile, self.detail):
-                    container.add_item(item)
-            container.add_item(discord.ui.Separator())
-            container.add_item(discord.ui.ActionRow(self._detail_select()))
+            container.add_item(self._button_row(None))
+            self.add_item(container)
+            return
 
+        profile = _load_profile(self.bot, self.guild, self.user)
+        self.files = [await _card_file(profile)]
+        container.add_item(_card_gallery(profile.user.display_name))
+        container.add_item(discord.ui.TextDisplay(f"-# Perfil: {profile.user.mention}"))
+
+        if self.detail in DETAILS:
+            container.add_item(discord.ui.Separator())
+            for item in await self._detail_items(profile):
+                container.add_item(item)
+
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.ActionRow(self._detail_select()))
         container.add_item(self._button_row(profile))
         self.add_item(container)
+
+    async def _detail_items(self, profile: Profile) -> list[discord.ui.Item[Any]]:
+        if self.detail == "presentation":
+            return await _presentation_items(self.bot, profile)
+        if self.detail == "first":
+            page = await _first_page(self.bot, profile, self.offset)
+            items: list[discord.ui.Item[Any]] = [discord.ui.TextDisplay(_first_text(profile, page))]
+            if page.offset or page.has_next:
+                items.append(self._pager_row(page))
+            return items
+        if self.detail == "voice":
+            return [discord.ui.TextDisplay(_voice_text(profile))]
+        if self.detail == "rrpp":
+            return [discord.ui.TextDisplay(_rrpp_text(profile))]
+        return [discord.ui.TextDisplay(_server_text(profile))]
+
+    def _pager_row(self, page: FirstPage) -> discord.ui.ActionRow[Any]:
+        row: discord.ui.ActionRow[Any] = discord.ui.ActionRow()
+
+        def _go(offset: int) -> Any:
+            async def _callback(interaction: discord.Interaction) -> None:
+                await self.show(interaction, self.user, "first", offset)
+
+            return _callback
+
+        previous = discord.ui.Button(emoji="◀️", style=discord.ButtonStyle.secondary)
+        previous.disabled = page.offset == 0
+        previous.callback = _go(max(0, page.offset - PAGE_SIZE))
+        row.add_item(previous)
+
+        shown = f"{page.offset + 1}–{page.offset + len(page.entries)}"
+        label = f"{shown} de {page.total}" if page.total is not None else shown
+        row.add_item(discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, disabled=True))
+
+        following = discord.ui.Button(emoji="▶️", style=discord.ButtonStyle.secondary)
+        following.disabled = not page.has_next
+        following.callback = _go(page.offset + PAGE_SIZE)
+        row.add_item(following)
+        return row
 
     def _detail_select(self) -> discord.ui.Select[Any]:
         options = [
@@ -624,14 +795,21 @@ class InspectView(discord.ui.LayoutView):
         interaction: discord.Interaction,
         user: discord.Member | discord.User | None,
         detail: str | None,
+        offset: int = 0,
     ) -> None:
         self.stop()
-        await interaction.response.edit_message(
-            view=_loading_view(_loading_text(user, detail)),
-            allowed_mentions=discord.AllowedMentions.none(),
+        none = discord.AllowedMentions.none()
+        same_user = self.user is not None and user is not None and user.id == self.user.id
+        loading = _loading_view(
+            _loading_text(user, detail, offset), self.user.display_name if same_user and self.user else None
         )
+        if same_user:
+            await interaction.response.edit_message(view=loading, allowed_mentions=none)
+        else:
+            await interaction.response.edit_message(view=loading, attachments=[], allowed_mentions=none)
+
         try:
-            view = await InspectView.create(self.bot, self.guild, self.author_id, user, detail)
+            view = await InspectView.create(self.bot, self.guild, self.author_id, user, detail, offset)
         except Exception:
             # Que la ficha no se quede en "Cargando…": se vuelve a la ficha sin detalle.
             _log.exception("No se ha podido cargar el inspector RRPP")
@@ -640,9 +818,7 @@ class InspectView(discord.ui.LayoutView):
                 "❌ No he podido cargar ese detalle. Inténtalo otra vez.", ephemeral=True
             )
         view.message = self.message or interaction.message
-        await interaction.edit_original_response(
-            view=view, allowed_mentions=discord.AllowedMentions.none()
-        )
+        await interaction.edit_original_response(view=view, attachments=view.files, allowed_mentions=none)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
@@ -666,12 +842,6 @@ class InspectView(discord.ui.LayoutView):
 
 
 def register_rrpp_inspect_commands(bot: commands.Bot, rrpp_group: commands.Group) -> None:
-    @bot.listen("on_message")
-    async def _track_user_activity(message: discord.Message) -> None:
-        if message.author.bot or message.guild is None:
-            return
-        get_bot_context(bot).user_activity.record_message(message)
-
     @rrpp_group.command(name="inspect")
     async def inspect(
         ctx: commands.Context, user: discord.Member | discord.User | None = None
@@ -686,10 +856,10 @@ def register_rrpp_inspect_commands(bot: commands.Bot, rrpp_group: commands.Group
             return
 
         none = discord.AllowedMentions.none()
-        message = await ctx.send(view=_loading_view(_loading_text(user, None)), allowed_mentions=none)
+        message = await ctx.send(view=_loading_view(_loading_text(user, None, 0)), allowed_mentions=none)
         view = await InspectView.create(ctx.bot, ctx.guild, ctx.author.id, user)
         view.message = message
-        await message.edit(view=view, allowed_mentions=none)
+        await message.edit(view=view, attachments=view.files, allowed_mentions=none)
 
     @inspect.error
     async def _inspect_error(ctx: commands.Context, error: commands.CommandError) -> None:
