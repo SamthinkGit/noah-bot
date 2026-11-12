@@ -36,6 +36,12 @@ HISTORY_SCAN_PER_CHANNEL = 500
 HISTORY_SCAN_CONCURRENCY = 4
 HISTORY_SCAN_TIMEOUT = 40
 SCAN_CACHE_SECONDS = 600
+# Análisis de respuestas (solo admins).
+ANALYSIS_MESSAGES = 100
+SEARCH_PAGE_LIMIT = 25
+REPLIES_SHOWN = 5
+FETCH_CONCURRENCY = 5
+REPLY_MESSAGE_TYPE = 19
 CLOSE_DETAIL = "close"
 VERIFIED_ROLE_PATTERN = re.compile(r"^\W*(verificad[oa]s?|verified)\W*$", re.IGNORECASE)
 # Detalle: (emoji, nombre, descripción del desplegable).
@@ -45,7 +51,10 @@ DETAILS: dict[str, tuple[str, str, str]] = {
     "voice": ("🎧", "Voz", "Tiempo, estado y nivel de .noah vc"),
     "rrpp": ("🤝", "RRPP", "Quién le saludó, presentó y llevó al VC"),
     "server": ("🏷️", "Roles y servidor", "Verificación, roles, apodo y avisos"),
+    "replies": ("🔗", "Con quién habla", "A quién responde en sus 100 primeros mensajes"),
 }
+# Detalles que solo ven los administradores.
+ADMIN_DETAILS = {"replies"}
 CLAIM_STEPS = (
     ("greeting", "👋", "Saludo"),
     ("presentation", "📝", "Presentación"),
@@ -54,6 +63,7 @@ CLAIM_STEPS = (
 
 _avatar_cache: dict[str, bytes] = {}
 _scan_cache: dict[tuple[int, int], tuple[float, list[dict[str, Any]], bool]] = {}
+_replies_cache: dict[tuple[int, int], tuple[float, "ReplyStats"]] = {}
 
 
 # -- Formato -----------------------------------------------------------------
@@ -351,16 +361,17 @@ def _message_entry(message: discord.Message) -> dict[str, Any]:
     }
 
 
-async def _search_page(
-    bot: commands.Bot, guild_id: int, user_id: int, offset: int
-) -> FirstPage | None:
-    """Pide a la búsqueda de Discord los mensajes del usuario, del más antiguo al más nuevo."""
+async def _search_raw(
+    bot: commands.Bot, guild_id: int, user_id: int, offset: int, limit: int
+) -> tuple[list[dict[str, Any]], int] | None:
+    """Pide a la búsqueda de Discord los mensajes del usuario, del más antiguo al más nuevo.
+    Devuelve los mensajes en bruto y el total, o None si la búsqueda no está disponible."""
     route = Route("GET", "/guilds/{guild_id}/messages/search", guild_id=guild_id)
     params = {
         "author_id": str(user_id),
         "sort_by": "timestamp",
         "sort_order": "asc",
-        "limit": PAGE_SIZE,
+        "limit": limit,
         "offset": offset,
         "include_nsfw": "true",
     }
@@ -375,15 +386,12 @@ async def _search_page(
 
         groups = data.get("messages")
         if isinstance(groups, list):
-            entries: list[dict[str, Any]] = []
+            raws: list[dict[str, Any]] = []
             for group in groups:
                 raw = group[0] if isinstance(group, list) and group else group
-                entry = _raw_entry(raw) if isinstance(raw, dict) else None
-                if entry is not None:
-                    entries.append(entry)
-            total = int(data.get("total_results") or len(entries))
-            has_next = offset + PAGE_SIZE < min(total, SEARCH_MAX_OFFSET + PAGE_SIZE)
-            return FirstPage(entries, offset, total, has_next)
+                if isinstance(raw, dict):
+                    raws.append(raw)
+            return raws, int(data.get("total_results") or len(raws))
 
         # 202: Discord todavía está indexando el servidor; avisa cuándo reintentar.
         with suppress(TypeError, ValueError):
@@ -391,9 +399,21 @@ async def _search_page(
     return None
 
 
+async def _search_page(
+    bot: commands.Bot, guild_id: int, user_id: int, offset: int
+) -> FirstPage | None:
+    result = await _search_raw(bot, guild_id, user_id, offset, PAGE_SIZE)
+    if result is None:
+        return None
+    raws, total = result
+    entries = [entry for raw in raws if (entry := _raw_entry(raw)) is not None]
+    has_next = offset + PAGE_SIZE < min(total, SEARCH_MAX_OFFSET + PAGE_SIZE)
+    return FirstPage(entries, offset, total, has_next)
+
+
 async def _scan_history(
     guild: discord.Guild, user_id: int, after: datetime, need: int
-) -> list[dict[str, Any]]:
+) -> list[discord.Message]:
     me = guild.me
     channels = [
         channel
@@ -424,7 +444,7 @@ async def _scan_history(
         task.cancel()
     messages = [message for task in done if not task.exception() for message in task.result()]
     messages.sort(key=lambda message: message.created_at)
-    return [_message_entry(message) for message in messages[:need]]
+    return messages[:need]
 
 
 async def _history_page(
@@ -441,7 +461,7 @@ async def _history_page(
     if cached is not None and (len(cached[1]) >= need or cached[2]):
         entries, complete = cached[1], cached[2]
     else:
-        entries = await _scan_history(guild, user_id, after, need)
+        entries = [_message_entry(message) for message in await _scan_history(guild, user_id, after, need)]
         complete = len(entries) < need
         _scan_cache[key] = (now + SCAN_CACHE_SECONDS, entries, complete)
 
@@ -458,9 +478,12 @@ async def _first_page(bot: commands.Bot, profile: Profile, offset: int) -> First
     page = await _search_page(bot, profile.guild.id, profile.user.id, offset)
     if page is not None:
         return page
+    return await _history_page(profile.guild, profile.user.id, _scan_start(profile), offset)
+
+
+def _scan_start(profile: Profile) -> datetime:
     joined = profile.member.joined_at if profile.member is not None else None
-    after = (joined or profile.user.created_at) - timedelta(minutes=1)
-    return await _history_page(profile.guild, profile.user.id, after, offset)
+    return (joined or profile.user.created_at) - timedelta(minutes=1)
 
 
 def _first_text(profile: Profile, page: FirstPage) -> str:
@@ -481,6 +504,166 @@ def _first_text(profile: Profile, page: FirstPage) -> str:
     if page.from_history:
         blocks.append("-# Buscados en el historial reciente de cada canal; puede faltar alguno.")
     return _clip("\n\n".join(blocks))
+
+
+# -- Con quién habla (solo admins) -------------------------------------------
+
+
+@dataclass
+class Reply:
+    url: str
+    channel_id: int
+    message_id: int
+    author_id: int | None = None
+    author_bot: bool = False
+
+
+@dataclass
+class ReplyStats:
+    analyzed: int
+    counts: dict[int, int]
+    first_reply: dict[int, str]
+    unresolved: int
+    from_history: bool
+
+
+async def _replies_from_search(
+    bot: commands.Bot, guild: discord.Guild, user_id: int
+) -> tuple[int, list[Reply]] | None:
+    raws: list[dict[str, Any]] = []
+    for offset in range(0, ANALYSIS_MESSAGES, SEARCH_PAGE_LIMIT):
+        result = await _search_raw(bot, guild.id, user_id, offset, SEARCH_PAGE_LIMIT)
+        if result is None:
+            if not raws:
+                return None
+            break
+        page, total = result
+        raws.extend(page)
+        if len(page) < SEARCH_PAGE_LIMIT or offset + SEARCH_PAGE_LIMIT >= total:
+            break
+
+    replies: list[Reply] = []
+    for raw in raws[:ANALYSIS_MESSAGES]:
+        reference = raw.get("message_reference")
+        if raw.get("type") != REPLY_MESSAGE_TYPE or not isinstance(reference, dict):
+            continue
+        with suppress(KeyError, TypeError, ValueError):
+            reply = Reply(
+                url=_jump(guild.id, raw["channel_id"], raw["id"]),
+                channel_id=int(reference.get("channel_id") or raw["channel_id"]),
+                message_id=int(reference["message_id"]),
+            )
+            referenced = raw.get("referenced_message")
+            if isinstance(referenced, dict) and isinstance(referenced.get("author"), dict):
+                reply.author_id = int(referenced["author"]["id"])
+                reply.author_bot = bool(referenced["author"].get("bot"))
+            replies.append(reply)
+    return min(len(raws), ANALYSIS_MESSAGES), replies
+
+
+async def _replies_from_history(profile: Profile) -> tuple[int, list[Reply]]:
+    messages = await _scan_history(
+        profile.guild, profile.user.id, _scan_start(profile), ANALYSIS_MESSAGES
+    )
+    replies: list[Reply] = []
+    for message in messages:
+        reference = message.reference
+        if message.type is not discord.MessageType.reply or reference is None or reference.message_id is None:
+            continue
+        reply = Reply(
+            url=message.jump_url,
+            channel_id=reference.channel_id or message.channel.id,
+            message_id=reference.message_id,
+        )
+        if isinstance(reference.resolved, discord.Message):
+            reply.author_id = reference.resolved.author.id
+            reply.author_bot = reference.resolved.author.bot
+        replies.append(reply)
+    return len(messages), replies
+
+
+async def _resolve_reply_authors(guild: discord.Guild, replies: list[Reply]) -> None:
+    """Busca el autor de los mensajes respondidos que no venían incluidos."""
+    semaphore = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+    async def _fetch(reply: Reply) -> None:
+        channel = guild.get_channel_or_thread(reply.channel_id)
+        if channel is None or not hasattr(channel, "fetch_message"):
+            return
+        async with semaphore:
+            with suppress(discord.HTTPException):
+                message = await channel.fetch_message(reply.message_id)
+                reply.author_id = message.author.id
+                reply.author_bot = message.author.bot
+
+    await asyncio.gather(*(_fetch(reply) for reply in replies if reply.author_id is None))
+
+
+async def _reply_stats(bot: commands.Bot, profile: Profile) -> ReplyStats:
+    key = (profile.guild.id, profile.user.id)
+    now = time.monotonic()
+    cached = _replies_cache.get(key)
+    if cached is not None and cached[0] > now:
+        return cached[1]
+
+    found = await _replies_from_search(bot, profile.guild, profile.user.id)
+    from_history = found is None
+    analyzed, replies = found if found is not None else await _replies_from_history(profile)
+    await _resolve_reply_authors(profile.guild, replies)
+
+    counts: dict[int, int] = {}
+    first_reply: dict[int, str] = {}
+    unresolved = 0
+    for reply in replies:
+        if reply.author_id is None:
+            unresolved += 1
+            continue
+        if reply.author_bot or reply.author_id == profile.user.id:
+            continue
+        counts[reply.author_id] = counts.get(reply.author_id, 0) + 1
+        first_reply.setdefault(reply.author_id, reply.url)
+
+    stats = ReplyStats(analyzed, counts, first_reply, unresolved, from_history)
+    for stale in [cache_key for cache_key, value in _replies_cache.items() if value[0] <= now]:
+        del _replies_cache[stale]
+    _replies_cache[key] = (now + SCAN_CACHE_SECONDS, stats)
+    return stats
+
+
+def _replies_text(stats: ReplyStats) -> str:
+    title = "### 🔗 Con quién habla"
+    if not stats.analyzed:
+        return f"{title}\nNo he encontrado mensajes suyos en el servidor."
+
+    total = sum(stats.counts.values())
+    lines = [
+        title,
+        f"-# Analizados sus {stats.analyzed} primeros mensajes: "
+        f"{_plural(total, 'respuesta', 'respuestas')} a "
+        f"{_plural(len(stats.counts), 'persona', 'personas')}.",
+    ]
+    if not stats.counts:
+        lines.append("No ha respondido a nadie en esos mensajes.")
+    ranked = sorted(stats.counts.items(), key=lambda item: item[1], reverse=True)[:REPLIES_SHOWN]
+    for number, (user_id, count) in enumerate(ranked, start=1):
+        lines.append("")
+        lines.append(
+            f"**{number}.** <@{user_id}> · **{_plural(count, 'respuesta', 'respuestas')}** "
+            f"({count * 100 // total} %)\n"
+            f"-# [↗ Primera respuesta]({stats.first_reply[user_id]})"
+        )
+
+    notes = ["No cuentan las respuestas a bots ni a sí mismo."]
+    if stats.unresolved:
+        notes.append(
+            f"{_plural(stats.unresolved, 'respuesta', 'respuestas')} a mensajes borrados no se "
+            f"{'ha' if stats.unresolved == 1 else 'han'} podido contar."
+        )
+    if stats.from_history:
+        notes.append("Buscados en el historial reciente de cada canal; puede faltar alguno.")
+    lines.append("")
+    lines.append("-# " + " ".join(notes))
+    return _clip("\n".join(lines))
 
 
 # -- Otros detalles ----------------------------------------------------------
@@ -625,6 +808,8 @@ def _loading_text(
     if user is None:
         return "Cargando…"
     name = discord.utils.escape_markdown(user.display_name)
+    if detail == "replies":
+        return f"Analizando los {ANALYSIS_MESSAGES} primeros mensajes de **{name}**…"
     if detail == "first" and offset:
         return f"Cargando los mensajes {offset + 1}–{offset + PAGE_SIZE} de **{name}**…"
     if detail in DETAILS:
@@ -654,12 +839,16 @@ class InspectView(discord.ui.LayoutView):
         user: discord.Member | discord.User | None = None,
         detail: str | None = None,
         offset: int = 0,
+        is_admin: bool = False,
     ) -> None:
         super().__init__(timeout=INSPECT_TIMEOUT)
         self.bot = bot
         self.guild = guild
         self.author_id = author_id
+        self.is_admin = is_admin
         self.user = user
+        if detail in ADMIN_DETAILS and not is_admin:
+            detail = None
         self.detail = detail if user is not None else None
         self.offset = offset if self.detail == "first" else 0
         self.files: list[discord.File] = []
@@ -674,8 +863,9 @@ class InspectView(discord.ui.LayoutView):
         user: discord.Member | discord.User | None = None,
         detail: str | None = None,
         offset: int = 0,
+        is_admin: bool = False,
     ) -> "InspectView":
-        view = cls(bot, guild, author_id, user, detail, offset)
+        view = cls(bot, guild, author_id, user, detail, offset, is_admin)
         await view._render()
         return view
 
@@ -719,6 +909,8 @@ class InspectView(discord.ui.LayoutView):
             return [discord.ui.TextDisplay(_voice_text(profile))]
         if self.detail == "rrpp":
             return [discord.ui.TextDisplay(_rrpp_text(profile))]
+        if self.detail == "replies":
+            return [discord.ui.TextDisplay(_replies_text(await _reply_stats(self.bot, profile)))]
         return [discord.ui.TextDisplay(_server_text(profile))]
 
     def _pager_row(self, page: FirstPage) -> discord.ui.ActionRow[Any]:
@@ -751,6 +943,7 @@ class InspectView(discord.ui.LayoutView):
                 label=name, value=key, description=description, emoji=emoji, default=key == self.detail
             )
             for key, (emoji, name, description) in DETAILS.items()
+            if self.is_admin or key not in ADMIN_DETAILS
         ]
         if self.detail is not None:
             options.append(
@@ -809,11 +1002,15 @@ class InspectView(discord.ui.LayoutView):
             await interaction.response.edit_message(view=loading, attachments=[], allowed_mentions=none)
 
         try:
-            view = await InspectView.create(self.bot, self.guild, self.author_id, user, detail, offset)
+            view = await InspectView.create(
+                self.bot, self.guild, self.author_id, user, detail, offset, self.is_admin
+            )
         except Exception:
             # Que la ficha no se quede en "Cargando…": se vuelve a la ficha sin detalle.
             _log.exception("No se ha podido cargar el inspector RRPP")
-            view = await InspectView.create(self.bot, self.guild, self.author_id, user)
+            view = await InspectView.create(
+                self.bot, self.guild, self.author_id, user, is_admin=self.is_admin
+            )
             await interaction.followup.send(
                 "❌ No he podido cargar ese detalle. Inténtalo otra vez.", ephemeral=True
             )
@@ -857,7 +1054,9 @@ def register_rrpp_inspect_commands(bot: commands.Bot, rrpp_group: commands.Group
 
         none = discord.AllowedMentions.none()
         message = await ctx.send(view=_loading_view(_loading_text(user, None, 0)), allowed_mentions=none)
-        view = await InspectView.create(ctx.bot, ctx.guild, ctx.author.id, user)
+        view = await InspectView.create(
+            ctx.bot, ctx.guild, ctx.author.id, user, is_admin=is_rrpp_admin(ctx.author)
+        )
         view.message = message
         await message.edit(view=view, attachments=view.files, allowed_mentions=none)
 
