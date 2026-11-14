@@ -10,6 +10,7 @@ from noah_bot.commands.autobump import register_autobump_commands
 from noah_bot.commands.autogami import register_autogami_commands
 from noah_bot.commands.billboard import register_billboard_commands
 from noah_bot.commands.confess import register_confess_commands
+from noah_bot.commands.council import register_council_commands
 from noah_bot.commands.gochi import register_gotchi_commands
 from noah_bot.commands.guard import register_guard_commands
 from noah_bot.commands.presentations import register_presentations_commands
@@ -303,6 +304,9 @@ def register_noah_commands(bot: commands.Bot) -> None:
         )
         chart.add_row(
             [".noah sports help", "Quedadas para hacer deporte (con mapa y plazas)."]
+        )
+        chart.add_row(
+            [".noah council help", "Consejo oculto con votos anónimos (solo admins)."]
         )
         chart.add_row(
             [".waifuracer setemoji <emoji>", "Set your claim reaction emoji."]
@@ -735,3 +739,4 @@ def register_noah_commands(bot: commands.Bot) -> None:
     register_confess_commands(bot, noah)
     register_billboard_commands(bot, noah)
     register_sports_commands(bot, noah)
+    register_council_commands(bot, noah)

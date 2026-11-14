@@ -7,6 +7,7 @@ from noah_bot.modules.ai import AiResponder
 from noah_bot.modules.autogami import AutogamiTokenStore
 from noah_bot.modules.billboard import BillboardStore
 from noah_bot.modules.confessions import ConfessionsStore
+from noah_bot.modules.council import CouncilStore
 from noah_bot.modules.daily_stats import DailyStatsManager
 from noah_bot.modules.discord_formatter import UserEmojiManager
 from noah_bot.modules.guard import GuardStore
@@ -43,6 +44,7 @@ class BotContext:
     confessions: ConfessionsStore = field(default_factory=ConfessionsStore)
     billboard: BillboardStore = field(default_factory=BillboardStore)
     sports: SportsStore = field(default_factory=SportsStore)
+    council: CouncilStore = field(default_factory=CouncilStore)
     waifu_manager: WaifuGameManager = field(
         default_factory=lambda: WaifuGameManager(json_path="waifu_game.json")
     )
