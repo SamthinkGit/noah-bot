@@ -21,6 +21,8 @@ QUESTION_MAX_LENGTH = 200
 _OPTION_PREFIX = re.compile(r"^(?:[-•*·]|\d+[.)-])\s*")
 
 VOTE_OK = "ok"
+VOTE_CHANGED = "changed"
+VOTE_SAME = "same"
 VOTE_ALREADY = "already"
 VOTE_CLOSED = "closed"
 VOTE_MISSING = "missing"
@@ -344,10 +346,14 @@ class CouncilStore:
             poll["live"] = bool(live)
             self._save()
 
-    def vote(self, guild_id: int, poll_id: str, user_id: int, option: int) -> tuple[str, int | None]:
-        """Registra el voto. Cada persona vota una sola vez y no puede cambiarlo.
+    def vote(
+        self, guild_id: int, poll_id: str, user_id: int, option: int, *, change: bool = False
+    ) -> tuple[str, int | None]:
+        """Registra el voto. Cada persona tiene un solo voto; con `change` lo corrige
+        (solo mientras el poll esté abierto).
 
-        Devuelve el resultado y, si ya había votado, la opción que eligió.
+        Devuelve el resultado y la opción: la votada o, si ya había votado y no se
+        pide cambiarlo, la que eligió.
         """
         poll = self.get_poll(guild_id, poll_id)
         if poll is None or not 0 <= option < len(poll.get("options") or []):
@@ -355,15 +361,17 @@ class CouncilStore:
         if poll.get("closed"):
             return VOTE_CLOSED, None
         previous = poll_votes(poll).get(int(user_id))
-        if previous is not None:
+        if previous is not None and not change:
             return VOTE_ALREADY, previous
+        if previous == option:
+            return VOTE_SAME, option
         votes = poll.get("votes")
         if not isinstance(votes, dict):
             votes = {}
             poll["votes"] = votes
         votes[str(int(user_id))] = int(option)
         self._save()
-        return VOTE_OK, option
+        return (VOTE_CHANGED if previous is not None else VOTE_OK), option
 
     def close_poll(self, guild_id: int, poll_id: str) -> bool:
         poll = self.get_poll(guild_id, poll_id)

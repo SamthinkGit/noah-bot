@@ -3,11 +3,15 @@
 El canal «┆📌・𝐂𝐨𝐧𝐬𝐞𝐣𝐨» existe siempre, pero entre consejos está vacío y solo lo
 ven los admins. `.noah council init` abre una consola privada para empezar un
 consejo (tema, descripción e implicados excluidos). Dentro, `.noah council poll`
-publica votaciones anónimas de 2 a 4 opciones (un voto por persona, sin cambios; los
-admins ven quién votó qué), `.noah council meet` deja entrar al rol del consejo y le
-avisa, `.noah council exclude` oculta el canal a los implicados y
-`.noah council finish` envía el acta (con la conversación en un .txt), borra todos los
-mensajes y vuelve a ocultar el canal. El mensaje fijado trae botones para lo mismo.
+publica votaciones anónimas de 2 a 4 opciones (un voto por persona que se puede
+corregir mientras el poll esté abierto; los admins ven quién votó qué),
+`.noah council meet` deja entrar al rol del consejo y le avisa,
+`.noah council exclude` oculta el canal a los implicados y `.noah council finish`
+envía el acta (con la conversación en un .txt), borra todos los mensajes y vuelve a
+ocultar el canal. El mensaje fijado trae botones para lo mismo.
+
+Todos los mensajes usan Components V2 con el mismo estilo: una caja con franja
+dorada, título, separadores finos y los botones dentro.
 """
 
 import asyncio
@@ -24,10 +28,8 @@ from discord.ext import commands
 
 from noah_bot.commands.billboard import (
     _is_admin,
-    _jump_url,
     _local,
     _mark_transient,
-    _respond_edit,
     _truncate,
     _ts,
 )
@@ -36,8 +38,10 @@ from noah_bot.modules.council import (
     OPTION_MAX_LENGTH,
     QUESTION_MAX_LENGTH,
     VOTE_ALREADY,
+    VOTE_CHANGED,
     VOTE_CLOSED,
     VOTE_OK,
+    VOTE_SAME,
     CouncilStore,
     parse_datetime,
     parse_options,
@@ -50,24 +54,24 @@ _log = logging.getLogger(__name__)
 
 COUNCIL_COLOR = discord.Color.from_rgb(201, 162, 39)
 CLOSED_COLOR = discord.Color.from_rgb(96, 104, 114)
+SUCCESS_COLOR = discord.Color.from_rgb(67, 160, 71)
 DANGER_COLOR = discord.Color.from_rgb(170, 32, 38)
-FOOTER = "Noah Council"
 CHANNEL_NAME = "┆📌・𝐂𝐨𝐧𝐬𝐞𝐣𝐨"
-OPTION_EMOJIS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣")
-BAR_LENGTH = 12
+BAR_LENGTH = 16
 
-CONTROL_POLL_ID = "noah:council:poll"
-CONTROL_MEET_ID = "noah:council:meet"
-CONTROL_EXCLUDE_ID = "noah:council:exclude"
-CONTROL_FINISH_ID = "noah:council:finish"
+CONTROL_TEMPLATE = r"noah:council:ctl:(?P<action>poll|meet|exclude|finish)"
+POLL_TEMPLATE = (
+    r"noah:council:(?P<action>vote|votes|close):(?P<poll_id>[0-9a-f]+)(?::(?P<index>\d))?"
+)
 
 PROMPT_TIMEOUT = 60
 NOTICE_DELETE_AFTER = 8
 CONSOLE_TIMEOUT = 840
+VOTE_REPLY_TIMEOUT = 600
 POLL_REFRESH_DELAY = 1.0
 EXCLUDE_LIMIT = 25
-MENTIONS_SHOWN = 40
-FIELD_LIMIT = 1024
+MENTIONS_SHOWN = 20
+TEXT_LIMIT = 1500
 REQUIRED_PERMISSIONS = (
     ("manage_channels", "Gestionar canales"),
     ("manage_roles", "Gestionar permisos"),
@@ -121,6 +125,183 @@ def _fixed_channel(guild: discord.Guild, store: CouncilStore) -> discord.TextCha
     channel_id = store.get_channel_id(guild.id)
     channel = guild.get_channel(channel_id) if channel_id is not None else None
     return channel if isinstance(channel, discord.TextChannel) else None
+
+
+def _council_channel(
+    guild: discord.Guild, active: dict[str, Any] | None
+) -> discord.TextChannel | None:
+    if active is None:
+        return None
+    try:
+        channel = guild.get_channel(int(active.get("channel_id")))
+    except (TypeError, ValueError):
+        return None
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+def _can_manage(member: discord.abc.User, store: CouncilStore) -> bool:
+    """Admins que no estén excluidos del consejo activo."""
+    if not _is_admin(member):
+        return False
+    return member.id not in store.excluded_ids(member.guild.id)  # type: ignore[union-attr]
+
+
+def _can_vote(member: discord.abc.User, store: CouncilStore, active: dict[str, Any]) -> bool:
+    if not isinstance(member, discord.Member) or member.bot:
+        return False
+    if member.id in store.excluded_ids(member.guild.id):
+        return False
+    if member.guild_permissions.administrator:
+        return True
+    role = _council_role(member.guild, store)
+    return bool(active.get("met_at")) and role is not None and role in member.roles
+
+
+def _voters(guild: discord.Guild, store: CouncilStore, active: dict[str, Any]) -> list[discord.Member]:
+    return [member for member in guild.members if _can_vote(member, store, active)]
+
+
+def _missing_permissions(guild: discord.Guild) -> list[str]:
+    permissions = guild.me.guild_permissions
+    return [label for name, label in REQUIRED_PERMISSIONS if not getattr(permissions, name)]
+
+
+def _mentions(user_ids: Any, empty: str = "nadie", limit: int = MENTIONS_SHOWN) -> str:
+    ids = list(user_ids)
+    if not ids:
+        return empty
+    shown = ", ".join(f"<@{user_id}>" for user_id in ids[:limit])
+    if len(ids) > limit:
+        shown += f" y {len(ids) - limit} más"
+    return shown
+
+
+def _block(text: str, limit: int = TEXT_LIMIT) -> str:
+    text = str(text).strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _name(guild: discord.Guild, user_id: int) -> str:
+    member = guild.get_member(int(user_id))
+    if member is None:
+        return f"usuario {user_id}"
+    return f"{member.display_name} (@{member.name})"
+
+
+def _plural(count: int, singular: str, plural: str) -> str:
+    return f"{count} {singular if count == 1 else plural}"
+
+
+def _format_span(delta: timedelta) -> str:
+    minutes = max(0, int(delta.total_seconds() // 60))
+    days, minutes = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(minutes, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} d")
+    if hours:
+        parts.append(f"{hours} h")
+    if minutes or not parts:
+        parts.append(f"{minutes} min")
+    return " ".join(parts)
+
+
+def _admin_warnings(guild: discord.Guild, user_ids: Any) -> list[str]:
+    """Discord no deja ocultar un canal a quien tiene permiso de Administrador."""
+    warnings = []
+    for user_id in user_ids:
+        member = guild.get_member(int(user_id))
+        if member is not None and member.guild_permissions.administrator:
+            warnings.append(
+                f"⚠️ {member.mention} es admin: Discord no deja ocultarle el canal, así que lo "
+                "seguirá viendo. Eso sí, no podrá votar ni gestionar el consejo."
+            )
+    return warnings
+
+
+# -- Piezas del estilo (caja con franja, título y separadores) ---------------
+
+
+def _box(color: discord.Color = COUNCIL_COLOR) -> discord.ui.Container:
+    return discord.ui.Container(accent_color=color)
+
+
+def _text(content: str) -> discord.ui.TextDisplay:
+    return discord.ui.TextDisplay(content)
+
+
+def _sep(visible: bool = True) -> discord.ui.Separator:
+    return discord.ui.Separator(visible=visible, spacing=discord.SeparatorSpacing.small)
+
+
+def _row(*items: discord.ui.Item[Any]) -> discord.ui.ActionRow:
+    row = discord.ui.ActionRow()
+    for item in items:
+        row.add_item(item)
+    return row
+
+
+def _button(
+    label: str,
+    callback: Callable[[discord.Interaction], Awaitable[None]],
+    *,
+    emoji: str | None = None,
+    style: discord.ButtonStyle = discord.ButtonStyle.secondary,
+    disabled: bool = False,
+) -> discord.ui.Button:
+    button = discord.ui.Button(label=label, emoji=emoji, style=style, disabled=disabled)
+    button.callback = callback
+    return button
+
+
+def _note_view(text: str, color: discord.Color = COUNCIL_COLOR) -> discord.ui.LayoutView:
+    """Mensaje simple (sin botones) con el estilo del consejo."""
+    view = discord.ui.LayoutView()
+    box = _box(color)
+    box.add_item(_text(text))
+    view.add_item(box)
+    return view
+
+
+async def _notice(ctx: commands.Context, text: str) -> None:
+    with suppress(discord.HTTPException):
+        notice = await ctx.send(
+            text, delete_after=NOTICE_DELETE_AFTER, allowed_mentions=discord.AllowedMentions.none()
+        )
+        _mark_transient(notice.id)
+
+
+async def _reply_private(interaction: discord.Interaction, text: str) -> None:
+    if interaction.response.is_done():
+        await interaction.followup.send(text, ephemeral=True)
+    else:
+        await interaction.response.send_message(text, ephemeral=True)
+
+
+async def _edit_view(interaction: discord.Interaction, view: discord.ui.LayoutView) -> None:
+    """Edita el mensaje del componente, tanto si ya se ha respondido como si no."""
+    if interaction.response.is_done():
+        await interaction.edit_original_response(view=view)
+    else:
+        await interaction.response.edit_message(view=view)
+
+
+async def _check_manager(interaction: discord.Interaction, *, needs_active: bool = True) -> bool:
+    guild = interaction.guild
+    store = _store(interaction.client)
+    if guild is None or not _can_manage(interaction.user, store):
+        await _reply_private(
+            interaction, "❌ Solo los admins (que no estén excluidos) pueden gestionar el consejo."
+        )
+        return False
+    if needs_active and store.get_active(guild.id) is None:
+        await _reply_private(interaction, "❌ No hay ningún consejo abierto.")
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Canal fijo
 
 
 def _bot_overwrite(channel: discord.TextChannel | None = None) -> discord.PermissionOverwrite:
@@ -191,229 +372,164 @@ async def _clear_messages(
     return clone
 
 
-def _council_channel(
-    guild: discord.Guild, active: dict[str, Any] | None
-) -> discord.TextChannel | None:
-    if active is None:
-        return None
-    try:
-        channel = guild.get_channel(int(active.get("channel_id")))
-    except (TypeError, ValueError):
-        return None
-    return channel if isinstance(channel, discord.TextChannel) else None
-
-
-def _can_manage(member: discord.abc.User, store: CouncilStore) -> bool:
-    """Admins que no estén excluidos del consejo activo."""
-    if not _is_admin(member):
-        return False
-    return member.id not in store.excluded_ids(member.guild.id)  # type: ignore[union-attr]
-
-
-def _can_vote(member: discord.abc.User, store: CouncilStore, active: dict[str, Any]) -> bool:
-    if not isinstance(member, discord.Member) or member.bot:
-        return False
-    if member.id in store.excluded_ids(member.guild.id):
-        return False
-    if member.guild_permissions.administrator:
-        return True
-    role = _council_role(member.guild, store)
-    return bool(active.get("met_at")) and role is not None and role in member.roles
-
-
-def _voters(guild: discord.Guild, store: CouncilStore, active: dict[str, Any]) -> list[discord.Member]:
-    return [member for member in guild.members if _can_vote(member, store, active)]
-
-
-def _missing_permissions(guild: discord.Guild) -> list[str]:
-    permissions = guild.me.guild_permissions
-    return [label for name, label in REQUIRED_PERMISSIONS if not getattr(permissions, name)]
-
-
-def _mentions(user_ids: Any, empty: str = "Nadie") -> str:
-    ids = list(user_ids)
-    if not ids:
-        return empty
-    shown = ", ".join(f"<@{user_id}>" for user_id in ids[:MENTIONS_SHOWN])
-    if len(ids) > MENTIONS_SHOWN:
-        shown += f" y {len(ids) - MENTIONS_SHOWN} más"
-    return _field(shown)
-
-
-def _field(text: str, limit: int = FIELD_LIMIT) -> str:
-    text = str(text).strip() or "—"
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
-def _name(guild: discord.Guild, user_id: int) -> str:
-    member = guild.get_member(int(user_id))
-    if member is None:
-        return f"usuario {user_id}"
-    return f"{member.display_name} (@{member.name})"
-
-
-def _plural(count: int, singular: str, plural: str) -> str:
-    return f"{count} {singular if count == 1 else plural}"
-
-
-def _format_span(delta: timedelta) -> str:
-    minutes = max(0, int(delta.total_seconds() // 60))
-    days, minutes = divmod(minutes, 24 * 60)
-    hours, minutes = divmod(minutes, 60)
-    parts = []
-    if days:
-        parts.append(f"{days} d")
-    if hours:
-        parts.append(f"{hours} h")
-    if minutes or not parts:
-        parts.append(f"{minutes} min")
-    return " ".join(parts)
-
-
-def _admin_warnings(guild: discord.Guild, user_ids: Any) -> list[str]:
-    """Discord no deja ocultar un canal a quien tiene permiso de Administrador."""
-    warnings = []
-    for user_id in user_ids:
-        member = guild.get_member(int(user_id))
-        if member is not None and member.guild_permissions.administrator:
-            warnings.append(
-                f"⚠️ {member.mention} es admin: Discord no deja ocultarle el canal, así que lo "
-                "seguirá viendo. Eso sí, no podrá votar ni gestionar el consejo."
-            )
-    return warnings
-
-
-async def _notice(ctx: commands.Context, text: str) -> None:
-    with suppress(discord.HTTPException):
-        notice = await ctx.send(
-            text, delete_after=NOTICE_DELETE_AFTER, allowed_mentions=discord.AllowedMentions.none()
-        )
-        _mark_transient(notice.id)
-
-
-async def _reply_private(interaction: discord.Interaction, text: str) -> None:
-    if interaction.response.is_done():
-        await interaction.followup.send(text, ephemeral=True)
-    else:
-        await interaction.response.send_message(text, ephemeral=True)
-
-
-async def _check_manager(interaction: discord.Interaction, *, needs_active: bool = True) -> bool:
-    guild = interaction.guild
-    store = _store(interaction.client)
-    if guild is None or not _can_manage(interaction.user, store):
-        await _reply_private(
-            interaction, "❌ Solo los admins (que no estén excluidos) pueden gestionar el consejo."
-        )
-        return False
-    if needs_active and store.get_active(guild.id) is None:
-        await _reply_private(interaction, "❌ No hay ningún consejo abierto.")
-        return False
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Mensaje fijado del canal (estado + botones)
 
 
-def _header_embed(guild: discord.Guild, store: CouncilStore, active: dict[str, Any]) -> discord.Embed:
-    role = _council_role(guild, store)
-    role_text = role.mention if role is not None else "el rol del consejo"
-    embed = discord.Embed(
-        title=f"📌 Consejo · {_truncate(active.get('topic') or 'Sin tema', 200)}",
-        description=_field(active.get("description") or "*Sin descripción.*", 3000),
-        color=COUNCIL_COLOR,
-    )
-    if active.get("met_at"):
-        status = f"🟢 **Reunido** · lo ven los admins y {role_text}."
-    else:
-        status = (
-            "🔒 **En preparación** · de momento solo lo ven los admins.\n"
-            f"Pulsa 📣 **Reunir consejo** cuando quieras que entre {role_text}."
-        )
-    embed.add_field(name="Estado", value=status, inline=False)
-    embed.add_field(name="Abierto por", value=f"<@{active.get('opened_by')}>", inline=True)
-    opened = parse_datetime(active.get("opened_at"))
-    embed.add_field(name="Desde", value=_ts(opened, "R") if opened else "—", inline=True)
-    polls = store.list_polls(guild.id)
-    open_count = sum(1 for poll in polls if not poll.get("closed"))
-    embed.add_field(
-        name="Polls", value=f"📊 `{len(polls)}` · `{open_count}` abiertos", inline=True
-    )
-    embed.add_field(
-        name="🚫 Excluidos",
-        value=_mentions(store.excluded_ids(guild.id)),
-        inline=False,
-    )
-    embed.set_footer(text=f"{FOOTER} · .noah council help")
-    return embed
-
-
-class CouncilControlView(discord.ui.View):
+class ControlButton(discord.ui.DynamicItem[discord.ui.Button], template=CONTROL_TEMPLATE):
     """Botones del mensaje fijado. Persistentes: funcionan tras reiniciar el bot."""
 
-    def __init__(self, met: bool = False) -> None:
-        super().__init__(timeout=None)
-        self.meet.disabled = met
+    def __init__(
+        self,
+        action: str,
+        *,
+        label: str | None = None,
+        emoji: str | None = None,
+        style: discord.ButtonStyle = discord.ButtonStyle.secondary,
+    ) -> None:
+        super().__init__(
+            discord.ui.Button(
+                label=label, emoji=emoji, style=style, custom_id=f"noah:council:ctl:{action}"
+            )
+        )
+        self.action = action
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Button,
+        match: re.Match[str],
+        /,
+    ) -> "ControlButton":
+        _ = interaction, item
+        return cls(match["action"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
         store = _store(interaction.client)
         active = store.get_active(guild.id) if guild is not None else None
-        if active is None or interaction.channel_id != active.get("channel_id"):
+        if guild is None or active is None or interaction.channel_id != active.get("channel_id"):
             await interaction.response.send_message(
                 "❌ Este consejo ya no está abierto.", ephemeral=True
             )
-            return False
-        return await _check_manager(interaction)
+            return
+        if not await _check_manager(interaction):
+            return
+        if self.action == "poll":
+            await interaction.response.send_modal(PollModal())
+        elif self.action == "meet":
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            result = await _meet(guild, store, interaction.user)
+            await interaction.followup.send(result, ephemeral=True)
+        elif self.action == "exclude":
+            await _open_exclusions(interaction)
+        elif self.action == "finish":
+            await _open_finish(interaction)
 
-    @discord.ui.button(
-        label="Nuevo poll", emoji="📊", style=discord.ButtonStyle.primary, custom_id=CONTROL_POLL_ID
-    )
-    async def poll(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
-        await interaction.response.send_modal(PollModal())
 
-    @discord.ui.button(
-        label="Reunir consejo",
-        emoji="📣",
-        style=discord.ButtonStyle.success,
-        custom_id=CONTROL_MEET_ID,
-    )
-    async def meet(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        result = await _meet(interaction.guild, _store(interaction.client), interaction.user)  # type: ignore[arg-type]
-        await interaction.followup.send(result, ephemeral=True)
+def _header_view(
+    guild: discord.Guild, store: CouncilStore, active: dict[str, Any]
+) -> discord.ui.LayoutView:
+    role = _council_role(guild, store)
+    role_text = role.mention if role is not None else "el rol del consejo"
+    opened = parse_datetime(active.get("opened_at"))
+    met = parse_datetime(active.get("met_at"))
 
-    @discord.ui.button(
-        label="Exclusiones",
-        emoji="🚫",
-        style=discord.ButtonStyle.secondary,
-        custom_id=CONTROL_EXCLUDE_ID,
+    box = _box()
+    subtitle = f"Consejo · abierto por <@{active.get('opened_by')}>"
+    if opened is not None:
+        subtitle += f" {_ts(opened, 'R')}"
+    box.add_item(
+        _text(f"## 📌 {_truncate(active.get('topic') or 'Sin tema', 200)}\n-# {subtitle}")
     )
-    async def exclude(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
-        await _open_exclusions(interaction)
+    description = str(active.get("description") or "").strip()
+    if description:
+        box.add_item(_text(_block(description)))
+    box.add_item(_sep())
 
-    @discord.ui.button(
-        label="Finalizar", emoji="🏁", style=discord.ButtonStyle.danger, custom_id=CONTROL_FINISH_ID
+    if met is None:
+        box.add_item(
+            discord.ui.Section(
+                _text(
+                    "**🔒 En preparación**\n"
+                    "Solo lo ven los admins. Cuando esté listo, reúne "
+                    + (f"a {role.mention}." if role is not None else "al consejo.")
+                ),
+                accessory=ControlButton(
+                    "meet", label="Reunir consejo", emoji="📣", style=discord.ButtonStyle.success
+                ),
+            )
+        )
+    else:
+        box.add_item(_text(f"**🟢 Reunido** {_ts(met, 'R')}\nLo ven los admins y {role_text}."))
+
+    polls = store.list_polls(guild.id)
+    open_count = sum(1 for poll in polls if not poll.get("closed"))
+    polls_text = (
+        f"{len(polls)} · {_plural(open_count, 'abierto', 'abiertos')}" if polls else "ninguno"
     )
-    async def finish(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
-        await _open_finish(interaction)
+    box.add_item(
+        _text(
+            f"📊 **Polls** · {polls_text}\n"
+            f"🚫 **Excluidos** · {_mentions(sorted(store.excluded_ids(guild.id)))}"
+        )
+    )
+    box.add_item(_sep())
+    box.add_item(
+        _row(
+            ControlButton("poll", label="Nuevo poll", emoji="📊", style=discord.ButtonStyle.primary),
+            ControlButton("exclude", label="Exclusiones", emoji="🚫"),
+            ControlButton("finish", label="Finalizar", emoji="🏁", style=discord.ButtonStyle.danger),
+        )
+    )
+    box.add_item(
+        _text("-# Votos anónimos · solo los admins gestionan el consejo · `.noah council help`")
+    )
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(box)
+    return view
+
+
+async def _send_header(
+    guild: discord.Guild, store: CouncilStore, channel: discord.TextChannel
+) -> None:
+    active = store.get_active(guild.id)
+    if active is None:
+        return
+    try:
+        header = await channel.send(
+            view=_header_view(guild, store, active),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        _log.exception("No se pudo publicar el mensaje principal del consejo")
+        return
+    store.set_header(guild.id, header.id)
+    with suppress(discord.HTTPException):
+        await header.pin(reason="Mensaje principal del consejo")
 
 
 async def _refresh_header(guild: discord.Guild, store: CouncilStore) -> None:
     active = store.get_active(guild.id)
     channel = _council_channel(guild, active)
-    if active is None or channel is None or not active.get("header_message_id"):
+    if active is None or channel is None:
         return
-    with suppress(discord.HTTPException):
-        await channel.get_partial_message(int(active["header_message_id"])).edit(
-            embed=_header_embed(guild, store, active),
-            view=CouncilControlView(met=bool(active.get("met_at"))),
-        )
+    header_id = active.get("header_message_id")
+    if header_id:
+        try:
+            await channel.get_partial_message(int(header_id)).edit(
+                view=_header_view(guild, store, active)
+            )
+            return
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            # Mensaje de una versión anterior que no se puede pasar al estilo nuevo.
+            with suppress(discord.HTTPException):
+                await channel.get_partial_message(int(header_id)).delete()
+    await _send_header(guild, store, channel)
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +607,7 @@ def _create_problems(guild: discord.Guild, store: CouncilStore) -> list[str]:
     return problems
 
 
-class InitConsoleView(discord.ui.View):
+class InitConsoleView(discord.ui.LayoutView):
     def __init__(
         self,
         guild: discord.Guild,
@@ -510,67 +626,80 @@ class InitConsoleView(discord.ui.View):
         self.description = description
         self.excluded = list(excluded or [])
 
+        role = _council_role(guild, store)
+        category = _category(guild, store)
+        channel = _fixed_channel(guild, store)
+        if channel is not None:
+            where = f"Será en {channel.mention}"
+        else:
+            in_category = f" en **{category.name}**" if category is not None else ""
+            where = f"Se creará **{CHANNEL_NAME}**{in_category}"
+        role_text = role.mention if role is not None else "el rol del consejo"
+
+        box = _box()
+        box.add_item(
+            _text(
+                "## 📌 Nuevo consejo\n"
+                f"-# {where}. Al principio solo lo ven los admins; con 📣 Reunir consejo "
+                f"entra {role_text}."
+            )
+        )
+        box.add_item(_sep())
+
+        topic_text = (
+            f"**Tema**\n{_truncate(topic, 100)}" if topic else "**Tema**\n*Sin tema todavía*"
+        )
+        if description:
+            topic_text += f"\n\n**Descripción**\n{_block(description, 900)}"
+        box.add_item(
+            discord.ui.Section(
+                _text(topic_text),
+                accessory=_button(
+                    "Editar" if topic else "Poner tema",
+                    self._edit_topic,
+                    emoji="✏️",
+                    style=discord.ButtonStyle.secondary if topic else discord.ButtonStyle.primary,
+                ),
+            )
+        )
+        box.add_item(_sep())
+
+        box.add_item(
+            _text(
+                f"**🚫 Excluidos** · {_mentions(self.excluded)}\n"
+                "-# No verán el canal aunque tengan el rol del consejo y no podrán votar."
+            )
+        )
         members = [
             member for user_id in self.excluded if (member := guild.get_member(user_id)) is not None
         ]
         self.exclude_select = discord.ui.UserSelect(
-            placeholder="🚫 Excluir a los implicados (opcional)",
+            placeholder="Elige a los implicados (opcional)",
             min_values=0,
             max_values=EXCLUDE_LIMIT,
             default_values=members,
-            row=0,
         )
         self.exclude_select.callback = self._on_exclude
-        self.add_item(self.exclude_select)
+        box.add_item(_row(self.exclude_select))
 
-        self.topic_button.style = (
-            discord.ButtonStyle.secondary if self.topic else discord.ButtonStyle.primary
-        )
-        self.open_button.disabled = not self.topic or bool(_create_problems(guild, store))
-
-    def embed(self) -> discord.Embed:
-        role = _council_role(self.guild, self.store)
-        category = _category(self.guild, self.store)
-        channel = _fixed_channel(self.guild, self.store)
-        if channel is not None:
-            where = f"El consejo será en {channel.mention}"
-        else:
-            in_category = f" en **{category.name}**" if category is not None else ""
-            where = f"Se creará el canal **{CHANNEL_NAME}**{in_category}"
-        role_text = role.mention if role is not None else "el rol del consejo"
-        embed = discord.Embed(
-            title="📌 Nuevo consejo",
-            description=(
-                f"{where}. Al principio solo lo verán los admins; con `.noah council meet` "
-                f"(o 📣 en el canal) entrará {role_text}."
-            ),
-            color=COUNCIL_COLOR,
-        )
-        embed.add_field(
-            name="Tema",
-            value=_field(self.topic) if self.topic else "*Sin tema · pulsa ✏️ Tema y descripción*",
-            inline=False,
-        )
-        embed.add_field(
-            name="Descripción",
-            value=_field(self.description) if self.description else "*Sin descripción*",
-            inline=False,
-        )
-        embed.add_field(
-            name="🚫 Excluidos",
-            value=(
-                _mentions(self.excluded)
-                + "\nNo verán el canal aunque tengan el rol del consejo y no podrán votar."
-            ),
-            inline=False,
-        )
-        notes = _create_problems(self.guild, self.store) + _admin_warnings(
-            self.guild, self.excluded
-        )
+        problems = _create_problems(guild, store)
+        notes = problems + _admin_warnings(guild, self.excluded)
         if notes:
-            embed.add_field(name="Avisos", value=_field("\n".join(notes)), inline=False)
-        embed.set_footer(text=FOOTER)
-        return embed
+            box.add_item(_text("\n".join(notes)))
+        box.add_item(_sep())
+        box.add_item(
+            _row(
+                _button(
+                    "Abrir consejo",
+                    self._open,
+                    emoji="📌",
+                    style=discord.ButtonStyle.success,
+                    disabled=not topic or bool(problems),
+                ),
+                _button("Cancelar", self._cancel),
+            )
+        )
+        self.add_item(box)
 
     def _copy(self) -> "InitConsoleView":
         return InitConsoleView(
@@ -585,7 +714,7 @@ class InitConsoleView(discord.ui.View):
     async def refresh(self, interaction: discord.Interaction) -> None:
         view = self._copy()
         self.stop()
-        await _respond_edit(interaction, embed=view.embed(), view=view)
+        await _edit_view(interaction, view)
 
     async def _on_exclude(self, interaction: discord.Interaction) -> None:
         self.excluded = [
@@ -595,24 +724,16 @@ class InitConsoleView(discord.ui.View):
         ]
         await self.refresh(interaction)
 
-    @discord.ui.button(label="Tema y descripción", emoji="✏️", row=1)
-    async def topic_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
+    async def _edit_topic(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(TopicModal(self))
 
-    @discord.ui.button(
-        label="Abrir consejo", emoji="📌", style=discord.ButtonStyle.success, row=1
-    )
-    async def open_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
+    async def _open(self, interaction: discord.Interaction) -> None:
         await _create_council(interaction, self)
 
-    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, row=1)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
+    async def _cancel(self, interaction: discord.Interaction) -> None:
         self.stop()
         await interaction.response.edit_message(
-            content="Consejo cancelado. No se ha creado nada.", embed=None, view=None
+            view=_note_view("-# Consejo cancelado. No se ha creado nada.", CLOSED_COLOR)
         )
 
 
@@ -659,7 +780,7 @@ async def _open_console(interaction: discord.Interaction) -> bool:
     guild = interaction.guild
     assert guild is not None
     view = InitConsoleView(guild, _store(interaction.client), interaction.user.id)
-    await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+    await interaction.response.send_message(view=view, ephemeral=True)
     return True
 
 
@@ -699,7 +820,7 @@ async def _create_council(interaction: discord.Interaction, console: InitConsole
             )
             return
 
-        active = store.start(
+        store.start(
             guild.id,
             channel_id=channel.id,
             topic=console.topic,
@@ -707,28 +828,19 @@ async def _create_council(interaction: discord.Interaction, console: InitConsole
             opened_by=interaction.user.id,
             excluded=excluded,
         )
-        try:
-            header = await channel.send(
-                embed=_header_embed(guild, store, active), view=CouncilControlView()
-            )
-        except discord.HTTPException:
-            header = None
-        if header is not None:
-            store.set_header(guild.id, header.id)
-            with suppress(discord.HTTPException):
-                await header.pin(reason="Mensaje principal del consejo")
+        await _send_header(guild, store, channel)
 
     console.stop()
-    embed = discord.Embed(
-        title="✅ Consejo abierto",
-        description=(
+    await _edit_view(
+        interaction,
+        _note_view(
+            "### ✅ Consejo abierto\n"
             f"**{_truncate(console.topic, 100)}** ya está en {channel.mention}.\n"
-            "De momento solo lo ven los admins. Desde ahí puedes crear polls y, cuando esté "
-            "listo, reunir al consejo con 📣 o `.noah council meet`."
+            "-# De momento solo lo ven los admins. Crea polls y, cuando esté listo, pulsa "
+            "📣 Reunir consejo.",
+            SUCCESS_COLOR,
         ),
-        color=COUNCIL_COLOR,
     )
-    await _respond_edit(interaction, content=None, embed=embed, view=None)
 
 
 # ---------------------------------------------------------------------------
@@ -766,12 +878,11 @@ async def _meet(guild: discord.Guild, store: CouncilStore, actor: discord.abc.Us
         if not poll.get("closed"):
             _request_poll_refresh(guild, store, poll["id"])
 
-    lines = [f"📣 {role.mention}, el consejo está reunido."]
-    lines.append(f"**Tema:** {_truncate(active.get('topic') or 'Sin tema', 200)}")
-    lines.append("Las votaciones son anónimas: solo puedes votar una vez y no se puede cambiar.")
     with suppress(discord.HTTPException):
         await channel.send(
-            "\n".join(lines),
+            f"📣 {role.mention} · **el consejo está reunido**\n"
+            f"-# Tema: {_truncate(active.get('topic') or 'Sin tema', 150)} · "
+            "los votos son anónimos y se pueden corregir mientras el poll esté abierto",
             allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=[role]),
         )
 
@@ -788,45 +899,46 @@ async def _meet(guild: discord.Guild, store: CouncilStore, actor: discord.abc.Us
 # Exclusiones durante el consejo
 
 
-def _exclusions_embed(guild: discord.Guild, store: CouncilStore, last: str = "") -> discord.Embed:
-    excluded = store.excluded_ids(guild.id)
-    embed = discord.Embed(
-        title="🚫 Exclusiones del consejo",
-        description=(
-            "Los excluidos no ven el canal aunque tengan el rol del consejo y no pueden votar. "
-            "Si ya habían votado en un poll abierto, su voto se anula."
-        ),
-        color=COUNCIL_COLOR,
-    )
-    embed.add_field(name="Excluidos", value=_mentions(excluded), inline=False)
-    warnings = _admin_warnings(guild, excluded)
-    if warnings:
-        embed.add_field(name="Avisos", value=_field("\n".join(warnings)), inline=False)
-    if last:
-        embed.add_field(name="Último cambio", value=_field(last), inline=False)
-    embed.set_footer(text=FOOTER)
-    return embed
-
-
-class ExclusionsView(discord.ui.View):
-    def __init__(self, guild: discord.Guild, store: CouncilStore, author_id: int) -> None:
+class ExclusionsView(discord.ui.LayoutView):
+    def __init__(
+        self, guild: discord.Guild, store: CouncilStore, author_id: int, last: str = ""
+    ) -> None:
         super().__init__(timeout=CONSOLE_TIMEOUT)
         self.guild = guild
         self.store = store
         self.author_id = author_id
+        excluded = sorted(store.excluded_ids(guild.id))
+
+        box = _box()
+        box.add_item(
+            _text(
+                "### 🚫 Exclusiones\n"
+                "-# Los excluidos no ven el canal ni pueden votar. Si ya habían votado en un "
+                "poll abierto, su voto se anula."
+            )
+        )
+        box.add_item(_sep())
+        box.add_item(_text(f"**Excluidos** · {_mentions(excluded)}"))
         members = [
-            member
-            for user_id in sorted(store.excluded_ids(guild.id))
-            if (member := guild.get_member(user_id)) is not None
+            member for user_id in excluded if (member := guild.get_member(user_id)) is not None
         ]
         self.select = discord.ui.UserSelect(
-            placeholder="🚫 Quién queda excluido",
+            placeholder="Quién queda excluido",
             min_values=0,
             max_values=EXCLUDE_LIMIT,
             default_values=members[:EXCLUDE_LIMIT],
         )
         self.select.callback = self._on_select
-        self.add_item(self.select)
+        box.add_item(_row(self.select))
+        warnings = _admin_warnings(guild, excluded)
+        if warnings:
+            box.add_item(_text("\n".join(warnings)))
+        if last:
+            box.add_item(_sep())
+            box.add_item(_text(f"**Último cambio**\n{_block(last, 900)}"))
+        box.add_item(_sep())
+        box.add_item(_row(_button("Hecho", self._done)))
+        self.add_item(box)
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
         if not await _check_manager(interaction):
@@ -838,17 +950,15 @@ class ExclusionsView(discord.ui.View):
             if not user.bot and user.id != interaction.user.id
         }
         last = await _apply_exclusions(self.guild, self.store, selected, interaction.user)
-        view = ExclusionsView(self.guild, self.store, self.author_id)
         self.stop()
-        await _respond_edit(
-            interaction, embed=_exclusions_embed(self.guild, self.store, last), view=view
-        )
+        await _edit_view(interaction, ExclusionsView(self.guild, self.store, self.author_id, last))
 
-    @discord.ui.button(label="Hecho", style=discord.ButtonStyle.secondary, row=1)
-    async def done(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
+    async def _done(self, interaction: discord.Interaction) -> None:
         self.stop()
-        await interaction.response.edit_message(view=None)
+        excluded = sorted(self.store.excluded_ids(self.guild.id))
+        await interaction.response.edit_message(
+            view=_note_view(f"### 🚫 Exclusiones guardadas\n**Excluidos** · {_mentions(excluded)}")
+        )
 
 
 async def _apply_exclusions(
@@ -893,7 +1003,9 @@ async def _apply_exclusions(
     if removed:
         parts.append(f"✅ Readmitidos: {_mentions(removed)}")
     if touched:
-        parts.append(f"🗳️ Votos anulados en {_plural(len(touched), 'poll abierto', 'polls abiertos')}.")
+        parts.append(
+            f"🗳️ Votos anulados en {_plural(len(touched), 'poll abierto', 'polls abiertos')}."
+        )
     if failed:
         parts.append(f"❌ No he podido cambiar los permisos de {_mentions(failed)}.")
     return "\n".join(parts) or "Sin cambios."
@@ -904,10 +1016,8 @@ async def _open_exclusions(interaction: discord.Interaction) -> bool:
         return False
     guild = interaction.guild
     assert guild is not None
-    store = _store(interaction.client)
     await interaction.response.send_message(
-        embed=_exclusions_embed(guild, store),
-        view=ExclusionsView(guild, store, interaction.user.id),
+        view=ExclusionsView(guild, _store(interaction.client), interaction.user.id),
         ephemeral=True,
     )
     return True
@@ -919,13 +1029,13 @@ async def _open_exclusions(interaction: discord.Interaction) -> bool:
 
 def _bar(count: int, total: int) -> str:
     filled = round(BAR_LENGTH * count / total) if total else 0
-    return "█" * filled + "░" * (BAR_LENGTH - filled)
+    return "▰" * filled + "▱" * (BAR_LENGTH - filled)
 
 
-def _option_label(poll: dict[str, Any], index: int) -> str:
+def _option_name(poll: dict[str, Any], index: int) -> str:
     options = poll.get("options") or []
     name = options[index] if 0 <= index < len(options) else "?"
-    return f"{OPTION_EMOJIS[index]} **{name}**"
+    return f"{index + 1} · {name}"
 
 
 def _result_text(poll: dict[str, Any]) -> str:
@@ -937,61 +1047,12 @@ def _result_text(poll: dict[str, Any]) -> str:
         return "Nadie ha votado."
     if len(best) == 1:
         index = best[0]
-        return f"🏆 **{options[index]}** ({counts[index]}/{total})"
+        return f"🏆 **{options[index]}** gana con {counts[index]} de {total}"
     names = ", ".join(f"**{options[index]}**" for index in best)
     return f"🤝 Empate entre {names} ({_plural(counts[best[0]], 'voto', 'votos')} cada una)"
 
 
-def _poll_embed(
-    guild: discord.Guild, store: CouncilStore, active: dict[str, Any], poll: dict[str, Any]
-) -> discord.Embed:
-    closed = bool(poll.get("closed"))
-    counts = tally(poll)
-    total = sum(counts)
-    show = closed or bool(poll.get("live"))
-    best = set(winners(poll)) if closed else set()
-
-    lines = []
-    for index in range(len(counts)):
-        line = _option_label(poll, index) + (" 🏆" if index in best else "")
-        if show:
-            percent = round(counts[index] * 100 / total) if total else 0
-            line += (
-                f"\n`{_bar(counts[index], total)}` **{percent}%** · "
-                f"{_plural(counts[index], 'voto', 'votos')}"
-            )
-        lines.append(line)
-
-    embed = discord.Embed(
-        title=f"📊 {_truncate(poll.get('question') or 'Votación', 250)}",
-        description="\n\n".join(lines),
-        color=CLOSED_COLOR if closed else COUNCIL_COLOR,
-    )
-    eligible = len(_voters(guild, store, active))
-    if closed or eligible < total:
-        participation = f"🗳️ **{_plural(total, 'voto', 'votos')}**"
-    else:
-        participation = f"🗳️ **{total}/{eligible}** han votado"
-    if closed:
-        status = "🔒 Votación cerrada"
-    elif poll.get("live"):
-        status = "📈 Resultados en directo"
-    else:
-        status = "🙈 Resultados ocultos hasta cerrar"
-    embed.add_field(name="Participación", value=participation, inline=True)
-    embed.add_field(name="Estado", value=status, inline=True)
-    if closed:
-        embed.add_field(name="Resultado", value=_result_text(poll), inline=False)
-    embed.set_footer(
-        text=f"{FOOTER} · Voto anónimo · 1 voto por persona, no se puede cambiar"
-    )
-    return embed
-
-
-class PollButton(
-    discord.ui.DynamicItem[discord.ui.Button],
-    template=r"noah:council:(?P<action>vote|votes|close):(?P<poll_id>[0-9a-f]+)(?::(?P<index>\d))?",
-):
+class PollButton(discord.ui.DynamicItem[discord.ui.Button], template=POLL_TEMPLATE):
     """Botones de los polls (votar, ver votos y cerrar). Persistentes tras reiniciar."""
 
     def __init__(
@@ -1004,7 +1065,6 @@ class PollButton(
         emoji: str | None = None,
         style: discord.ButtonStyle = discord.ButtonStyle.secondary,
         disabled: bool = False,
-        row: int | None = None,
     ) -> None:
         custom_id = f"noah:council:{action}:{poll_id}"
         if index is not None:
@@ -1012,8 +1072,7 @@ class PollButton(
         super().__init__(
             discord.ui.Button(
                 label=label, emoji=emoji, style=style, disabled=disabled, custom_id=custom_id
-            ),
-            row=row,
+            )
         )
         self.action = action
         self.poll_id = poll_id
@@ -1035,25 +1094,62 @@ class PollButton(
         await _poll_action(interaction, self.action, self.poll_id, self.index)
 
 
-def _poll_view(poll: dict[str, Any]) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
+def _poll_view(
+    guild: discord.Guild, store: CouncilStore, active: dict[str, Any], poll: dict[str, Any]
+) -> discord.ui.LayoutView:
     closed = bool(poll.get("closed"))
+    counts = tally(poll)
+    total = sum(counts)
+    show = closed or bool(poll.get("live"))
+    best = set(winners(poll)) if closed else set()
+
+    box = _box(CLOSED_COLOR if closed else COUNCIL_COLOR)
+    box.add_item(_text(f"### 📊 {_truncate(poll.get('question') or 'Votación', 250)}"))
+
+    lines = []
+    for index in range(len(counts)):
+        line = f"**{_option_name(poll, index)}**" + (" 🏆" if index in best else "")
+        if show:
+            percent = round(counts[index] * 100 / total) if total else 0
+            line += f"\n{_bar(counts[index], total)}  **{percent}%** · {counts[index]}"
+        lines.append(line)
+    box.add_item(_text(("\n\n" if show else "\n").join(lines)))
+
+    if closed:
+        box.add_item(_text(_result_text(poll)))
+        status = f"🔒 cerrada · {_plural(total, 'voto', 'votos')}"
+    else:
+        eligible = len(_voters(guild, store, active))
+        participation = (
+            f"🗳️ {total}/{eligible} han votado"
+            if eligible >= total
+            else f"🗳️ {_plural(total, 'voto', 'votos')}"
+        )
+        mode = "📈 en directo" if poll.get("live") else "🙈 resultados al cerrar"
+        status = f"{participation} · {mode} · anónimo, se puede corregir"
+    box.add_item(_text(f"-# {status}"))
+    box.add_item(_sep())
+
+    vote_row = discord.ui.ActionRow()
     for index, option in enumerate(poll.get("options") or []):
-        view.add_item(
+        vote_row.add_item(
             PollButton(
                 "vote",
                 poll["id"],
                 index,
-                label=_truncate(option, 80),
-                emoji=OPTION_EMOJIS[index],
-                style=discord.ButtonStyle.secondary,
+                label=_truncate(f"{index + 1} · {option}", 80),
                 disabled=closed,
-                row=0,
             )
         )
-    view.add_item(PollButton("votes", poll["id"], label="Votos", emoji="🔍", row=1))
+    box.add_item(vote_row)
+    admin_row = discord.ui.ActionRow()
+    admin_row.add_item(PollButton("votes", poll["id"], label="Votos", emoji="🔍"))
     if not closed:
-        view.add_item(PollButton("close", poll["id"], label="Cerrar", emoji="🔒", row=1))
+        admin_row.add_item(PollButton("close", poll["id"], label="Cerrar", emoji="🔒"))
+    box.add_item(admin_row)
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(box)
     return view
 
 
@@ -1065,7 +1161,7 @@ async def _refresh_poll(guild: discord.Guild, store: CouncilStore, poll_id: str)
         return
     with suppress(discord.HTTPException):
         await channel.get_partial_message(int(poll["message_id"])).edit(
-            embed=_poll_embed(guild, store, active, poll), view=_poll_view(poll)
+            view=_poll_view(guild, store, active, poll)
         )
 
 
@@ -1206,10 +1302,9 @@ async def _publish_poll(
     if poll is None:
         return "❌ El consejo ya no está abierto."
     try:
-        message = await channel.send(
-            embed=_poll_embed(guild, store, active, poll), view=_poll_view(poll)
-        )
+        message = await channel.send(view=_poll_view(guild, store, active, poll))
     except discord.HTTPException:
+        _log.exception("No se pudo publicar un poll del consejo")
         store.remove_poll(guild.id, poll["id"])
         return f"❌ No he podido publicar el poll en {channel.mention}."
     store.set_poll_message(guild.id, poll["id"], message.id)
@@ -1240,9 +1335,7 @@ async def _poll_action(
         return
     if action == "votes":
         await interaction.response.send_message(
-            embed=_votes_embed(guild, store, active, poll),
-            view=PollAdminView(guild, store, poll_id),
-            ephemeral=True,
+            view=PollAdminView(guild, store, poll_id), ephemeral=True
         )
     elif action == "close":
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1250,6 +1343,129 @@ async def _poll_action(
         await interaction.followup.send(
             "🔒 Poll cerrado." if closed else "ℹ️ Este poll ya estaba cerrado.", ephemeral=True
         )
+
+
+# -- Respuesta privada al votar (con «Corregir voto») ------------------------
+
+REPLY_VOTED = "voted"
+REPLY_PICK = "pick"
+REPLY_ASK = "ask"
+
+
+class VoteReplyView(discord.ui.LayoutView):
+    """Respuesta privada al votar: confirma el voto y deja corregirlo.
+
+    - `voted`: «Has votado X» + ✏️ Corregir voto.
+    - `pick`: elige el nuevo voto entre las demás opciones.
+    - `ask`: ha pulsado otra opción en el poll; ¿cambiar de X a Y?
+    """
+
+    def __init__(
+        self,
+        guild: discord.Guild,
+        store: CouncilStore,
+        poll_id: str,
+        user_id: int,
+        state: str = REPLY_VOTED,
+        *,
+        target: int | None = None,
+        notice: str = "",
+    ) -> None:
+        super().__init__(timeout=VOTE_REPLY_TIMEOUT)
+        self.guild = guild
+        self.store = store
+        self.poll_id = poll_id
+        self.user_id = user_id
+
+        poll = store.get_poll(guild.id, poll_id) or {}
+        current = poll_votes(poll).get(user_id)
+        question = _truncate(poll.get("question") or "Votación", 120)
+
+        if not poll or poll.get("closed") or current is None:
+            box = _box(CLOSED_COLOR)
+            box.add_item(_text(f"🔒 Esta votación ya está cerrada.\n-# {question}"))
+            self.add_item(box)
+            return
+
+        if state == REPLY_PICK:
+            box = _box()
+            box.add_item(
+                _text(
+                    f"**¿Cuál es tu voto?**\n-# {question} · ahora: {_option_name(poll, current)}"
+                )
+            )
+            row = discord.ui.ActionRow()
+            for index in range(len(poll.get("options") or [])):
+                row.add_item(
+                    _button(
+                        _truncate(_option_name(poll, index), 80),
+                        self._choose_callback(index),
+                        disabled=index == current,
+                    )
+                )
+            box.add_item(row)
+            box.add_item(_row(_button("Cancelar", self._back)))
+        elif state == REPLY_ASK and target is not None and target != current:
+            box = _box()
+            box.add_item(
+                _text(
+                    f"Ya votaste **{_option_name(poll, current)}**.\n"
+                    f"¿Quieres cambiarlo a **{_option_name(poll, target)}**?\n-# {question}"
+                )
+            )
+            box.add_item(
+                _row(
+                    _button(
+                        _truncate(f"Cambiar a {_option_name(poll, target)}", 80),
+                        self._choose_callback(target),
+                        style=discord.ButtonStyle.primary,
+                    ),
+                    _button("Dejarlo así", self._back),
+                )
+            )
+        else:
+            box = _box(SUCCESS_COLOR)
+            lead = notice or "✅ Has votado"
+            box.add_item(
+                _text(
+                    f"{lead} **{_option_name(poll, current)}**.\n"
+                    f"-# {question} · nadie del consejo verá tu voto (solo los admins)"
+                )
+            )
+            box.add_item(_row(_button("Corregir voto", self._pick, emoji="✏️")))
+        self.add_item(box)
+
+    def _redraw(self, state: str, **kwargs: Any) -> "VoteReplyView":
+        self.stop()
+        return VoteReplyView(self.guild, self.store, self.poll_id, self.user_id, state, **kwargs)
+
+    async def _pick(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(view=self._redraw(REPLY_PICK))
+
+    async def _back(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(view=self._redraw(REPLY_VOTED))
+
+    def _choose_callback(self, index: int) -> Callable[[discord.Interaction], Awaitable[None]]:
+        async def _choose(interaction: discord.Interaction) -> None:
+            await self._change(interaction, index)
+
+        return _choose
+
+    async def _change(self, interaction: discord.Interaction, index: int) -> None:
+        active = self.store.get_active(self.guild.id)
+        if active is None or not _can_vote(interaction.user, self.store, active):
+            await interaction.response.edit_message(
+                view=_note_view("❌ Ya no puedes votar en este consejo.", CLOSED_COLOR)
+            )
+            return
+        async with _poll_lock(self.poll_id):
+            status, _ = self.store.vote(
+                self.guild.id, self.poll_id, self.user_id, index, change=True
+            )
+        notice = "✏️ Voto corregido:" if status == VOTE_CHANGED else ""
+        await interaction.response.edit_message(view=self._redraw(REPLY_VOTED, notice=notice))
+        if status == VOTE_CHANGED:
+            _request_poll_refresh(self.guild, self.store, self.poll_id)
 
 
 async def _vote(
@@ -1267,56 +1483,28 @@ async def _vote(
         return
     async with _poll_lock(poll_id):
         status, option = store.vote(guild.id, poll_id, interaction.user.id, index)
-    poll = store.get_poll(guild.id, poll_id) or {}
 
-    if status == VOTE_ALREADY and option is not None:
-        text = (
-            f"ℹ️ Ya votaste {_option_label(poll, option)}.\n"
-            "Solo se puede votar una vez y el voto no se puede cambiar."
-        )
+    user_id = interaction.user.id
+    view: discord.ui.LayoutView
+    if status == VOTE_OK:
+        view = VoteReplyView(guild, store, poll_id, user_id)
+    elif status == VOTE_ALREADY and option is not None and option != index:
+        view = VoteReplyView(guild, store, poll_id, user_id, REPLY_ASK, target=index)
+    elif status in (VOTE_ALREADY, VOTE_SAME):
+        view = VoteReplyView(guild, store, poll_id, user_id, notice="ℹ️ Ya votaste")
     elif status == VOTE_CLOSED:
-        text = "🔒 Esta votación ya está cerrada."
-    elif status != VOTE_OK or option is None:
-        text = "❌ Esta opción ya no existe."
+        view = _note_view("🔒 Esta votación ya está cerrada.", CLOSED_COLOR)
     else:
-        text = (
-            f"✅ Has votado {_option_label(poll, option)}.\n"
-            "Tu voto es anónimo: el resto del consejo no sabrá qué has votado "
-            "(solo los admins pueden verlo)."
-        )
-    await interaction.response.send_message(text, ephemeral=True)
+        view = _note_view("❌ Esta opción ya no existe.", CLOSED_COLOR)
+    await interaction.response.send_message(view=view, ephemeral=True)
     if status == VOTE_OK:
         _request_poll_refresh(guild, store, poll_id)
 
 
-def _votes_embed(
-    guild: discord.Guild, store: CouncilStore, active: dict[str, Any], poll: dict[str, Any]
-) -> discord.Embed:
-    votes = poll_votes(poll)
-    options = poll.get("options") or []
-    embed = discord.Embed(
-        title=f"🔍 Votos · {_truncate(poll.get('question') or 'Votación', 230)}",
-        description="Solo lo ves tú. El resto del consejo nunca ve quién votó qué.",
-        color=CLOSED_COLOR if poll.get("closed") else COUNCIL_COLOR,
-    )
-    for index, option in enumerate(options):
-        voters = [user_id for user_id, choice in votes.items() if choice == index]
-        embed.add_field(
-            name=_truncate(f"{OPTION_EMOJIS[index]} {option} — {len(voters)}", 256),
-            value=_mentions(voters),
-            inline=False,
-        )
-    if not poll.get("closed"):
-        pending = [member.id for member in _voters(guild, store, active) if member.id not in votes]
-        embed.add_field(name="⏳ Sin votar", value=_mentions(pending), inline=False)
-        mode = "📈 en directo" if poll.get("live") else "🙈 ocultos hasta cerrar"
-        embed.set_footer(text=f"{FOOTER} · Resultados {mode}")
-    else:
-        embed.set_footer(text=f"{FOOTER} · Votación cerrada")
-    return embed
+# -- Panel privado de admins: quién votó qué ---------------------------------
 
 
-class PollAdminView(discord.ui.View):
+class PollAdminView(discord.ui.LayoutView):
     """Panel privado de un poll para admins: quién votó qué y modo de resultados."""
 
     def __init__(self, guild: discord.Guild, store: CouncilStore, poll_id: str) -> None:
@@ -1324,33 +1512,67 @@ class PollAdminView(discord.ui.View):
         self.guild = guild
         self.store = store
         self.poll_id = poll_id
-        poll = store.get_poll(guild.id, poll_id) or {}
+
+        active = store.get_active(guild.id)
+        poll = store.get_poll(guild.id, poll_id)
+        if active is None or poll is None:
+            box = _box(CLOSED_COLOR)
+            box.add_item(_text("❌ Este poll ya no existe."))
+            self.add_item(box)
+            return
+
         closed = bool(poll.get("closed"))
-        self.toggle.label = "Ocultar resultados" if poll.get("live") else "Mostrar resultados"
-        self.toggle.emoji = "🙈" if poll.get("live") else "📈"
-        self.toggle.disabled = closed
-        self.close.disabled = closed
+        votes = poll_votes(poll)
+        box = _box(CLOSED_COLOR if closed else COUNCIL_COLOR)
+        box.add_item(
+            _text(
+                f"### 🔍 Votos · {_truncate(poll.get('question') or 'Votación', 200)}\n"
+                "-# Solo lo ves tú. El resto del consejo nunca ve quién votó qué."
+            )
+        )
+        box.add_item(_sep())
+        lines = []
+        for index in range(len(poll.get("options") or [])):
+            voters = [user_id for user_id, choice in votes.items() if choice == index]
+            lines.append(f"**{_option_name(poll, index)}** · {len(voters)}\n{_mentions(voters)}")
+        if not closed:
+            pending = [
+                member.id for member in _voters(guild, store, active) if member.id not in votes
+            ]
+            lines.append(f"**⏳ Sin votar** · {len(pending)}\n{_mentions(pending)}")
+        box.add_item(_text("\n\n".join(lines)))
+        box.add_item(_sep())
+
+        live = bool(poll.get("live"))
+        buttons = [_button("Actualizar", self._update, emoji="🔄")]
+        if not closed:
+            buttons.append(
+                _button(
+                    "Ocultar resultados" if live else "Mostrar resultados",
+                    self._toggle,
+                    emoji="🙈" if live else "📈",
+                )
+            )
+            buttons.append(
+                _button("Cerrar poll", self._close, emoji="🔒", style=discord.ButtonStyle.danger)
+            )
+        box.add_item(_row(*buttons))
+        if closed:
+            box.add_item(_text("-# Votación cerrada"))
+        else:
+            box.add_item(
+                _text(f"-# Resultados {'📈 en directo' if live else '🙈 ocultos hasta cerrar'}")
+            )
+        self.add_item(box)
 
     async def _redraw(self, interaction: discord.Interaction) -> None:
-        active = self.store.get_active(self.guild.id)
-        poll = self.store.get_poll(self.guild.id, self.poll_id)
-        if active is None or poll is None:
-            await _respond_edit(interaction, content="❌ Este poll ya no existe.", embed=None, view=None)
-            return
-        view = PollAdminView(self.guild, self.store, self.poll_id)
         self.stop()
-        await _respond_edit(
-            interaction, embed=_votes_embed(self.guild, self.store, active, poll), view=view
-        )
+        await _edit_view(interaction, PollAdminView(self.guild, self.store, self.poll_id))
 
-    @discord.ui.button(label="Actualizar", emoji="🔄", style=discord.ButtonStyle.secondary)
-    async def update(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
+    async def _update(self, interaction: discord.Interaction) -> None:
         await self._redraw(interaction)
 
-    @discord.ui.button(label="Mostrar resultados", style=discord.ButtonStyle.secondary)
-    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
+    async def _toggle(self, interaction: discord.Interaction) -> None:
         if not await _check_manager(interaction):
             return
         poll = self.store.get_poll(self.guild.id, self.poll_id)
@@ -1360,9 +1582,7 @@ class PollAdminView(discord.ui.View):
             await _refresh_poll(self.guild, self.store, self.poll_id)
         await self._redraw(interaction)
 
-    @discord.ui.button(label="Cerrar poll", emoji="🔒", style=discord.ButtonStyle.danger)
-    async def close(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
+    async def _close(self, interaction: discord.Interaction) -> None:
         if not await _check_manager(interaction):
             return
         await interaction.response.defer()
@@ -1386,7 +1606,7 @@ async def _close_poll(guild: discord.Guild, store: CouncilStore, poll_id: str) -
         )
         with suppress(discord.HTTPException):
             await channel.send(
-                f"🔒 Votación cerrada · **{_truncate(poll.get('question') or '', 150)}**\n"
+                f"🔒 **Votación cerrada** · {_truncate(poll.get('question') or '', 150)}\n"
                 f"{_result_text(poll)}",
                 reference=reference,
                 mention_author=False,
@@ -1396,7 +1616,19 @@ async def _close_poll(guild: discord.Guild, store: CouncilStore, poll_id: str) -
 
 
 # ---------------------------------------------------------------------------
-# Finalizar: acta + borrar el canal
+# Finalizar: acta + vaciar y ocultar el canal
+
+
+def _component_texts(components: Any) -> list[str]:
+    """Textos de los Components V2 de un mensaje (cajas, secciones…)."""
+    texts: list[str] = []
+    for component in components or []:
+        content = getattr(component, "content", None)
+        if isinstance(content, str) and content:
+            texts.append(" ".join(content.split()))
+        texts += _component_texts(getattr(component, "children", None))
+        texts += _component_texts(getattr(component, "components", None))
+    return texts
 
 
 async def _collect_transcript(
@@ -1415,6 +1647,7 @@ async def _collect_transcript(
             for embed in message.embeds:
                 if embed.title:
                     parts.append(f"[{embed.title}]")
+            parts += _component_texts(message.components)
             for attachment in message.attachments:
                 parts.append(f"[adjunto: {attachment.filename}]")
             when = _local(message.created_at).strftime("%d/%m/%Y %H:%M")
@@ -1486,7 +1719,7 @@ def _acta_text(
     return "\n".join(lines) + "\n"
 
 
-def _acta_embed(
+def _acta_view(
     guild: discord.Guild,
     store: CouncilStore,
     active: dict[str, Any],
@@ -1494,53 +1727,60 @@ def _acta_embed(
     participants: set[int],
     actor: discord.abc.User | None,
     ended_at: datetime,
-) -> discord.Embed:
-    embed = discord.Embed(
-        title=f"📜 Acta del consejo · {_truncate(active.get('topic') or 'Sin tema', 200)}",
-        description=_field(active.get("description") or "*Sin descripción.*", 1500),
-        color=COUNCIL_COLOR,
-        timestamp=ended_at,
-    )
+    filename: str,
+) -> discord.ui.LayoutView:
     opened = parse_datetime(active.get("opened_at"))
     met = parse_datetime(active.get("met_at"))
-    embed.add_field(
-        name="Abierto por",
-        value=f"<@{active.get('opened_by')}>" + (f"\n{_ts(opened, 'f')}" if opened else ""),
-        inline=True,
+
+    box = _box()
+    box.add_item(
+        _text(
+            f"## 📜 Acta · {_truncate(active.get('topic') or 'Sin tema', 200)}\n"
+            f"-# Consejo finalizado {_ts(ended_at, 'f')}"
+        )
     )
-    embed.add_field(
-        name="Reunido", value=_ts(met, "f") if met else "No se llegó a reunir", inline=True
-    )
-    embed.add_field(
-        name="Finalizado por",
-        value=actor.mention if actor is not None else "Canal borrado a mano",
-        inline=True,
-    )
-    if opened is not None:
-        embed.add_field(name="Duración", value=_format_span(ended_at - opened), inline=True)
-    embed.add_field(name="Escribieron", value=_mentions(sorted(participants)), inline=False)
-    embed.add_field(
-        name="🚫 Excluidos", value=_mentions(sorted(store.excluded_ids(guild.id))), inline=False
-    )
-    polls = store.list_polls(guild.id)
-    poll_lines = [
-        f"📊 **{_truncate(poll.get('question') or '', 90)}** → {_result_text(poll)}"
-        for poll in polls
+    description = str(active.get("description") or "").strip()
+    if description:
+        box.add_item(_text(_block(description, 900)))
+    box.add_item(_sep())
+
+    timeline = [
+        f"**Abierto** · <@{active.get('opened_by')}>" + (f" · {_ts(opened, 'f')}" if opened else ""),
+        f"**Reunido** · {_ts(met, 'f') if met else 'no se llegó a reunir'}",
+        "**Finalizado** · " + (actor.mention if actor is not None else "canal borrado a mano"),
     ]
-    embed.add_field(
-        name="Votaciones", value=_field("\n".join(poll_lines) or "Sin votaciones"), inline=False
+    if opened is not None:
+        timeline.append(f"**Duración** · {_format_span(ended_at - opened)}")
+    box.add_item(_text("\n".join(timeline)))
+    box.add_item(_sep())
+    box.add_item(
+        _text(
+            f"**Escribieron** · {_mentions(sorted(participants))}\n"
+            f"**🚫 Excluidos** · {_mentions(sorted(store.excluded_ids(guild.id)))}"
+        )
     )
-    embed.set_footer(
-        text=f"{FOOTER} · La conversación y quién votó qué van en el archivo adjunto."
-    )
-    return embed
+    box.add_item(_sep())
+    poll_lines = [
+        f"📊 **{_truncate(poll.get('question') or '', 90)}**\n{_result_text(poll)}"
+        for poll in store.list_polls(guild.id)
+    ]
+    box.add_item(_text(_block("\n".join(poll_lines) or "📊 Sin votaciones", 1200)))
+    box.add_item(_sep())
+    box.add_item(discord.ui.File(f"attachment://{filename}"))
+    box.add_item(_text("-# La conversación completa y quién votó qué van en el archivo."))
+
+    view = discord.ui.LayoutView()
+    view.add_item(box)
+    return view
 
 
 async def _deliver_acta(
     guild: discord.Guild,
     store: CouncilStore,
+    active: dict[str, Any],
+    *,
+    participants: set[int],
     actor: discord.abc.User | None,
-    embed: discord.Embed,
     text: str,
     ended_at: datetime,
 ) -> str | None:
@@ -1548,19 +1788,31 @@ async def _deliver_acta(
     data = text.encode("utf-8")
     filename = f"acta-consejo-{_local(ended_at):%Y%m%d-%H%M}.txt"
 
+    targets: list[tuple[discord.abc.Messageable, str]] = []
     log_channel = _log_channel(guild, store)
     if log_channel is not None:
-        try:
-            await log_channel.send(embed=embed, file=discord.File(io.BytesIO(data), filename))
-            return log_channel.mention
-        except discord.HTTPException:
-            _log.warning("No se pudo publicar el acta del consejo en %s", log_channel.id)
+        targets.append((log_channel, log_channel.mention))
     if actor is not None:
+        targets.append((actor, "tus mensajes privados"))
+    for target, label in targets:
+        view = _acta_view(
+            guild,
+            store,
+            active,
+            participants=participants,
+            actor=actor,
+            ended_at=ended_at,
+            filename=filename,
+        )
         try:
-            await actor.send(embed=embed, file=discord.File(io.BytesIO(data), filename))
-            return "tus mensajes privados"
+            await target.send(
+                view=view,
+                file=discord.File(io.BytesIO(data), filename),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return label
         except discord.HTTPException:
-            pass
+            _log.warning("No se pudo enviar el acta del consejo a %s", label, exc_info=True)
     return None
 
 
@@ -1577,9 +1829,6 @@ async def _finish_council(
         transcript, participants = (
             await _collect_transcript(channel) if channel is not None else (None, set())
         )
-        embed = _acta_embed(
-            guild, store, active, participants=participants, actor=actor, ended_at=ended_at
-        )
         text = _acta_text(
             guild,
             store,
@@ -1590,7 +1839,15 @@ async def _finish_council(
             ended_at=ended_at,
             lost=channel is None,
         )
-        delivered_to = await _deliver_acta(guild, store, actor, embed, text, ended_at)
+        delivered_to = await _deliver_acta(
+            guild,
+            store,
+            active,
+            participants=participants,
+            actor=actor,
+            text=text,
+            ended_at=ended_at,
+        )
         if delivered_to is None:
             for poll in store.list_polls(guild.id):
                 await _refresh_poll(guild, store, poll["id"])
@@ -1646,9 +1903,6 @@ async def _handle_lost_channel(guild: discord.Guild, store: CouncilStore) -> Non
             return
         store.close_all_polls(guild.id)
         ended_at = _now()
-        embed = _acta_embed(
-            guild, store, active, participants=set(), actor=None, ended_at=ended_at
-        )
         text = _acta_text(
             guild,
             store,
@@ -1659,37 +1913,68 @@ async def _handle_lost_channel(guild: discord.Guild, store: CouncilStore) -> Non
             ended_at=ended_at,
             lost=True,
         )
-        await _deliver_acta(guild, store, None, embed, text, ended_at)
+        await _deliver_acta(
+            guild, store, active, participants=set(), actor=None, text=text, ended_at=ended_at
+        )
         store.end(guild.id)
         if store.get_channel_id(guild.id) == active.get("channel_id"):
             store.set_channel(guild.id, None)
 
 
-class FinishConfirmView(discord.ui.View):
+class FinishConfirmView(discord.ui.LayoutView):
     def __init__(self, guild: discord.Guild, store: CouncilStore) -> None:
         super().__init__(timeout=PROMPT_TIMEOUT * 2)
         self.guild = guild
         self.store = store
 
-    @discord.ui.button(label="Finalizar y borrar", emoji="🏁", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
+        active = store.get_active(guild.id) or {}
+        log_channel = _log_channel(guild, store)
+        destination = (
+            log_channel.mention if log_channel is not None else "tus MD (no hay canal de actas)"
+        )
+        open_polls = sum(1 for poll in store.list_polls(guild.id) if not poll.get("closed"))
+
+        box = _box(DANGER_COLOR)
+        box.add_item(
+            _text(
+                "### 🏁 Finalizar consejo\n"
+                f"-# {_truncate(active.get('topic') or 'Sin tema', 150)}"
+            )
+        )
+        box.add_item(_sep())
+        box.add_item(
+            _text(
+                f"🔒 Se cerrarán {_plural(open_polls, 'poll abierto', 'polls abiertos')}.\n"
+                f"📜 El acta (con la conversación y quién votó qué) irá a {destination}.\n"
+                "🧹 Se borrarán **todos los mensajes** y el canal volverá a quedar oculto."
+            )
+        )
+        box.add_item(_text("-# No se puede deshacer."))
+        box.add_item(_sep())
+        box.add_item(
+            _row(
+                _button("Finalizar", self._confirm, emoji="🏁", style=discord.ButtonStyle.danger),
+                _button("Cancelar", self._cancel),
+            )
+        )
+        self.add_item(box)
+
+    async def _confirm(self, interaction: discord.Interaction) -> None:
         if not await _check_manager(interaction):
             return
         self.stop()
         await interaction.response.edit_message(
-            content="⏳ Cerrando los polls y generando el acta…", embed=None, view=None
+            view=_note_view("⏳ Cerrando los polls y generando el acta…")
         )
         result = await _finish_council(self.guild, self.store, interaction.user)
+        color = SUCCESS_COLOR if result.startswith("✅") else DANGER_COLOR
         with suppress(discord.HTTPException):
-            await interaction.edit_original_response(content=result)
+            await interaction.edit_original_response(view=_note_view(result, color))
 
-    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
+    async def _cancel(self, interaction: discord.Interaction) -> None:
         self.stop()
         await interaction.response.edit_message(
-            content="El consejo sigue abierto.", embed=None, view=None
+            view=_note_view("-# El consejo sigue abierto.", CLOSED_COLOR)
         )
 
 
@@ -1698,25 +1983,8 @@ async def _open_finish(interaction: discord.Interaction) -> bool:
         return False
     guild = interaction.guild
     assert guild is not None
-    store = _store(interaction.client)
-    active = store.get_active(guild.id) or {}
-    log_channel = _log_channel(guild, store)
-    destination = log_channel.mention if log_channel is not None else "tus MD (no hay canal de actas)"
-    open_polls = sum(1 for poll in store.list_polls(guild.id) if not poll.get("closed"))
-    embed = discord.Embed(
-        title="🏁 Finalizar consejo",
-        description=(
-            f"**{_truncate(active.get('topic') or 'Sin tema', 100)}**\n\n"
-            f"• Se cerrarán {_plural(open_polls, 'poll abierto', 'polls abiertos')}.\n"
-            f"• El acta (con la conversación y quién votó qué en un .txt) irá a {destination}.\n"
-            "• Se borrarán **todos los mensajes** del canal y volverá a quedar oculto "
-            "(solo admins) hasta el próximo consejo.\n\n"
-            "**No se puede deshacer.**"
-        ),
-        color=DANGER_COLOR,
-    )
     await interaction.response.send_message(
-        embed=embed, view=FinishConfirmView(guild, store), ephemeral=True
+        view=FinishConfirmView(guild, _store(interaction.client)), ephemeral=True
     )
     return True
 
@@ -1725,76 +1993,38 @@ async def _open_finish(interaction: discord.Interaction) -> bool:
 # Configuración (solo admins)
 
 
-def _config_embed(guild: discord.Guild, store: CouncilStore) -> discord.Embed:
+def _config_problems(guild: discord.Guild, store: CouncilStore) -> list[str]:
     role = _council_role(guild, store)
-    category = _category(guild, store)
     log_channel = _log_channel(guild, store)
-    fixed = _fixed_channel(guild, store)
-    active = store.get_active(guild.id)
-    channel = _council_channel(guild, active)
-
-    embed = discord.Embed(
-        title="Configuración del consejo",
-        description=(
-            "El canal del consejo existe siempre, pero entre consejos está vacío y solo lo ven "
-            "los admins. Con `.noah council meet` entra el rol del consejo y con "
-            "`.noah council finish` el acta va al canal de actas y se borran todos los mensajes."
-        ),
-        color=COUNCIL_COLOR,
-    )
-    embed.add_field(
-        name="Rol del consejo", value=role.mention if role is not None else "Sin configurar", inline=True
-    )
-    embed.add_field(
-        name="Canal del consejo",
-        value=fixed.mention if fixed is not None else "Se crea al abrir el primer consejo",
-        inline=True,
-    )
-    embed.add_field(
-        name="Categoría (si hay que crearlo)",
-        value=category.name if category is not None else "Sin categoría",
-        inline=True,
-    )
-    embed.add_field(
-        name="Canal de actas",
-        value=log_channel.mention if log_channel is not None else "Sin canal (va por MD)",
-        inline=True,
-    )
-    if active is not None and channel is not None and active.get("header_message_id"):
-        current = f"[{_truncate(active.get('topic') or 'Sin tema', 80)}]({_jump_url(guild.id, channel.id, int(active['header_message_id']))})"
-    elif active is not None and channel is not None:
-        current = channel.mention
-    else:
-        current = "Ninguno"
-    embed.add_field(name="Consejo abierto", value=current, inline=False)
-
     problems = []
     missing = _missing_permissions(guild)
     if missing:
-        problems.append(f"Me faltan permisos: {', '.join(missing)}.")
+        problems.append(f"⚠️ Me faltan permisos: {', '.join(missing)}.")
     if log_channel is not None:
         permissions = log_channel.permissions_for(guild.me)
-        if not (permissions.send_messages and permissions.attach_files and permissions.embed_links):
-            problems.append(f"No puedo enviar embeds y archivos en {log_channel.mention}.")
+        if not (permissions.send_messages and permissions.attach_files):
+            problems.append(f"⚠️ No puedo enviar mensajes con archivos en {log_channel.mention}.")
         if log_channel.permissions_for(guild.default_role).view_channel or (
             role is not None and log_channel.permissions_for(role).view_channel
         ):
             problems.append(
-                f"{log_channel.mention} lo puede ver gente que no es admin y el acta dice quién "
+                f"⚠️ {log_channel.mention} lo puede ver gente que no es admin y el acta dice quién "
                 "votó qué. Mejor un canal solo para admins."
             )
     if role is not None and not role.mentionable and not guild.me.guild_permissions.mention_everyone:
-        problems.append(
-            "El rol no es mencionable: el aviso de `.noah council meet` no les notificará."
-        )
-    if problems:
-        embed.add_field(name="⚠️ Avisos", value=_field("\n".join(problems)), inline=False)
-    embed.set_footer(text=FOOTER)
-    return embed
+        problems.append("⚠️ El rol no es mencionable: el aviso al reunir no les notificará.")
+    return problems
 
 
-class CouncilConfigView(discord.ui.View):
-    def __init__(self, guild: discord.Guild, store: CouncilStore, author_id: int) -> None:
+class CouncilConfigView(discord.ui.LayoutView):
+    def __init__(
+        self,
+        guild: discord.Guild,
+        store: CouncilStore,
+        author_id: int,
+        *,
+        interactive: bool = True,
+    ) -> None:
         super().__init__(timeout=300)
         self.guild = guild
         self.store = store
@@ -1802,52 +2032,107 @@ class CouncilConfigView(discord.ui.View):
         self.message: discord.Message | None = None
 
         role = _council_role(guild, store)
-        self.role_select = discord.ui.RoleSelect(
-            placeholder="Rol del consejo",
-            min_values=0,
-            max_values=1,
-            default_values=[role] if role is not None else [],
-            row=0,
-        )
-        self.role_select.callback = self._on_role
-        self.add_item(self.role_select)
-
         fixed = _fixed_channel(guild, store)
-        self.channel_select = discord.ui.ChannelSelect(
-            placeholder="Canal del consejo (o créalo con el botón)",
-            channel_types=[discord.ChannelType.text],
-            min_values=0,
-            max_values=1,
-            default_values=[fixed] if fixed is not None else [],
-            row=1,
-        )
-        self.channel_select.callback = self._on_channel
-        self.add_item(self.channel_select)
-
         category = _category(guild, store)
-        self.category_select = discord.ui.ChannelSelect(
-            placeholder="Categoría donde crear el canal (opcional)",
-            channel_types=[discord.ChannelType.category],
-            min_values=0,
-            max_values=1,
-            default_values=[category] if category is not None else [],
-            row=2,
-        )
-        self.category_select.callback = self._on_category
-        self.add_item(self.category_select)
-
         log_channel = _log_channel(guild, store)
-        self.log_select = discord.ui.ChannelSelect(
-            placeholder="Canal de actas (solo admins)",
-            channel_types=[discord.ChannelType.text],
-            min_values=0,
-            max_values=1,
-            default_values=[log_channel] if log_channel is not None else [],
-            row=3,
+        current = _council_channel(guild, store.get_active(guild.id))
+
+        box = _box()
+        box.add_item(
+            _text(
+                "## ⚙️ Consejo · configuración\n"
+                "-# El canal existe siempre, pero entre consejos está vacío y solo lo ven los "
+                "admins. Al finalizar, el acta va al canal de actas."
+            )
         )
-        self.log_select.callback = self._on_log
-        self.add_item(self.log_select)
-        self.create_channel.disabled = fixed is not None
+        box.add_item(_sep())
+
+        box.add_item(
+            _text(f"**Rol del consejo** · {role.mention if role is not None else 'sin configurar'}")
+        )
+        if interactive:
+            self.role_select = discord.ui.RoleSelect(
+                placeholder="Rol del consejo",
+                min_values=0,
+                max_values=1,
+                default_values=[role] if role is not None else [],
+            )
+            self.role_select.callback = self._on_role
+            box.add_item(_row(self.role_select))
+
+        box.add_item(
+            _text(
+                "**Canal del consejo** · "
+                + (fixed.mention if fixed is not None else "se crea al abrir el primer consejo")
+            )
+        )
+        if interactive:
+            self.channel_select = discord.ui.ChannelSelect(
+                placeholder="Elige un canal existente (o créalo abajo)",
+                channel_types=[discord.ChannelType.text],
+                min_values=0,
+                max_values=1,
+                default_values=[fixed] if fixed is not None else [],
+            )
+            self.channel_select.callback = self._on_channel
+            box.add_item(_row(self.channel_select))
+
+        box.add_item(
+            _text(
+                "**Categoría** · "
+                + (category.name if category is not None else "sin categoría")
+                + "\n-# Solo se usa si hay que crear el canal."
+            )
+        )
+        if interactive:
+            self.category_select = discord.ui.ChannelSelect(
+                placeholder="Categoría (opcional)",
+                channel_types=[discord.ChannelType.category],
+                min_values=0,
+                max_values=1,
+                default_values=[category] if category is not None else [],
+            )
+            self.category_select.callback = self._on_category
+            box.add_item(_row(self.category_select))
+
+        box.add_item(
+            _text(
+                "**Canal de actas** · "
+                + (log_channel.mention if log_channel is not None else "sin canal (va por MD)")
+            )
+        )
+        if interactive:
+            self.log_select = discord.ui.ChannelSelect(
+                placeholder="Canal de actas (solo admins)",
+                channel_types=[discord.ChannelType.text],
+                min_values=0,
+                max_values=1,
+                default_values=[log_channel] if log_channel is not None else [],
+            )
+            self.log_select.callback = self._on_log
+            box.add_item(_row(self.log_select))
+
+        box.add_item(_sep())
+        status = (
+            f"📌 Consejo abierto en {current.mention}"
+            if current is not None
+            else "💤 Sin consejo abierto"
+        )
+        box.add_item(_text("\n".join([status] + _config_problems(guild, store))))
+        if interactive:
+            buttons = []
+            if fixed is None:
+                buttons.append(
+                    _button(
+                        "Crear canal",
+                        self._create_channel,
+                        emoji="📌",
+                        style=discord.ButtonStyle.primary,
+                    )
+                )
+            buttons.append(_button("Cerrar", self._close))
+            box.add_item(_row(*buttons))
+        self.add_item(box)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
@@ -1861,7 +2146,7 @@ class CouncilConfigView(discord.ui.View):
         view = CouncilConfigView(self.guild, self.store, self.author_id)
         view.message = self.message
         self.stop()
-        await _respond_edit(interaction, embed=_config_embed(self.guild, self.store), view=view)
+        await _edit_view(interaction, view)
 
     async def _on_role(self, interaction: discord.Interaction) -> None:
         values = self.role_select.values
@@ -1880,7 +2165,10 @@ class CouncilConfigView(discord.ui.View):
         if isinstance(channel, discord.TextChannel):
             try:
                 await _hide_channel(
-                    self.guild, self.store, channel, f"Canal del consejo elegido por {interaction.user}"
+                    self.guild,
+                    self.store,
+                    channel,
+                    f"Canal del consejo elegido por {interaction.user}",
                 )
             except discord.HTTPException:
                 await interaction.followup.send(
@@ -1903,11 +2191,7 @@ class CouncilConfigView(discord.ui.View):
         self.store.set_log_channel(self.guild.id, values[0].id if values else None)
         await self.refresh(interaction)
 
-    @discord.ui.button(label="Crear canal", emoji="📌", style=discord.ButtonStyle.primary, row=4)
-    async def create_channel(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        _ = button
+    async def _create_channel(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
         if _fixed_channel(self.guild, self.store) is None:
             try:
@@ -1921,73 +2205,59 @@ class CouncilConfigView(discord.ui.View):
                 )
         await self.refresh(interaction)
 
-    @discord.ui.button(label="Cerrar", style=discord.ButtonStyle.secondary, row=4)
-    async def close(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
+    async def _close(self, interaction: discord.Interaction) -> None:
         self.stop()
-        await interaction.response.edit_message(view=None)
+        await interaction.response.edit_message(
+            view=CouncilConfigView(self.guild, self.store, self.author_id, interactive=False)
+        )
 
     async def on_timeout(self) -> None:
         if self.message is not None:
             with suppress(discord.HTTPException):
-                await self.message.edit(view=None)
+                await self.message.edit(
+                    view=CouncilConfigView(
+                        self.guild, self.store, self.author_id, interactive=False
+                    )
+                )
 
 
-def _build_help_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="Consejo",
-        description=(
-            f"Canal oculto (**{CHANNEL_NAME}**) para que el consejo decida en privado. Existe "
-            "siempre, pero entre consejos está vacío y solo lo ven los admins; cuando el "
-            "consejo está listo se deja entrar al rol del consejo. Las votaciones son anónimas "
-            "y al terminar queda un acta para los admins."
-        ),
-        color=COUNCIL_COLOR,
+def _help_view() -> discord.ui.LayoutView:
+    box = _box()
+    box.add_item(
+        _text(
+            "## 📌 Consejo\n"
+            f"-# Canal oculto ({CHANNEL_NAME}) para que el consejo decida en privado. Existe "
+            "siempre, pero entre consejos está vacío y solo lo ven los admins."
+        )
     )
-    embed.add_field(
-        name=".noah council init",
-        value=(
-            "Abre una consola privada: tema, descripción y a quién excluir (implicados que no "
-            "deben ver el canal aunque estén en el consejo)."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah council poll",
-        value=(
-            "Votación de 2 a 4 opciones: un voto por persona, anónimo y sin cambios. Eliges si "
-            "los resultados se ven en directo u ocultos hasta cerrar. Con 🔍 **Votos** los "
-            "admins ven quién votó qué."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah council meet",
-        value="Deja entrar al rol del consejo y le avisa con una mención.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah council exclude",
-        value="Excluye o readmite gente en cualquier momento (sus votos en polls abiertos se anulan).",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah council finish",
-        value=(
+    box.add_item(_sep())
+    box.add_item(
+        _text(
+            "**`.noah council init`**\n"
+            "Consola privada para empezar: tema, descripción y a quién excluir (implicados que "
+            "no deben ver el canal aunque estén en el consejo).\n\n"
+            "**`.noah council poll`**\n"
+            "Votación de 2 a 4 opciones. Un voto por persona, anónimo y corregible mientras "
+            "esté abierta. Resultados en directo u ocultos hasta cerrar; con 🔍 Votos los "
+            "admins ven quién votó qué.\n\n"
+            "**`.noah council meet`**\n"
+            "Deja entrar al rol del consejo y le avisa con una mención.\n\n"
+            "**`.noah council exclude`**\n"
+            "Excluye o readmite gente en cualquier momento (sus votos abiertos se anulan).\n\n"
+            "**`.noah council finish`**\n"
             "Cierra los polls, envía el acta (con la conversación en un .txt), borra todos los "
-            "mensajes y vuelve a ocultar el canal."
-        ),
-        inline=False,
+            "mensajes y vuelve a ocultar el canal.\n\n"
+            "**`.noah council config`**\n"
+            "Rol del consejo, canal del consejo y canal de actas."
+        )
     )
-    embed.add_field(
-        name=".noah council config",
-        value="Rol del consejo, canal del consejo (elegir o crear) y canal de actas.",
-        inline=False,
+    box.add_item(_sep())
+    box.add_item(
+        _text("-# Todo es solo para admins. El mensaje fijado del canal trae botones para lo mismo.")
     )
-    embed.set_footer(
-        text=f"{FOOTER} · Todo es solo para admins. El mensaje fijado del canal trae botones para lo mismo."
-    )
-    return embed
+    view = discord.ui.LayoutView()
+    view.add_item(box)
+    return view
 
 
 # ---------------------------------------------------------------------------
@@ -2003,15 +2273,19 @@ def register_council_commands(bot: commands.Bot, noah_group: commands.Group) -> 
         if started:
             return
         started = True
-        bot.add_view(CouncilControlView())
-        bot.add_dynamic_items(PollButton)
+        bot.add_dynamic_items(ControlButton, PollButton)
 
         store = _store(bot)
         for guild_id in store.guild_ids():
             guild = bot.get_guild(guild_id)
             active = store.get_active(guild_id)
-            if guild is not None and active is not None and _council_channel(guild, active) is None:
+            if guild is None or active is None:
+                continue
+            if _council_channel(guild, active) is None:
                 await _handle_lost_channel(guild, store)
+            else:
+                # Pasa el mensaje fijado al estilo actual si viene de una versión anterior.
+                await _refresh_header(guild, store)
 
     @bot.listen("on_guild_channel_delete")
     async def _council_channel_deleted(channel: discord.abc.GuildChannel) -> None:
@@ -2041,11 +2315,11 @@ def register_council_commands(bot: commands.Bot, noah_group: commands.Group) -> 
 
     @noah_group.group(name="council", invoke_without_command=True)
     async def council(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_help_embed())
+        await ctx.send(view=_help_view())
 
     @council.command(name="help")
     async def council_help(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_help_embed())
+        await ctx.send(view=_help_view())
 
     @council.command(name="config")
     async def council_config(ctx: commands.Context) -> None:
@@ -2055,9 +2329,8 @@ def register_council_commands(bot: commands.Bot, noah_group: commands.Group) -> 
         if not _is_admin(ctx.author):
             await ctx.send("❌ Solo los administradores pueden usar este comando.")
             return
-        store = _store(ctx.bot)
-        view = CouncilConfigView(ctx.guild, store, ctx.author.id)
-        view.message = await ctx.send(embed=_config_embed(ctx.guild, store), view=view)
+        view = CouncilConfigView(ctx.guild, _store(ctx.bot), ctx.author.id)
+        view.message = await ctx.send(view=view, allowed_mentions=discord.AllowedMentions.none())
 
     @council.command(name="init")
     async def council_init(ctx: commands.Context) -> None:
@@ -2070,9 +2343,7 @@ def register_council_commands(bot: commands.Bot, noah_group: commands.Group) -> 
             )
             return
         if _council_role(ctx.guild, store) is None:
-            await _notice(
-                ctx, "❌ Falta elegir el rol del consejo. Usa `.noah council config`."
-            )
+            await _notice(ctx, "❌ Falta elegir el rol del consejo. Usa `.noah council config`.")
             return
         await _send_prompt(ctx, "Abrir consola", "📌", _open_console)
 
