@@ -466,44 +466,13 @@ class CloseChatButton(discord.ui.DynamicItem[discord.ui.Button], template=r"noah
         if lock is not None and lock.locked():
             await interaction.response.send_message("Espera a que Noah termine de responder para cerrar el chat 🖤", ephemeral=True)
             return
-        await interaction.response.send_message(
-            "¿Cerrar este chat? Se archivará y ya no se podrá escribir en él.",
-            view=ConfirmCloseView(interaction.message),
-            ephemeral=True,
-        )
-
-
-class ConfirmCloseView(discord.ui.View):
-    def __init__(self, welcome: discord.Message | None) -> None:
-        super().__init__(timeout=60)
-        self.welcome = welcome
-
-    @discord.ui.button(label="Sí, cerrar", emoji="🔒", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
-        self.stop()
-        thread = interaction.channel
-        guild = interaction.guild
-        if not isinstance(thread, discord.Thread) or guild is None:
-            return
-        settings = _settings(interaction.client)
-        data = settings.get_thread(guild.id, thread.id)
-        if data is None or data.get("closed"):
-            await interaction.response.edit_message(content="Este chat ya está cerrado.", view=None)
-            return
-        await interaction.response.edit_message(content="✅ Chat cerrado.", view=None)
+        await interaction.response.send_message("✅ Chat cerrado.", ephemeral=True)
         settings.close_thread(guild.id, thread.id, by="user", closer_id=interaction.user.id)
         name = discord.utils.escape_markdown(getattr(interaction.user, "display_name", interaction.user.name))
-        await _mark_welcome_closed(settings, thread, f"Chat cerrado por {name}", self.welcome)
+        await _mark_welcome_closed(settings, thread, f"Chat cerrado por {name}", interaction.message)
         with suppress(discord.HTTPException):
             await thread.send(f"-# 🔒 {name} ha cerrado el chat.", allowed_mentions=NONE)
         await _lock_thread(thread, "Noah AI: chat cerrado con el botón")
-
-    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        _ = button
-        self.stop()
-        await interaction.response.edit_message(content="Vale, el chat sigue abierto 🖤", view=None)
 
 
 def _welcome_view(
