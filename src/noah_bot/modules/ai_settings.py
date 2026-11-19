@@ -313,9 +313,18 @@ class AiSettingsStore:
         self._save()
         return int(data["strikes"])
 
-    def close_thread(self, guild_id: int, thread_id: int) -> None:
+    def set_thread_value(self, guild_id: int, thread_id: int, key: str, value: Any) -> None:
+        data = self.get_thread(guild_id, thread_id)
+        if data is not None:
+            data[key] = value
+            self._save()
+
+    def close_thread(self, guild_id: int, thread_id: int, by: str = "noah", closer_id: int | None = None) -> None:
+        """`by`: `noah` (por saltarse las reglas) o `user` (con el botón)."""
         data = self.get_thread(guild_id, thread_id)
         if data is not None:
             data["closed"] = True
+            data["closed_by"] = by
+            data["closed_by_id"] = closer_id
             data["closed_at"] = local_now().isoformat()
             self._save()

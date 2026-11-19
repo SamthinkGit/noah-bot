@@ -35,6 +35,8 @@ RULES = """
 ## Cómo trabajas
 - Tienes herramientas de SOLO LECTURA para investigar el servidor. Úsalas siempre que la
   pregunta dependa de datos del servidor; no inventes. Si no encuentras algo, dilo.
+- Si necesitas varias consultas que no dependen unas de otras (p. ej. leer dos canales, o
+  el perfil y la voz de alguien), pídelas todas a la vez en la misma vuelta.
 - Si te preguntan por ti, por Noah AI, por tus comandos o qué datos tienes, usa info_noah.
 - Para preguntas como "¿qué debería responderle?" lee primero la conversación y propón una
   respuesta concreta con el tono de quien pregunta.
@@ -128,7 +130,7 @@ def build_instructions(
     return "\n".join(parts)
 
 
-ToolRunner = Callable[[str, str], Awaitable[str]]
+ToolRunner = Callable[[list[tuple[str, str]]], Awaitable[list[str]]]
 ReasoningHook = Callable[[str], Awaitable[None]]
 ThinkingHook = Callable[[bool], Awaitable[None]]
 
@@ -169,7 +171,7 @@ class NoahAgent:
         instructions: str,
         history: list[dict[str, Any]],
         tools: list[ToolSpec],
-        run_tool: ToolRunner,
+        run_tools: ToolRunner,
         on_reasoning: ReasoningHook,
         on_thinking: ThinkingHook,
     ) -> AgentResult:
@@ -192,7 +194,7 @@ class NoahAgent:
                 if schemas:
                     kwargs["tools"] = schemas
                     kwargs["tool_choice"] = "none" if last_round else "auto"
-                    kwargs["parallel_tool_calls"] = False
+                    kwargs["parallel_tool_calls"] = True
 
                 await on_thinking(True)
                 response = await self._create(kwargs)
@@ -215,8 +217,9 @@ class NoahAgent:
                     break
 
                 context.extend(item for item in map(_as_input, response.output) if item is not None)
-                for call in calls:
-                    output = await run_tool(call.name, call.arguments or "{}")
+                # Varias herramientas en la misma vuelta se ejecutan a la vez.
+                outputs = await run_tools([(call.name, call.arguments or "{}") for call in calls])
+                for call, output in zip(calls, outputs):
                     context.append({"type": "function_call_output", "call_id": call.call_id, "output": output})
         except openai.AuthenticationError as error:
             raise AgentError("La API key de OpenAI no es válida. Avisa a un admin. 🖤") from error

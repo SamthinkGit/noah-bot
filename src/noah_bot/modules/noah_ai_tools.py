@@ -71,6 +71,7 @@ class Step:
         self._update = update
         self.label = label
         self.status = "run"
+        self.group: int | None = None  # herramientas lanzadas en la misma tanda
 
     async def running(self, label: str) -> None:
         self.label = label
@@ -1138,7 +1139,11 @@ async def tool_listar_hilos_noah(ctx: ToolContext, args: dict[str, Any], step: S
             continue
         thread = ctx.guild.get_thread(thread_id)
         user = ctx.guild.get_member(int(data.get("owner_id") or 0))
-        state = "cerrado por infracción" if data.get("closed") else "abierto"
+        state = (
+            ("cerrado por infracción" if data.get("closed_by", "noah") == "noah" else "cerrado por el usuario")
+            if data.get("closed")
+            else "abierto"
+        )
         lines.append(
             f"- hilo id {thread_id} ({thread.name if thread else 'archivado'}) · de {_name(user, 'ex-miembro')} · "
             f"creado {_fmt_dt(_iso(data.get('created_at')))} · {data.get('questions', 0)} preguntas · "

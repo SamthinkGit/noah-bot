@@ -53,6 +53,7 @@ OK_COLOR = discord.Color.from_rgb(35, 165, 90)
 
 PANEL_OPEN_ID = "noah:ai:open"
 PANEL_PREFS_ID = "noah:ai:prefs"
+CLOSE_BUTTON_ID = "noah:ai:close"
 PANEL_TEXT = (
     "## Noah AI\n"
     "Pulsa aquí abajo para abrir un chat **PRIVADO** con Noah. Esta IA tiene acceso a los "
@@ -65,6 +66,7 @@ ANSWER_CHUNK = 1900
 EDIT_INTERVAL = 1.2
 REASONING_LIMIT = 2500
 CARD_CACHE = 300
+PARALLEL_TOOLS = 4
 CONFIG_TIMEOUT = 600
 READABLE_CHANNEL_TYPES = [
     discord.ChannelType.text,
@@ -206,9 +208,10 @@ class ProgressCard:
         self.message: discord.Message | None = None
         self.finished = False
         self._dirty = False
+        self._urgent = False
         self._last_edit = 0.0
         self._flush_task: asyncio.Task[None] | None = None
-        self._lock = asyncio.Lock()
+        self._next_group = 0
 
     def mark_edited(self) -> None:
         self._last_edit = time.monotonic()
@@ -217,7 +220,7 @@ class ProgressCard:
         view = discord.ui.LayoutView(timeout=None)
         container = discord.ui.Container(accent_color=DANGER_COLOR if self.error else AI_COLOR)
 
-        lines = [f"{noah_ai_emojis.dot(step.status)} {step.label}" for step in self.steps]
+        lines = self._step_lines()
         if self.thinking and not self.finished:
             lines.append(f"{noah_ai_emojis.dot('run')} Pensando…")
         if self.error:
@@ -241,6 +244,29 @@ class ProgressCard:
         view.add_item(container)
         return view
 
+    def _step_lines(self) -> list[str]:
+        """Una línea por herramienta; las que corren a la vez van agrupadas en árbol."""
+        lines: list[str] = []
+        index = 0
+        while index < len(self.steps):
+            group = self.steps[index].group
+            end = index + 1
+            while group is not None and end < len(self.steps) and self.steps[end].group == group:
+                end += 1
+            batch = self.steps[index:end]
+            if len(batch) == 1:
+                step = batch[0]
+                lines.append(f"{noah_ai_emojis.dot(step.status)} {step.label}")
+            else:
+                running = sum(1 for step in batch if step.status == "run")
+                header = f"{len(batch)} consultas a la vez" + (f" · {running} en curso" if running else "")
+                lines.append(f"-# {header}")
+                for position, step in enumerate(batch):
+                    branch = "└" if position == len(batch) - 1 else "├"
+                    lines.append(f"{branch} {noah_ai_emojis.dot(step.status)} {step.label}")
+            index = end
+        return lines
+
     async def start(self) -> None:
         self.message = await self.channel.send(view=self.render(), allowed_mentions=NONE)
         self.mark_edited()
@@ -248,39 +274,47 @@ class ProgressCard:
         while len(_cards) > CARD_CACHE:
             _cards.popitem(last=False)
 
-    async def _flush(self) -> None:
-        async with self._lock:
-            if not self._dirty or self.message is None:
-                return
+    async def _flush_loop(self) -> None:
+        """Un único bucle de edición: repite mientras quede algún cambio sin enviar.
+
+        Así no se pierde un cambio que llega mientras otra edición está en camino
+        (era lo que dejaba la última herramienta «cargando» aunque hubiera acabado).
+        """
+        while self._dirty and self.message is not None:
+            if not self._urgent:
+                delay = EDIT_INTERVAL - (time.monotonic() - self._last_edit)
+                if delay > 0:
+                    await asyncio.sleep(delay)
             self._dirty = False
+            self._urgent = False
             self.mark_edited()
             with suppress(discord.HTTPException):
                 await self.message.edit(view=self.render(), allowed_mentions=NONE)
 
-    async def _delayed_flush(self, delay: float) -> None:
-        await asyncio.sleep(delay)
-        await self._flush()
-
     async def refresh(self, force: bool = False) -> None:
         self._dirty = True
         if force:
-            if self._flush_task is not None and not self._flush_task.done():
-                self._flush_task.cancel()
-            await self._flush()
-            return
-        if self._flush_task is not None and not self._flush_task.done():
-            return
-        delay = max(0.0, EDIT_INTERVAL - (time.monotonic() - self._last_edit))
-        self._flush_task = asyncio.create_task(self._delayed_flush(delay))
+            self._urgent = True
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._flush_loop())
+        if force:
+            await self._flush_task
 
     async def _on_step(self, step: Step) -> None:
         await self.refresh()
 
-    async def add_step(self, label: str) -> Step:
-        step = Step(self._on_step, label)
-        self.steps.append(step)
+    async def add_steps(self, labels: list[str]) -> list[Step]:
+        """Añade una tanda de herramientas que se ejecutan a la vez."""
+        group = self._next_group
+        self._next_group += 1
+        steps = []
+        for label in labels:
+            step = Step(self._on_step, label)
+            step.group = group
+            steps.append(step)
+        self.steps.extend(steps)
         await self.refresh()
-        return step
+        return steps
 
     async def set_thinking(self, thinking: bool) -> None:
         if self.thinking != thinking:
@@ -347,20 +381,147 @@ def _threads_problem(channel: discord.TextChannel) -> str | None:
     return f"Me faltan permisos en {channel.mention}: {', '.join(missing)}." if missing else None
 
 
-def _welcome_view(settings: AiSettingsStore, guild_id: int, member: discord.Member) -> discord.ui.LayoutView:
+WELCOME_TEXT = (
+    "### 🔒 Chat privado con Noah\n"
+    "Este chat es privado entre tú y Noah.\n"
+    "Si mencionas a alguien usando @user, se le añadirá a la conversación.\n"
+    "> En caso de incumplimiento de normas este chat puede ser revisado por el moderador."
+)
+
+
+class CloseChatButton(discord.ui.DynamicItem[discord.ui.Button], template=r"noah:ai:close"):
+    """Botón «Cerrar chat» del mensaje de bienvenida. Persistente."""
+
+    def __init__(self, disabled: bool = False) -> None:
+        super().__init__(
+            discord.ui.Button(
+                label="Chat cerrado" if disabled else "Cerrar chat",
+                emoji="🔒",
+                style=discord.ButtonStyle.secondary if disabled else discord.ButtonStyle.danger,
+                custom_id=CLOSE_BUTTON_ID,
+                disabled=disabled,
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str]
+    ) -> "CloseChatButton":
+        _ = interaction, item, match
+        return cls()
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        thread = interaction.channel
+        guild = interaction.guild
+        if not isinstance(thread, discord.Thread) or guild is None:
+            await interaction.response.send_message("❌ Esto solo funciona en un chat de Noah.", ephemeral=True)
+            return
+        settings = _settings(interaction.client)
+        data = settings.get_thread(guild.id, thread.id)
+        if data is None:
+            await interaction.response.send_message("❌ Este chat ya no está registrado.", ephemeral=True)
+            return
+        if interaction.user.id != data.get("owner_id") and not _is_admin(interaction.user):
+            await interaction.response.send_message("Solo quien abrió el chat (o un admin) puede cerrarlo.", ephemeral=True)
+            return
+        if data.get("closed"):
+            text = (
+                "Este chat lo ha cerrado Noah por saltarse las normas: no se puede cerrar ni reabrir desde aquí."
+                if data.get("closed_by", "noah") == "noah"
+                else "Este chat ya está cerrado."
+            )
+            await interaction.response.send_message(text, ephemeral=True)
+            return
+        lock = _thread_locks.get(thread.id)
+        if lock is not None and lock.locked():
+            await interaction.response.send_message("Espera a que Noah termine de responder para cerrar el chat 🖤", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "¿Cerrar este chat? Se archivará y ya no se podrá escribir en él.",
+            view=ConfirmCloseView(interaction.message),
+            ephemeral=True,
+        )
+
+
+class ConfirmCloseView(discord.ui.View):
+    def __init__(self, welcome: discord.Message | None) -> None:
+        super().__init__(timeout=60)
+        self.welcome = welcome
+
+    @discord.ui.button(label="Sí, cerrar", emoji="🔒", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        _ = button
+        self.stop()
+        thread = interaction.channel
+        guild = interaction.guild
+        if not isinstance(thread, discord.Thread) or guild is None:
+            return
+        settings = _settings(interaction.client)
+        data = settings.get_thread(guild.id, thread.id)
+        if data is None or data.get("closed"):
+            await interaction.response.edit_message(content="Este chat ya está cerrado.", view=None)
+            return
+        await interaction.response.edit_message(content="✅ Chat cerrado.", view=None)
+        settings.close_thread(guild.id, thread.id, by="user", closer_id=interaction.user.id)
+        name = discord.utils.escape_markdown(getattr(interaction.user, "display_name", interaction.user.name))
+        await _mark_welcome_closed(settings, thread, f"Chat cerrado por {name}", self.welcome)
+        with suppress(discord.HTTPException):
+            await thread.send(f"-# 🔒 {name} ha cerrado el chat.", allowed_mentions=NONE)
+        await _lock_thread(thread, "Noah AI: chat cerrado con el botón")
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        _ = button
+        self.stop()
+        await interaction.response.edit_message(content="Vale, el chat sigue abierto 🖤", view=None)
+
+
+def _welcome_view(
+    settings: AiSettingsStore,
+    guild_id: int,
+    member: discord.Member | None,
+    closed_note: str | None = None,
+) -> discord.ui.LayoutView:
     view = discord.ui.LayoutView(timeout=None)
     container = discord.ui.Container(accent_color=WARN_COLOR)
-    container.add_item(
-        discord.ui.TextDisplay(
-            "### 🔒 Chat anónimo y privado con Noah\n"
-            "Este chat es solo entre tú y Noah. Puede ser revisado por el staff si hay motivos "
-            "para ello, como romper las normas.\n"
-            "**No compartas información confidencial.**\n"
-            f"-# {_quota_text(settings, guild_id, member)}"
-        )
-    )
+    if closed_note is not None:
+        note = closed_note
+    elif member is not None:
+        note = _quota_text(settings, guild_id, member)
+    else:
+        note = None
+    container.add_item(discord.ui.TextDisplay(WELCOME_TEXT + (f"\n-# {note}" if note else "")))
+    row: discord.ui.ActionRow[Any] = discord.ui.ActionRow()
+    row.add_item(CloseChatButton(disabled=closed_note is not None))
+    container.add_item(row)
     view.add_item(container)
     return view
+
+
+async def _mark_welcome_closed(
+    settings: AiSettingsStore, thread: discord.Thread, note: str, welcome: discord.Message | None = None
+) -> None:
+    """Desactiva el botón de cerrar del mensaje de bienvenida (antes de archivar el hilo)."""
+    view = _welcome_view(settings, thread.guild.id, None, closed_note=note)
+    target: Any = welcome
+    if target is None:
+        data = settings.get_thread(thread.guild.id, thread.id) or {}
+        message_id = data.get("welcome_message_id")
+        if message_id is None:
+            return
+        target = thread.get_partial_message(int(message_id))
+    with suppress(discord.HTTPException):
+        await target.edit(view=view, allowed_mentions=NONE)
+
+
+async def _lock_thread(thread: discord.Thread, reason: str) -> bool:
+    """Bloquea y archiva el hilo para que nadie pueda volver a escribir."""
+    try:
+        await thread.edit(locked=True, archived=True, reason=reason)
+        return True
+    except discord.HTTPException as error:
+        _log.warning("No he podido cerrar el chat %s de Noah AI: %s", thread.id, error)
+        return False
 
 
 async def _open_chat(interaction: discord.Interaction) -> None:
@@ -411,7 +572,8 @@ async def _open_chat(interaction: discord.Interaction) -> None:
 
     settings.register_thread(guild.id, thread.id, member.id)
     with suppress(discord.HTTPException):
-        await thread.send(view=_welcome_view(settings, guild.id, member), allowed_mentions=NONE)
+        welcome = await thread.send(view=_welcome_view(settings, guild.id, member), allowed_mentions=NONE)
+        settings.set_thread_value(guild.id, thread.id, "welcome_message_id", welcome.id)
     link = discord.ui.View()
     link.add_item(discord.ui.Button(label="Ir al chat", emoji="💬", url=thread.jump_url))
     await interaction.followup.send(f"Tu chat privado con Noah está listo: {thread.mention} 🖤", view=link, ephemeral=True)
@@ -568,12 +730,12 @@ async def _alert_staff(
 
 async def _close_thread(bot: commands.Bot, thread: discord.Thread, member: discord.Member, last_message: str) -> None:
     settings = _settings(bot)
-    settings.close_thread(thread.guild.id, thread.id)
+    settings.close_thread(thread.guild.id, thread.id, by="noah")
+    await _mark_welcome_closed(settings, thread, "Chat cerrado por Noah")
     with suppress(discord.HTTPException):
         await thread.send(view=_closed_view(), allowed_mentions=NONE)
     await _alert_staff(bot, thread.guild, thread, member, last_message)
-    with suppress(discord.HTTPException):
-        await thread.edit(locked=True, archived=True, reason="Noah AI: segundo intento de saltarse las reglas")
+    await _lock_thread(thread, "Noah AI: segundo intento de saltarse las reglas")
 
 
 async def _handle_question(bot: commands.Bot, message: discord.Message) -> None:
@@ -638,12 +800,19 @@ async def _handle_question(bot: commands.Bot, message: discord.Message) -> None:
         report_infraction=_report,
     )
 
-    async def _run_tool(name: str, arguments: str) -> str:
-        spec = TOOLS_BY_NAME.get(name)
-        step = await card.add_step(spec.label if spec else "Trabajando…")
-        outcome = await execute_tool(ctx, name, arguments, step)
-        await step.finish(outcome.done, outcome.status)
-        return outcome.text
+    semaphore = asyncio.Semaphore(PARALLEL_TOOLS)
+
+    async def _run_tools(calls: list[tuple[str, str]]) -> list[str]:
+        labels = [TOOLS_BY_NAME[name].label if name in TOOLS_BY_NAME else "Trabajando…" for name, _ in calls]
+        steps = await card.add_steps(labels)
+
+        async def _one(step: Step, name: str, arguments: str) -> str:
+            async with semaphore:
+                outcome = await execute_tool(ctx, name, arguments, step)
+            await step.finish(outcome.done, outcome.status)
+            return outcome.text
+
+        return list(await asyncio.gather(*(_one(step, name, args) for step, (name, args) in zip(steps, calls))))
 
     started = time.monotonic()
     try:
@@ -659,7 +828,7 @@ async def _handle_question(bot: commands.Bot, message: discord.Message) -> None:
             instructions=instructions,
             history=history,
             tools=tools_for(admin, topics),
-            run_tool=_run_tool,
+            run_tools=_run_tools,
             on_reasoning=card.add_reasoning,
             on_thinking=card.set_thinking,
         )
@@ -1072,7 +1241,7 @@ def register_ai_commands(bot: commands.Bot, noah_group: commands.Group) -> None:
     @bot.listen("on_ready")
     async def _ai_ready() -> None:
         bot.add_view(AiPanelView())
-        bot.add_dynamic_items(ThinkToggle)
+        bot.add_dynamic_items(ThinkToggle, CloseChatButton)
         await noah_ai_emojis.load(bot)
 
     @bot.listen("on_message")
@@ -1080,7 +1249,11 @@ def register_ai_commands(bot: commands.Bot, noah_group: commands.Group) -> None:
         if message.author.bot or message.guild is None or not isinstance(message.channel, discord.Thread):
             return
         data = _settings(bot).get_thread(message.guild.id, message.channel.id)
-        if data is None or data.get("closed") or data.get("owner_id") != message.author.id:
+        if data is None or data.get("owner_id") != message.author.id:
+            return
+        if data.get("closed"):
+            # Si el bloqueo falló al cerrarlo, se reintenta: un chat cerrado no se reabre.
+            await _lock_thread(message.channel, "Noah AI: el chat estaba cerrado")
             return
         if not isinstance(message.author, discord.Member):
             return
