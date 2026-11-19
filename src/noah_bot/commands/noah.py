@@ -21,6 +21,7 @@ from noah_bot.commands.rrpp_points import register_rrpp_points_commands
 from noah_bot.commands.spotify import register_spotify_commands
 from noah_bot.commands.sports import register_sports_commands
 from noah_bot.commands.tts import register_tts_commands
+from noah_bot.commands.noah_ai import register_ai_commands
 from noah_bot.commands.vc_stats import register_vc_stats_commands
 from noah_bot.commands.waifu import register_waifu_commands
 from noah_bot.modules.bot_context import get_bot_context
@@ -235,6 +236,42 @@ def _build_noah_command_stats_embed(bot: commands.Bot) -> discord.Embed:
     return embed
 
 
+NOAH_HELP_ROWS: list[tuple[str, str]] = [
+    ('.noah ask <question>', 'Ask a question to Noah AI.'),
+    ('.noah ai help', 'Chat privado con Noah AI y su configuración.'),
+    ('.noah summary', 'Summarize recent channel messages.'),
+    ('.noah behonest <question>', 'Ask Noah without filters.'),
+    ('.noah quote <user>', 'Quote the replied message in a styled embed.'),
+    ('.noah merge', 'Render all images from a replied message.'),
+    ('.noah if <type>', 'Invert embed rarity symbol and color.'),
+    ('.noah ping', 'Check if Noah is responsive.'),
+    ('.noah d20', 'Tira un d20 y muestra el resultado estilo D&D.'),
+    ('.noah areyouok', 'Muestra el total de comandos y por categoria.'),
+    ('.noah kill', 'Stop the bot process immediately.'),
+    ('.noah help', 'Show Noah AI commands.'),
+    ('.noah daily', 'Resumen diario del servidor.'),
+    ('.noah daily -user @user', 'Resumen diario de un usuario.'),
+    ('.noah gochi help', 'Muestra los comandos de Noah Gochi.'),
+    ('.noah autogami help', 'Show Autogami sync commands.'),
+    ('.noah vc help', 'Show voice stats commands.'),
+    ('.noah spotify help', 'Muestra los comandos de Spotify.'),
+    ('.noah presentations', 'Obliga a presentarse (solo admins).'),
+    ('.noah mute', 'Mutea a todos en tu VC menos a ti (solo admins).'),
+    ('.noah unmute', 'Desmutea a todos en tu VC (solo admins).'),
+    ('.noah guard help', 'Protocolo de contingencia ante raids (solo staff).'),
+    ('.noah rrpp help', 'Mensajes con aviso a los RRPP (solo admins).'),
+    ('.noah confess help', 'Confesiones totalmente anónimas.'),
+    ('.noah billboard help', 'Cartelera de pelis del server.'),
+    ('.noah sports help', 'Quedadas para hacer deporte (con mapa y plazas).'),
+    ('.noah council help', 'Consejo oculto con votos anónimos (solo admins).'),
+    ('.waifuracer setemoji <emoji>', 'Set your claim reaction emoji.'),
+    ('.waifuracer help', 'Show waifuracer commands.'),
+    ('.noah waifu help', 'Show waifu battle commands'),
+    ('.noah relics help', 'Muestra los comandos de noah relics.'),
+    ('.steallist help', 'Show steallist commands.'),
+]
+
+
 def register_noah_commands(bot: commands.Bot) -> None:
     @bot.group()
     async def noah(ctx: commands.Context) -> None:
@@ -262,59 +299,8 @@ def register_noah_commands(bot: commands.Bot) -> None:
     @noah.command()
     async def help(ctx: commands.Context) -> None:
         chart = EmbedTable(headers=["Command", "Description"], title="Noah AI Commands")
-        chart.add_row([".noah ask <question>", "Ask a question to Noah AI."])
-        chart.add_row([".noah summary", "Summarize recent channel messages."])
-        chart.add_row([".noah behonest <question>", "Ask Noah without filters."])
-        chart.add_row(
-            [".noah quote <user>", "Quote the replied message in a styled embed."]
-        )
-        chart.add_row([".noah merge", "Render all images from a replied message."])
-        chart.add_row([".noah if <type>", "Invert embed rarity symbol and color."])
-        chart.add_row([".noah ping", "Check if Noah is responsive."])
-        chart.add_row([".noah d20", "Tira un d20 y muestra el resultado estilo D&D."])
-        chart.add_row(
-            [".noah areyouok", "Muestra el total de comandos y por categoria."]
-        )
-        chart.add_row([".noah kill", "Stop the bot process immediately."])
-        chart.add_row([".noah help", "Show Noah AI commands."])
-        chart.add_row([".noah daily", "Resumen diario del servidor."])
-        chart.add_row([".noah daily -user @user", "Resumen diario de un usuario."])
-        chart.add_row([".noah gochi help", "Muestra los comandos de Noah Gochi."])
-        chart.add_row([".noah autogami help", "Show Autogami sync commands."])
-        chart.add_row([".noah vc help", "Show voice stats commands."])
-        chart.add_row([".noah spotify help", "Muestra los comandos de Spotify."])
-        chart.add_row(
-            [".noah presentations", "Obliga a presentarse (solo admins)."]
-        )
-        chart.add_row(
-            [".noah mute", "Mutea a todos en tu VC menos a ti (solo admins)."]
-        )
-        chart.add_row([".noah unmute", "Desmutea a todos en tu VC (solo admins)."])
-        chart.add_row(
-            [".noah guard help", "Protocolo de contingencia ante raids (solo staff)."]
-        )
-        chart.add_row(
-            [".noah rrpp help", "Mensajes con aviso a los RRPP (solo admins)."]
-        )
-        chart.add_row(
-            [".noah confess help", "Confesiones totalmente anónimas."]
-        )
-        chart.add_row(
-            [".noah billboard help", "Cartelera de pelis del server."]
-        )
-        chart.add_row(
-            [".noah sports help", "Quedadas para hacer deporte (con mapa y plazas)."]
-        )
-        chart.add_row(
-            [".noah council help", "Consejo oculto con votos anónimos (solo admins)."]
-        )
-        chart.add_row(
-            [".waifuracer setemoji <emoji>", "Set your claim reaction emoji."]
-        )
-        chart.add_row([".waifuracer help", "Show waifuracer commands."])
-        chart.add_row([".noah waifu help", "Show waifu battle commands"])
-        chart.add_row([".noah relics help", "Muestra los comandos de noah relics."])
-        chart.add_row([".steallist help", "Show steallist commands."])
+        for row in NOAH_HELP_ROWS:
+            chart.add_row(list(row))
 
         await ctx.send(embed=chart.render())
 
@@ -430,7 +416,7 @@ def register_noah_commands(bot: commands.Bot) -> None:
         await ctx.typing()
 
         try:
-            response = context.ai_responder.ask(question)
+            response = await asyncio.to_thread(context.ai_responder.ask, question)
         except Exception:
             await ctx.send("❌ Lo siento, hubo un error al procesar tu solicitud.")
             return
@@ -446,7 +432,7 @@ def register_noah_commands(bot: commands.Bot) -> None:
         text = [message.content for message in messages]
 
         try:
-            summary_text = context.ai_responder.summarize(str(text))
+            summary_text = await asyncio.to_thread(context.ai_responder.summarize, str(text))
         except Exception:
             await ctx.send("💀 Noah couldn't survive this summary.")
             return
@@ -459,7 +445,7 @@ def register_noah_commands(bot: commands.Bot) -> None:
         await ctx.typing()
 
         try:
-            response = context.ai_responder.ask_without_filters(question)
+            response = await asyncio.to_thread(context.ai_responder.ask_without_filters, question)
         except Exception:
             await ctx.send("❌ Lo siento, hubo un error al procesar tu solicitud.")
             return
@@ -740,3 +726,4 @@ def register_noah_commands(bot: commands.Bot) -> None:
     register_billboard_commands(bot, noah)
     register_sports_commands(bot, noah)
     register_council_commands(bot, noah)
+    register_ai_commands(bot, noah)

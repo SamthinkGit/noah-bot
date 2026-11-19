@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from discord.ext import commands
 
 from noah_bot.modules.ai import AiResponder
+from noah_bot.modules.ai_settings import AiSettingsStore
 from noah_bot.modules.autogami import AutogamiTokenStore
 from noah_bot.modules.billboard import BillboardStore
 from noah_bot.modules.confessions import ConfessionsStore
@@ -26,6 +27,7 @@ from noah_bot.modules.spotify_player import (
 from noah_bot.modules.steallist import StealList
 from noah_bot.modules.tts import TTSVoiceStore
 from noah_bot.modules.voice_manager import VoiceManager
+from noah_bot.modules.voice_social import VoiceSocialStore
 from noah_bot.modules.waifu_game import WaifuGameManager
 
 
@@ -37,6 +39,8 @@ class BotContext:
     steallist: StealList = field(default_factory=StealList)
     autogami_tokens: AutogamiTokenStore = field(default_factory=AutogamiTokenStore)
     voice_manager: VoiceManager = field(default_factory=VoiceManager)
+    voice_social: VoiceSocialStore = field(default_factory=VoiceSocialStore)
+    ai_settings: AiSettingsStore = field(default_factory=AiSettingsStore)
     tts_voices: TTSVoiceStore = field(default_factory=TTSVoiceStore)
     presentations: PresentationsStore = field(default_factory=PresentationsStore)
     guard: GuardStore = field(default_factory=GuardStore)
@@ -71,7 +75,10 @@ class BotContext:
 
 
 def create_bot_context() -> BotContext:
-    return BotContext()
+    context = BotContext()
+    # Los módulos de IA antiguos usan la misma API key y modelo que Noah AI.
+    context.ai_responder.attach_settings(context.ai_settings)
+    return context
 
 
 def get_bot_context(bot: commands.Bot) -> BotContext:

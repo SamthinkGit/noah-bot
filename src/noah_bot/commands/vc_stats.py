@@ -1,7 +1,7 @@
 from datetime import datetime
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from noah_bot.modules.bot_context import get_bot_context
 from noah_bot.modules.daily_stats import overlap_seconds_for_current_day
@@ -101,10 +101,44 @@ async def _send_level_alert(
     return True
 
 
+def _voice_rooms(bot: commands.Bot) -> dict[int, list[list[int]]]:
+    """Quién cuenta en cada canal de voz (mismo criterio que los stats de voz)."""
+    voice_manager = get_bot_context(bot).voice_manager
+    rooms: dict[int, list[list[int]]] = {}
+    for guild in bot.guilds:
+        channels: list[list[int]] = []
+        for channel in [*guild.voice_channels, *guild.stage_channels]:
+            if guild.afk_channel is not None and channel.id == guild.afk_channel.id:
+                continue
+            members = [
+                member.id
+                for member in channel.members
+                if not member.bot
+                and member.voice is not None
+                and _get_trackable_channel(member.voice, voice_manager) is not None
+            ]
+            if members:
+                channels.append(members)
+        rooms[guild.id] = channels
+    return rooms
+
+
 def register_vc_stats_commands(bot: commands.Bot, noah_group: commands.Group) -> None:
+    @tasks.loop(seconds=60)
+    async def voice_social_tick() -> None:
+        # Registro aparte (coincidencias y medias): no toca niveles ni voice_stats.json.
+        get_bot_context(bot).voice_social.tick(_voice_rooms(bot))
+
+    @voice_social_tick.error
+    async def voice_social_tick_error(error: BaseException) -> None:
+        _ = error
+        voice_social_tick.restart()
+
     @bot.listen("on_ready")
     async def sync_voice_tracking() -> None:
         context = get_bot_context(bot)
+        if not voice_social_tick.is_running():
+            voice_social_tick.start()
         connected_members: list[dict[str, int | str | None]] = []
 
         for guild in bot.guilds:

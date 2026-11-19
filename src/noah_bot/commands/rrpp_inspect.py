@@ -17,6 +17,7 @@ from noah_bot.commands.rrpp import RRPP_COLOR, is_rrpp_admin
 from noah_bot.modules.bot_context import get_bot_context
 from noah_bot.modules.inspect_card import Badge, CardData, Stat, render_card
 from noah_bot.modules.rrpp import CLAIM_ACCEPTED, RrppStore
+from noah_bot.modules.voice_social import format_duration
 
 _log = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ VERIFIED_ROLE_PATTERN = re.compile(r"^\W*(verificad[oa]s?|verified)\W*$", re.IGN
 DETAILS: dict[str, tuple[str, str, str]] = {
     "presentation": ("📝", "Presentación", "Texto completo e imagen"),
     "first": ("💬", "Primeros mensajes", "Desde el más antiguo, de 5 en 5"),
-    "voice": ("🎧", "Voz", "Tiempo, estado y nivel de .noah vc"),
+    "voice": ("🎧", "Voz", "Tiempo, nivel, medias y con quién coincide"),
     "rrpp": ("🤝", "RRPP", "Quién le saludó, presentó y llevó al VC"),
     "server": ("🏷️", "Roles y servidor", "Verificación, roles, apodo y avisos"),
     "replies": ("🔗", "Con quién habla", "A quién responde en sus 100 primeros mensajes"),
@@ -159,6 +160,8 @@ class Profile:
     is_rrpp: bool
     claims: list[dict[str, Any]] = field(default_factory=list)
     help_at: float | None = None
+    voice_averages: dict[str, Any] | None = None
+    voice_companions: list[tuple[str, int]] = field(default_factory=list)
 
     @property
     def joined_at(self) -> float | None:
@@ -195,7 +198,17 @@ def _load_profile(
         is_rrpp=member is not None and _is_rrpp(member, context.rrpp),
         claims=context.rrpp.list_claims_about(guild.id, user.id),
         help_at=context.rrpp.help_requested_at(guild.id, user.id),
+        voice_averages=context.voice_social.averages(guild.id, user.id),
+        voice_companions=[
+            (_companion_name(guild, companion_id), seconds)
+            for companion_id, seconds in context.voice_social.companions(guild.id, user.id, limit=5)
+        ],
     )
+
+
+def _companion_name(guild: discord.Guild, user_id: int) -> str:
+    member = guild.get_member(user_id)
+    return discord.utils.escape_markdown(member.display_name) if member else "ex-miembro"
 
 
 def _verified_role(guild: discord.Guild) -> discord.Role | None:
@@ -729,6 +742,20 @@ def _voice_text(profile: Profile) -> str:
     left = _iso_ts(voice.get("last_left_at"))
     lines.append(f"**Última entrada:** {_ts(joined, 'R') if joined is not None else '-'}")
     lines.append(f"**Última salida:** {_ts(left, 'R') if left is not None else '-'}")
+
+    averages = profile.voice_averages
+    if averages is not None and averages["total_seconds"] > 0:
+        lines.append("")
+        lines.append(
+            f"**Media ({averages['window_days']} días):** {format_duration(averages['avg_per_day'])}/día · "
+            f"{format_duration(averages['avg_per_active_day'])} los días que entra"
+        )
+        lines.append(f"**Sesión media:** {format_duration(averages['avg_session'])}")
+    if profile.voice_companions:
+        companions = ", ".join(
+            f"{name} ({format_duration(seconds)})" for name, seconds in profile.voice_companions
+        )
+        lines.append(f"**Coincide más con:** {companions}")
 
     level = voice.get("level_data")
     lines.append("")

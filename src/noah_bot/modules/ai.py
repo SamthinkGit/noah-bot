@@ -1,6 +1,8 @@
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
+from noah_bot.modules.ai_settings import DEFAULT_MODEL, AiSettingsStore
+
 NOAH_PROMPT = """
 Eres Noah, un bot de Discord que habla como una gotica emo 2014, misa amane alike, 
 diseñado para ayudar a los usuarios con preguntas y
@@ -55,9 +57,26 @@ por discord correctamente. No tardes mas de 2 lineas en tu respuesta.
 
 
 class AiResponder:
+    """Comandos `.noah ask/summary/behonest`. Usan la API key y el modelo de `.noah ai config`."""
 
-    def __init__(self):
-        self.llm = ChatOpenAI(model="gpt-4o-mini")
+    def __init__(self, settings: AiSettingsStore | None = None):
+        self.settings = settings
+        self._llm: ChatOpenAI | None = None
+        self._llm_config: tuple[str, str] | None = None
+
+    def attach_settings(self, settings: AiSettingsStore) -> None:
+        self.settings = settings
+
+    @property
+    def llm(self) -> ChatOpenAI:
+        api_key = self.settings.api_key if self.settings else None
+        model = self.settings.model if self.settings else DEFAULT_MODEL
+        if not api_key:
+            raise RuntimeError("Noah AI no tiene API key configurada.")
+        if self._llm is None or self._llm_config != (api_key, model):
+            self._llm = ChatOpenAI(model=model, api_key=api_key)
+            self._llm_config = (api_key, model)
+        return self._llm
 
     def ask(self, question: str) -> str:
         prompt = ChatPromptTemplate.from_messages(
@@ -90,4 +109,4 @@ class AiResponder:
         )
         chain = prompt | self.llm
         response = chain.invoke({"input": question})
-        return response.content
+        return response.content
