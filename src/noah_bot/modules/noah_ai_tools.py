@@ -1018,6 +1018,7 @@ def _noah_ai_text(ctx: ToolContext) -> str:
     disabled = [TOPICS[key][0] for key in TOPICS if key in settings.disabled_topics(guild_id)]
     used = settings.used_today(guild_id, ctx.asker.id)
     lines = [
+        "Quién es Noah: la waifu gótica de Samthink (el administrador, que la creó) y la bot de Discord de Amigos Madrid.",
         "Cómo funciona Noah AI:",
         "- En el canal del panel hay un botón para abrir un chat PRIVADO con Noah (un hilo privado). Cada persona puede abrir varios.",
         "- Nadie más ve esos chats ni sabe que existen, salvo el staff, que puede revisarlos si hay motivos (como romper las normas).",

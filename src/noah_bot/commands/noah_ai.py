@@ -24,7 +24,10 @@ from typing import Any
 import discord
 from discord.ext import commands
 
+from langsmith import trace
+
 from noah_bot.modules import noah_ai_emojis
+from noah_bot.modules.ai_tracing import tracing
 from noah_bot.modules.ai_settings import (
     DEFAULT_MODEL,
     LENGTHS,
@@ -67,6 +70,8 @@ EDIT_INTERVAL = 1.2
 REASONING_LIMIT = 2500
 CARD_CACHE = 300
 PARALLEL_TOOLS = 4
+FINAL_EDIT_ATTEMPTS = 3
+FINAL_EDIT_GAP = 1.0
 CONFIG_TIMEOUT = 600
 READABLE_CHANNEL_TYPES = [
     discord.ChannelType.text,
@@ -208,7 +213,7 @@ class ProgressCard:
         self.message: discord.Message | None = None
         self.finished = False
         self._dirty = False
-        self._urgent = False
+        self._urgent = False  # se mantiene por compatibilidad con el bucle
         self._last_edit = 0.0
         self._flush_task: asyncio.Task[None] | None = None
         self._next_group = 0
@@ -245,7 +250,7 @@ class ProgressCard:
         return view
 
     def _step_lines(self) -> list[str]:
-        """Una línea por herramienta; las que corren a la vez van agrupadas en árbol."""
+        """Una línea por herramienta; las que corren a la vez van juntas dentro de una cita."""
         lines: list[str] = []
         index = 0
         while index < len(self.steps):
@@ -254,16 +259,9 @@ class ProgressCard:
             while group is not None and end < len(self.steps) and self.steps[end].group == group:
                 end += 1
             batch = self.steps[index:end]
-            if len(batch) == 1:
-                step = batch[0]
-                lines.append(f"{noah_ai_emojis.dot(step.status)} {step.label}")
-            else:
-                running = sum(1 for step in batch if step.status == "run")
-                header = f"{len(batch)} consultas a la vez" + (f" · {running} en curso" if running else "")
-                lines.append(f"-# {header}")
-                for position, step in enumerate(batch):
-                    branch = "└" if position == len(batch) - 1 else "├"
-                    lines.append(f"{branch} {noah_ai_emojis.dot(step.status)} {step.label}")
+            prefix = "> " if len(batch) > 1 else ""
+            for step in batch:
+                lines.append(f"{prefix}{noah_ai_emojis.dot(step.status)} {step.label}")
             index = end
         return lines
 
@@ -274,31 +272,63 @@ class ProgressCard:
         while len(_cards) > CARD_CACHE:
             _cards.popitem(last=False)
 
-    async def _flush_loop(self) -> None:
-        """Un único bucle de edición: repite mientras quede algún cambio sin enviar.
+    async def _edit(self) -> None:
+        assert self.message is not None
+        self.mark_edited()
+        await self.message.edit(view=self.render(), allowed_mentions=NONE)
 
-        Así no se pierde un cambio que llega mientras otra edición está en camino
-        (era lo que dejaba la última herramienta «cargando» aunque hubiera acabado).
-        """
-        while self._dirty and self.message is not None:
+    async def _flush_loop(self) -> None:
+        """Un único bucle de edición: repite mientras quede algún cambio sin enviar."""
+        while self._dirty and self.message is not None and not self.finished:
             if not self._urgent:
                 delay = EDIT_INTERVAL - (time.monotonic() - self._last_edit)
                 if delay > 0:
                     await asyncio.sleep(delay)
+            if self.finished:
+                return
             self._dirty = False
             self._urgent = False
-            self.mark_edited()
-            with suppress(discord.HTTPException):
-                await self.message.edit(view=self.render(), allowed_mentions=NONE)
+            try:
+                await self._edit()
+            except discord.HTTPException as error:
+                _log.warning("No he podido actualizar la tarjeta de Noah AI: %s", error)
+            except Exception:  # noqa: BLE001 - que el bucle no muera en silencio
+                _log.exception("Error actualizando la tarjeta de Noah AI")
 
-    async def refresh(self, force: bool = False) -> None:
+    async def refresh(self) -> None:
+        if self.finished:
+            return
         self._dirty = True
-        if force:
-            self._urgent = True
         if self._flush_task is None or self._flush_task.done():
             self._flush_task = asyncio.create_task(self._flush_loop())
-        if force:
-            await self._flush_task
+
+    async def _final_edit(self) -> None:
+        """La última edición no puede perderse: espera a la anterior, reintenta y, si
+        Discord sigue sin aceptarla, vuelve a enviar la tarjeta."""
+        if self._flush_task is not None and not self._flush_task.done():
+            with suppress(Exception):
+                await self._flush_task
+        if self.message is None:
+            return
+        for attempt in range(FINAL_EDIT_ATTEMPTS):
+            gap = FINAL_EDIT_GAP - (time.monotonic() - self._last_edit)
+            if gap > 0:
+                await asyncio.sleep(gap)
+            try:
+                await self._edit()
+                return
+            except discord.HTTPException as error:
+                _log.warning("Intento %s de cerrar la tarjeta de Noah AI fallido: %s", attempt + 1, error)
+                await asyncio.sleep(1.5 * (attempt + 1))
+        old = self.message
+        try:
+            self.message = await self.channel.send(view=self.render(), allowed_mentions=NONE)
+            _cards[self.message.id] = self
+        except discord.HTTPException as error:
+            _log.warning("No he podido reenviar la tarjeta de Noah AI: %s", error)
+            return
+        with suppress(discord.HTTPException):
+            await old.delete()
 
     async def _on_step(self, step: Step) -> None:
         await self.refresh()
@@ -333,7 +363,7 @@ class ProgressCard:
         for step in self.steps:
             if step.status == "run":
                 step.status = "error" if error else "ok"
-        await self.refresh(force=True)
+        await self._final_edit()
 
 
 # -- Panel ----------------------------------------------------------------------------------
@@ -808,7 +838,9 @@ async def _handle_question(bot: commands.Bot, message: discord.Message) -> None:
 
         async def _one(step: Step, name: str, arguments: str) -> str:
             async with semaphore:
-                outcome = await execute_tool(ctx, name, arguments, step)
+                with trace(name, run_type="tool", inputs={"arguments": arguments}) as run:
+                    outcome = await execute_tool(ctx, name, arguments, step)
+                    run.end(outputs={"result": outcome.text, "status": outcome.status})
             await step.finish(outcome.done, outcome.status)
             return outcome.text
 
@@ -824,14 +856,19 @@ async def _handle_question(bot: commands.Bot, message: discord.Message) -> None:
             prefs=prefs,
             enabled_topics=topics,
         )
-        result = await _agent_for(bot).run(
-            instructions=instructions,
-            history=history,
-            tools=tools_for(admin, topics),
-            run_tools=_run_tools,
-            on_reasoning=card.add_reasoning,
-            on_thinking=card.set_thinking,
-        )
+        with tracing(
+            settings,
+            tags=["noah-ai", "admin" if admin else "usuario"],
+            metadata={"guild_id": guild.id, "thread_id": thread.id, "user_id": member.id, "model": settings.model},
+        ):
+            result = await _agent_for(bot).run(
+                instructions=instructions,
+                history=history,
+                tools=tools_for(admin, topics),
+                run_tools=_run_tools,
+                on_reasoning=card.add_reasoning,
+                on_thinking=card.set_thinking,
+            )
     except AgentError as error:
         await card.finish(error=str(error))
         return
@@ -966,6 +1003,50 @@ class LimitModal(discord.ui.Modal, title="Límite diario"):
         await self.panel.refresh(interaction)
 
 
+class LangSmithModal(discord.ui.Modal, title="LangSmith"):
+    def __init__(self, panel: "AiConfigView") -> None:
+        super().__init__(timeout=300)
+        self.panel = panel
+        settings = panel.settings
+        self.key = discord.ui.TextInput(placeholder="lsv2_…  (vacío = no cambiarla)", max_length=300, required=False)
+        self.project = discord.ui.TextInput(default=settings.langsmith_project, max_length=100, required=False)
+        enabled = settings.langsmith_switch
+        self.enabled: discord.ui.Select[Any] = discord.ui.Select(
+            options=[
+                discord.SelectOption(label="Registrar llamadas", value="1", default=enabled),
+                discord.SelectOption(label="No registrar", value="0", default=not enabled),
+                discord.SelectOption(label="Borrar la API key guardada", value="delete", emoji="🗑️"),
+            ],
+            min_values=1,
+            max_values=1,
+        )
+        self.add_item(
+            discord.ui.Label(
+                text="API key de LangSmith (LANGCHAIN_API_KEY)",
+                description="No se muestra nunca. Si no hay, se usa la del .env.",
+                component=self.key,
+            )
+        )
+        self.add_item(discord.ui.Label(text="Proyecto", description="Vacío = noah-bot", component=self.project))
+        self.add_item(
+            discord.ui.Label(
+                text="Estado",
+                description="Se envían preguntas, mensajes leídos y respuestas.",
+                component=self.enabled,
+            )
+        )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        choice = self.enabled.values[0] if self.enabled.values else "1"
+        key = self.key.value.strip()
+        self.panel.settings.set_langsmith(
+            api_key="" if choice == "delete" else (key or None),
+            project=self.project.value or "",
+            enabled=choice != "0",
+        )
+        await self.panel.refresh(interaction)
+
+
 def _threads_list_text(guild: discord.Guild, settings: AiSettingsStore, limit: int = 15) -> str:
     lines = []
     for thread_id, data in settings.list_threads(guild.id)[:limit]:
@@ -1074,6 +1155,17 @@ class AiConfigView(discord.ui.LayoutView):
                 self._edit_limit,
             )
         )
+        if settings.langsmith_api_key:
+            source = " (desde .env)" if settings.langsmith_key_source == "env" else ""
+            langsmith = (
+                f"…{settings.langsmith_api_key[-4:]}{source} · proyecto {settings.langsmith_project} · "
+                + ("registrando" if settings.langsmith_enabled else "pausado")
+            )
+        else:
+            langsmith = "sin configurar"
+        container.add_item(
+            self._section(f"**LangSmith** (registro de llamadas)\n-# {langsmith}", "Configurar", self._edit_langsmith)
+        )
         container.add_item(discord.ui.Separator())
 
         readable = [guild.get_channel(channel_id) for channel_id in sorted(settings.readable_channels(guild.id))]
@@ -1154,6 +1246,9 @@ class AiConfigView(discord.ui.LayoutView):
 
     async def _edit_limit(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(LimitModal(self))
+
+    async def _edit_langsmith(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(LangSmithModal(self))
 
     async def _on_readable(self, interaction: discord.Interaction) -> None:
         self.settings.set_readable_channels(self.guild.id, [channel.id for channel in self._channel_select.values])

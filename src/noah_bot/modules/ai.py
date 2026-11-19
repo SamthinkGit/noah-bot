@@ -2,6 +2,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
 from noah_bot.modules.ai_settings import DEFAULT_MODEL, AiSettingsStore
+from noah_bot.modules.ai_tracing import tracing
 
 NOAH_PROMPT = """
 Eres Noah, un bot de Discord que habla como una gotica emo 2014, misa amane alike, 
@@ -86,7 +87,8 @@ class AiResponder:
             ]
         )
         chain = prompt | self.llm
-        response = chain.invoke({"input": question})
+        with tracing(self.settings, tags=["noah-comandos"]):
+            response = chain.invoke({"input": question})
         return response.content
 
     def summarize(self, text: str) -> str:
@@ -97,7 +99,8 @@ class AiResponder:
             ]
         )
         summary_chain = summary_prompt | self.llm
-        response = summary_chain.invoke({"input": text})
+        with tracing(self.settings, tags=["noah-comandos"]):
+            response = summary_chain.invoke({"input": text})
         return response.content
 
     def ask_without_filters(self, question: str) -> str:
@@ -108,5 +111,6 @@ class AiResponder:
             ]
         )
         chain = prompt | self.llm
-        response = chain.invoke({"input": question})
+        with tracing(self.settings, tags=["noah-comandos"]):
+            response = chain.invoke({"input": question})
         return response.content

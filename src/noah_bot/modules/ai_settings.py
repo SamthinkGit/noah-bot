@@ -58,7 +58,7 @@ class AiSettingsStore:
     # -- Persistencia -----------------------------------------------------------
 
     def _load(self) -> dict[str, Any]:
-        state: dict[str, Any] = {"openai": {}, "guilds": {}, "users": {}}
+        state: dict[str, Any] = {"openai": {}, "langsmith": {}, "guilds": {}, "users": {}}
         if not self.json_path.exists():
             return state
         try:
@@ -71,6 +71,8 @@ class AiSettingsStore:
         for key in state:
             if isinstance(payload.get(key), dict):
                 state[key] = payload[key]
+        # Versión anterior: marcaba modelos "sin razonamiento" para siempre por error.
+        state["openai"].pop("no_reasoning_models", None)
         return state
 
     def _save(self) -> None:
@@ -123,7 +125,6 @@ class AiSettingsStore:
 
     def set_model(self, model: str) -> None:
         self._state["openai"]["model"] = model.strip() or DEFAULT_MODEL
-        self._state["openai"].pop("no_reasoning_models", None)
         self._save()
 
     def key_status(self) -> str | None:
@@ -134,14 +135,56 @@ class AiSettingsStore:
         self._state["openai"]["key_status"] = status
         self._save()
 
-    def supports_reasoning(self, model: str) -> bool:
-        return model not in self._state["openai"].get("no_reasoning_models", [])
+    # -- LangSmith (registro de llamadas) -------------------------------------------
 
-    def mark_no_reasoning(self, model: str) -> None:
-        models = self._state["openai"].setdefault("no_reasoning_models", [])
-        if model not in models:
-            models.append(model)
-            self._save()
+    @property
+    def langsmith_api_key(self) -> str | None:
+        stored = self._state["langsmith"].get("api_key")
+        if isinstance(stored, str) and stored.strip():
+            return stored.strip()
+        for name in ("LANGSMITH_API_KEY", "LANGCHAIN_API_KEY"):
+            value = os.getenv(name)
+            if value and value.strip():
+                return value.strip()
+        return None
+
+    @property
+    def langsmith_key_source(self) -> str:
+        stored = self._state["langsmith"].get("api_key")
+        if isinstance(stored, str) and stored.strip():
+            return "config"
+        return "env" if self.langsmith_api_key else "none"
+
+    @property
+    def langsmith_project(self) -> str:
+        stored = self._state["langsmith"].get("project")
+        if isinstance(stored, str) and stored.strip():
+            return stored.strip()
+        for name in ("LANGSMITH_PROJECT", "LANGCHAIN_PROJECT"):
+            value = os.getenv(name)
+            if value and value.strip():
+                return value.strip()
+        return "noah-bot"
+
+    @property
+    def langsmith_switch(self) -> bool:
+        """Interruptor del admin (independiente de que haya key)."""
+        return bool(self._state["langsmith"].get("enabled", True))
+
+    @property
+    def langsmith_enabled(self) -> bool:
+        return bool(self.langsmith_api_key) and self.langsmith_switch
+
+    def set_langsmith(self, *, api_key: str | None = None, project: str | None = None, enabled: bool | None = None) -> None:
+        """`api_key=None` deja la key como está; `""` la borra."""
+        data = self._state["langsmith"]
+        if api_key is not None:
+            data["api_key"] = api_key.strip() or None
+        if project is not None:
+            data["project"] = project.strip() or None
+        if enabled is not None:
+            data["enabled"] = enabled
+        self._save()
 
     # -- Servidor ----------------------------------------------------------------
 

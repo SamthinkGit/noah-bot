@@ -49,6 +49,8 @@ Debes crear un fichero **`.env`** en la raíz del proyecto con el token de Disco
 DISCORD_BOT_TOKEN="YourBotToken"
 # Opcional: la API key de OpenAI también se puede poner desde `.noah ai config`
 OPENAI_API_KEY="sk-..."
+# Opcional: registrar las llamadas de IA en LangSmith (también desde `.noah ai config`)
+LANGCHAIN_API_KEY="lsv2_..."
 ```
 
 ---
@@ -82,6 +84,8 @@ de voz, con quién habla o coincide alguien en VC, etc.
   temas que puede comentar y publicar el panel.
 - `.noah ai chats` (admins): últimos chats abiertos.
 - La misma API key y modelo los usan `.noah ask`, `.noah summary` y `.noah behonest`.
+- LangSmith (opcional): con su API key, cada pregunta queda registrada con sus llamadas al
+  modelo y a las herramientas. Se envían las preguntas, los mensajes leídos y las respuestas.
 
 **Sandbox**
 - Ninguna herramienta escribe ni borra nada.
