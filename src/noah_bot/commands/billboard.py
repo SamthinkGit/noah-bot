@@ -2,8 +2,10 @@ import asyncio
 import io
 import logging
 import re
+import unicodedata
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -152,6 +154,101 @@ def _has_ended(item: dict[str, Any], now: datetime) -> bool:
     if start is None:
         return False
     return now >= start + (MOVIE_DURATION if _is_movie(item) else ANNOUNCEMENT_EXPIRE_AFTER)
+
+
+PAST_FILTERS = {
+    "hide": "Ocultar lo que ya ha pasado",
+    "show": "Mostrar también lo pasado",
+    "only": "Solo lo que ya ha pasado",
+}
+DATE_FILTERS = {
+    "any": "Cualquier fecha",
+    "today": "Hoy",
+    "week": "Próximos 7 días",
+    "month": "Próximos 30 días",
+    "last_month": "Últimos 30 días",
+}
+EXTRA_FILTERS = {
+    "no_poster": ("Sin póster ni imagen", "Para completar los que faltan"),
+    "with_attendees": ("Películas con apuntados", "Al menos una persona apuntada"),
+    "no_attendees": ("Películas sin apuntados", "Nadie apuntado todavía"),
+}
+KIND_FILTERS = {KIND_MOVIE: "Películas", KIND_ANNOUNCEMENT: "Anuncios"}
+
+
+def _fold(text: str) -> str:
+    return "".join(
+        char for char in unicodedata.normalize("NFKD", text.casefold()) if not unicodedata.combining(char)
+    )
+
+
+@dataclass(frozen=True)
+class EditorFilters:
+    """Filtros del gestor. Por defecto solo se oculta lo que ya ha pasado."""
+
+    past: str = "hide"
+    kinds: frozenset[str] = frozenset(KIND_FILTERS)
+    query: str = ""
+    when: str = "any"
+    extras: frozenset[str] = frozenset()
+
+    def is_default(self) -> bool:
+        return self == EditorFilters()
+
+    def matches(self, item: dict[str, Any], now: datetime) -> bool:
+        ended = _has_ended(item, now)
+        if (self.past == "hide" and ended) or (self.past == "only" and not ended):
+            return False
+        if str(item.get("kind") or KIND_MOVIE) not in self.kinds:
+            return False
+        if self.query:
+            haystack = _fold(f"{item.get('title') or ''} {item.get('description') or ''}")
+            if _fold(self.query) not in haystack:
+                return False
+        if self.when != "any":
+            start = item_start(item)
+            if start is None:
+                return False
+            day = _local(start).date()
+            today = _local(now).date()
+            ranges = {
+                "today": (today, today),
+                "week": (today, today + timedelta(days=6)),
+                "month": (today, today + timedelta(days=29)),
+                "last_month": (today - timedelta(days=30), today),
+            }
+            first, last = ranges[self.when]
+            if not first <= day <= last:
+                return False
+        if "no_poster" in self.extras and item.get("poster"):
+            return False
+        attendees = len(item_attendees(item)) if _is_movie(item) else None
+        if "with_attendees" in self.extras and not attendees:
+            return False
+        if "no_attendees" in self.extras and (attendees is None or attendees > 0):
+            return False
+        return True
+
+    def summary(self) -> str:
+        parts = []
+        if self.past != "show":
+            parts.append("ocultando lo pasado" if self.past == "hide" else "solo lo pasado")
+        if self.kinds != frozenset(KIND_FILTERS):
+            parts.append("solo " + " y ".join(KIND_FILTERS[kind].lower() for kind in KIND_FILTERS if kind in self.kinds))
+        if self.when != "any":
+            parts.append(DATE_FILTERS[self.when].lower())
+        if self.query:
+            parts.append(f"«{discord.utils.escape_markdown(self.query)}»")
+        parts.extend(EXTRA_FILTERS[key][0].lower() for key in EXTRA_FILTERS if key in self.extras)
+        return " · ".join(parts) if parts else "sin filtros"
+
+
+# Filtros de cada editor (por servidor y persona). Se olvidan al reiniciar el bot.
+_editor_filters: dict[tuple[int, int], EditorFilters] = {}
+
+
+def _filters_for(guild_id: int, user_id: int) -> EditorFilters:
+    return _editor_filters.get((guild_id, user_id), EditorFilters())
 
 
 def _editor_order(items: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
@@ -810,14 +907,29 @@ def _editor_line(item: dict[str, Any]) -> str:
     return f"📢 {when}**{title}**"
 
 
-def _editor_embed(store: BillboardStore, guild: discord.Guild) -> discord.Embed:
-    items = _editor_order(store.list_items(guild.id), _now())
-    lines = [_editor_line(item) for item in items[:SELECT_LIMIT]]
+def _editor_items(
+    store: BillboardStore, guild: discord.Guild, author_id: int
+) -> tuple[list[dict[str, Any]], int]:
+    """Elementos que pasan los filtros de quien edita, y el total sin filtrar."""
+    now = _now()
+    all_items = store.list_items(guild.id)
+    filters = _filters_for(guild.id, author_id)
+    items = [item for item in _editor_order(all_items, now) if filters.matches(item, now)]
+    return items, len(all_items)
+
+
+def _editor_embed(store: BillboardStore, guild: discord.Guild, author_id: int) -> discord.Embed:
+    items, total = _editor_items(store, guild, author_id)
+    filters = _filters_for(guild.id, author_id)
+    lines = [f"-# 🔎 Filtros: {filters.summary()} · {len(items)} de {total}"]
+    lines.extend(_editor_line(item) for item in items[:SELECT_LIMIT])
     if len(items) > SELECT_LIMIT:
-        lines.append(f"…y {len(items) - SELECT_LIMIT} más")
+        lines.append(f"…y {len(items) - SELECT_LIMIT} más (usa los filtros para encontrarlos)")
+    if not items:
+        lines.append("_Nada cumple los filtros._" if total else "_La cartelera está vacía._")
     embed = discord.Embed(
         title="🛠️ Gestor de la cartelera",
-        description="\n".join(lines) or "_La cartelera está vacía._",
+        description="\n".join(lines),
         color=BILLBOARD_COLOR,
     )
     embed.set_footer(
@@ -836,7 +948,7 @@ async def _show_editor(
     await _respond_edit(
         interaction,
         content=content,
-        embed=_editor_embed(store, guild),
+        embed=_editor_embed(store, guild, author_id),
         view=EditorView(store, guild, author_id),
         attachments=[],
     )
@@ -898,7 +1010,13 @@ class _EditorBaseView(discord.ui.View):
 class EditorView(_EditorBaseView):
     def __init__(self, store: BillboardStore, guild: discord.Guild, author_id: int) -> None:
         super().__init__(guild, author_id)
-        items = _editor_order(store.list_items(guild.id), _now())[:SELECT_LIMIT]
+        items = _editor_items(store, guild, author_id)[0][:SELECT_LIMIT]
+        filters = _filters_for(guild.id, author_id)
+        self.filters_button.style = (
+            discord.ButtonStyle.secondary if filters.is_default() else discord.ButtonStyle.primary
+        )
+        if filters.is_default():
+            self.remove_item(self.reset_filters)
         if items:
             options = []
             for item in items:
@@ -946,6 +1064,23 @@ class EditorView(_EditorBaseView):
             ItemModal(self.guild, self.author_id, KIND_ANNOUNCEMENT)
         )
 
+    @discord.ui.button(label="Filtros", emoji="🔎", style=discord.ButtonStyle.secondary, row=0)
+    async def filters_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        _ = button
+        await interaction.response.send_modal(
+            FiltersModal(self.guild, self.author_id, _filters_for(self.guild.id, self.author_id))
+        )
+
+    @discord.ui.button(label="Quitar filtros", style=discord.ButtonStyle.secondary, row=0)
+    async def reset_filters(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        _ = button
+        _editor_filters.pop((self.guild.id, self.author_id), None)
+        await _show_editor(interaction, self.guild, self.author_id)
+
     @discord.ui.button(label="Cerrar", style=discord.ButtonStyle.secondary, row=0)
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         _ = button
@@ -953,6 +1088,80 @@ class EditorView(_EditorBaseView):
         await interaction.response.defer()
         with suppress(discord.HTTPException):
             await interaction.delete_original_response()
+
+
+class FiltersModal(discord.ui.Modal, title="Filtros del gestor"):
+    def __init__(self, guild: discord.Guild, author_id: int, current: EditorFilters) -> None:
+        super().__init__(timeout=600)
+        self.guild = guild
+        self.author_id = author_id
+        self.past_select: discord.ui.Select[Any] = discord.ui.Select(
+            options=[
+                discord.SelectOption(label=label, value=key, default=key == current.past)
+                for key, label in PAST_FILTERS.items()
+            ],
+            min_values=1,
+            max_values=1,
+        )
+        self.kind_select: discord.ui.Select[Any] = discord.ui.Select(
+            options=[
+                discord.SelectOption(
+                    label=label, value=key, emoji="🎬" if key == KIND_MOVIE else "📢", default=key in current.kinds
+                )
+                for key, label in KIND_FILTERS.items()
+            ],
+            min_values=1,
+            max_values=len(KIND_FILTERS),
+        )
+        self.query_input = discord.ui.TextInput(
+            required=False, max_length=100, default=current.query or None, placeholder="Dune, Halloween…"
+        )
+        self.when_select: discord.ui.Select[Any] = discord.ui.Select(
+            options=[
+                discord.SelectOption(label=label, value=key, default=key == current.when)
+                for key, label in DATE_FILTERS.items()
+            ],
+            min_values=1,
+            max_values=1,
+        )
+        self.extra_select: discord.ui.Select[Any] = discord.ui.Select(
+            placeholder="Ninguno",
+            options=[
+                discord.SelectOption(label=label, value=key, description=description, default=key in current.extras)
+                for key, (label, description) in EXTRA_FILTERS.items()
+            ],
+            min_values=0,
+            max_values=len(EXTRA_FILTERS),
+            required=False,
+        )
+        self.add_item(discord.ui.Label(text="Lo que ya ha pasado", component=self.past_select))
+        self.add_item(discord.ui.Label(text="Qué mostrar", component=self.kind_select))
+        self.add_item(
+            discord.ui.Label(
+                text="Buscar",
+                description="En el título o la descripción. Vacío = todo.",
+                component=self.query_input,
+            )
+        )
+        self.add_item(discord.ui.Label(text="Fecha", component=self.when_select))
+        self.add_item(discord.ui.Label(text="Otros filtros", component=self.extra_select))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        filters = EditorFilters(
+            past=self.past_select.values[0] if self.past_select.values else "hide",
+            kinds=frozenset(self.kind_select.values) or frozenset(KIND_FILTERS),
+            query=(self.query_input.value or "").strip(),
+            when=self.when_select.values[0] if self.when_select.values else "any",
+            extras=frozenset(self.extra_select.values),
+        )
+        if filters.is_default():
+            _editor_filters.pop((self.guild.id, self.author_id), None)
+        else:
+            _editor_filters[(self.guild.id, self.author_id)] = filters
+        await _show_editor(interaction, self.guild, self.author_id)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await _modal_error(interaction, error)
 
 
 class ItemManageView(_EditorBaseView):
@@ -1528,7 +1737,7 @@ async def _open_editor(interaction: discord.Interaction) -> bool:
         return False
 
     await interaction.response.send_message(
-        embed=_editor_embed(store, guild),
+        embed=_editor_embed(store, guild, interaction.user.id),
         view=EditorView(store, guild, interaction.user.id),
         ephemeral=True,
     )
