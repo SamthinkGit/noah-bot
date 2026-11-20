@@ -948,21 +948,121 @@ async def tool_conversacion(ctx: ToolContext, args: dict[str, Any], step: Step) 
     )
 
 
+def _staff(guild: discord.Guild) -> tuple[list[discord.Member], list[discord.Member]]:
+    admins, mods = [], []
+    for member in guild.members:
+        if member.bot:
+            continue
+        permissions = member.guild_permissions
+        if permissions.administrator:
+            admins.append(member)
+        elif permissions.manage_messages or permissions.kick_members or permissions.ban_members or permissions.moderate_members:
+            mods.append(member)
+    return admins, mods
+
+
 async def tool_info_servidor(ctx: ToolContext, args: dict[str, Any], step: Step) -> ToolOutcome:
     await step.running("Consultando la información del servidor…")
     guild = ctx.guild
     humans = sum(1 for member in guild.members if not member.bot)
+    admins, mods = _staff(guild)
+    staff_roles = [
+        role.name
+        for role in reversed(guild.roles)
+        if not role.is_default() and not role.managed
+        and (role.permissions.administrator or role.permissions.manage_messages or role.permissions.kick_members)
+    ]
     lines = [
         f"Servidor: {guild.name}",
-        f"Creado: {_fmt_dt(guild.created_at)}",
-        f"Miembros: {guild.member_count} ({humans} personas, {guild.member_count - humans if guild.member_count else 0} bots)",
-        f"Nivel de boost: {guild.premium_tier} ({guild.premium_subscription_count} boosts)",
-        f"Ahora en voz: {sum(len(channel.members) for channel in guild.voice_channels)} personas",
+        "Administrador principal y creador de Noah: Samthink.",
     ]
-    newest = sorted((member for member in guild.members if member.joined_at), key=lambda member: member.joined_at, reverse=True)[:5]
-    if newest:
-        lines.append("Últimos en entrar: " + ", ".join(f"{_name(member)} ({_fmt_dt(member.joined_at)})" for member in newest))
+    if guild.description:
+        lines.append(f"Descripción: {_clip(guild.description, 300)}")
+    if guild.owner:
+        lines.append(f"Dueño del servidor: {_name(guild.owner)}")
+    lines.append("Admins: " + (", ".join(_name(member) for member in admins[:15]) or "ninguno"))
+    if mods:
+        lines.append("Moderadores: " + ", ".join(_name(member) for member in mods[:15]))
+    if staff_roles:
+        lines.append("Roles de staff: " + ", ".join(staff_roles[:10]))
+    lines += [
+        f"Creado: {_fmt_dt(guild.created_at)}",
+        f"Miembros: {guild.member_count} ({humans} personas)",
+        f"Nivel de boost: {guild.premium_tier} ({guild.premium_subscription_count} boosts)",
+    ]
+    rules = _rules_channel(ctx)
+    if rules is not None:
+        lines.append(f"Canal de normas: #{rules.name} (léelo con la herramienta normas)")
+
+    # Canales que ve quien pregunta (los nombres no son secretos para él).
+    lines.append("\nCanales que ve quien pregunta (✓ = Noah puede leerlos):")
+    shown = 0
+    for category, channels in guild.by_category():
+        visible = [
+            channel for channel in channels
+            if not isinstance(channel, discord.CategoryChannel)
+            and (ctx.is_admin or channel.permissions_for(ctx.asker).view_channel)
+        ]
+        if not visible:
+            continue
+        names = []
+        for channel in visible:
+            kind = "🔊" if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)) else "#"
+            names.append(f"{kind}{channel.name}{' ✓' if can_read(ctx, channel) else ''}")
+        lines.append(f"- {category.name if category else 'Sin categoría'}: {', '.join(names)}")
+        shown += len(visible)
+        if shown >= 80:
+            lines.append("- …y más canales")
+            break
+
+    if ctx.allows("servidor"):
+        newest = sorted((member for member in guild.members if member.joined_at), key=lambda member: member.joined_at, reverse=True)[:5]
+        if newest:
+            lines.append("Últimos en entrar: " + ", ".join(f"{_name(member)} ({_fmt_dt(member.joined_at)})" for member in newest))
+        lines.append(f"Ahora en voz: {sum(len(channel.members) for channel in guild.voice_channels)} personas")
     return ToolOutcome("\n".join(lines), "Consultada la información del servidor")
+
+
+RULES_NAMES = ("norma", "regla", "rules", "reglamento")
+
+
+def _rules_channel(ctx: ToolContext) -> Any:
+    """Canal de normas: el oficial del servidor o uno que se llame así. Solo si quien pregunta lo ve."""
+    candidates = []
+    if ctx.guild.rules_channel is not None:
+        candidates.append(ctx.guild.rules_channel)
+    candidates += [
+        channel for channel in ctx.guild.text_channels if any(word in _norm(channel.name) for word in RULES_NAMES)
+    ]
+    for channel in candidates:
+        if not bot_can_read(channel):
+            continue
+        if ctx.is_admin or channel.permissions_for(ctx.asker).view_channel:
+            return channel
+    return None
+
+
+async def tool_normas(ctx: ToolContext, args: dict[str, Any], step: Step) -> ToolOutcome:
+    channel = _rules_channel(ctx)
+    if channel is None:
+        return ToolOutcome("No encuentro un canal de normas en el servidor.", "Sin canal de normas")
+    await step.running(f"Leyendo las normas en {channel.mention}…")
+    parts: list[str] = []
+    with suppress(discord.HTTPException):
+        async for message in channel.history(limit=40, oldest_first=True):
+            text = message.clean_content.strip()
+            for embed in message.embeds:
+                text += "\n" + "\n".join(part for part in (embed.title, embed.description) if part)
+                for embed_field in embed.fields:
+                    text += f"\n{embed_field.name}: {embed_field.value}"
+            if text.strip():
+                parts.append(_clip(text, 2500))
+    if not parts:
+        return ToolOutcome(f"#{channel.name} está vacío.", f"Sin normas en {channel.mention}")
+    return ToolOutcome(
+        _join_limited(parts, f"Normas del servidor (#{channel.name}):\n"),
+        f"Leídas las normas en {channel.mention}",
+    )
 
 
 async def tool_companeros_voz(ctx: ToolContext, args: dict[str, Any], step: Step) -> ToolOutcome:
@@ -1274,7 +1374,8 @@ TOOLS: list[ToolSpec] = [
         "Leyendo conversación…",
         topics=("relaciones",),
     ),
-    ToolSpec("info_servidor", "Datos generales del servidor: miembros, boosts, últimos en entrar.", _obj({}), tool_info_servidor, "Consultando servidor…", topics=("servidor",)),
+    ToolSpec("info_servidor", "Información básica del servidor: quién es el admin y el staff, qué canales hay, canal de normas, miembros y boosts.", _obj({}), tool_info_servidor, "Consultando servidor…"),
+    ToolSpec("normas", "Lee las normas del servidor (canal de normas).", _obj({}), tool_normas, "Leyendo normas…"),
     ToolSpec("companeros_voz", "Con quién coincide más un miembro en los canales de voz y cuánto tiempo.", _obj({"usuario": USER_PARAM}, ["usuario"]), tool_companeros_voz, "Mirando coincidencias en voz…", topics=("voz_companeros",)),
     ToolSpec(
         "info_noah",

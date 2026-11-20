@@ -32,7 +32,7 @@ TOPICS: dict[str, tuple[str, str]] = {
     "presentaciones": ("Presentaciones", "Si alguien se ha presentado y qué dijo"),
     "perfiles": ("Perfiles", "Fecha de entrada, roles y antigüedad de la cuenta"),
     "confesiones": ("Confesiones", "Opinar sobre quién pudo escribir una confesión"),
-    "servidor": ("Datos del servidor", "Miembros, boosts y últimos en entrar"),
+    "servidor": ("Actividad del servidor", "Últimos en entrar y gente en voz ahora"),
 }
 
 
