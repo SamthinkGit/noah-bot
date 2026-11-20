@@ -173,8 +173,8 @@ class ThinkToggle(discord.ui.DynamicItem[discord.ui.Button], template=r"noah:ai:
     def __init__(self, expanded: bool) -> None:
         super().__init__(
             discord.ui.Button(
-                label="Razonamiento",
-                emoji="▾" if expanded else "▸",
+                # ▸/▾ no son emojis válidos para Discord: van en el texto, no como emoji.
+                label=("▾ " if expanded else "▸ ") + "Razonamiento",
                 style=discord.ButtonStyle.secondary,
                 custom_id=f"noah:ai:think:{int(expanded)}",
             )
@@ -221,7 +221,7 @@ class ProgressCard:
     def mark_edited(self) -> None:
         self._last_edit = time.monotonic()
 
-    def render(self) -> discord.ui.LayoutView:
+    def render(self, safe: bool = False) -> discord.ui.LayoutView:
         view = discord.ui.LayoutView(timeout=None)
         container = discord.ui.Container(accent_color=DANGER_COLOR if self.error else AI_COLOR)
 
@@ -234,7 +234,7 @@ class ProgressCard:
             lines.append(f"{noah_ai_emojis.dot('ok')} Respondido sin consultar el servidor")
         container.add_item(discord.ui.TextDisplay(_clip("\n".join(lines), 1200)))
 
-        if self.reasoning and self.show_reasoning:
+        if self.reasoning and self.show_reasoning and not safe:
             row: discord.ui.ActionRow[Any] = discord.ui.ActionRow()
             row.add_item(ThinkToggle(self.expanded))
             container.add_item(row)
@@ -275,7 +275,14 @@ class ProgressCard:
     async def _edit(self) -> None:
         assert self.message is not None
         self.mark_edited()
-        await self.message.edit(view=self.render(), allowed_mentions=NONE)
+        try:
+            await self.message.edit(view=self.render(), allowed_mentions=NONE)
+        except discord.HTTPException as error:
+            if error.status != 400:
+                raise
+            # Discord rechaza algo de la tarjeta: se manda sin botones para no quedarse colgada.
+            _log.warning("Discord ha rechazado la tarjeta de Noah AI, se envía sin botones: %s", error)
+            await self.message.edit(view=self.render(safe=True), allowed_mentions=NONE)
 
     async def _flush_loop(self) -> None:
         """Un único bucle de edición: repite mientras quede algún cambio sin enviar."""
