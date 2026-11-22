@@ -26,8 +26,15 @@ from noah_bot.commands.waifu import register_waifu_commands
 from noah_bot.modules.bot_context import get_bot_context
 from noah_bot.modules.daily_stats import overlap_seconds_for_current_day
 from noah_bot.modules.dice import build_d20_embed
+from noah_bot.modules.help_ui import (
+    HelpEntry,
+    HelpModule,
+    HelpSection,
+    build_index_view,
+    install_help_buttons,
+    register_help,
+)
 from noah_bot.modules.discord_formatter import (
-    EmbedTable,
     RARITY_COLORS,
     RARITY_DISPLAY,
     RARITY_SYMBOLS,
@@ -235,46 +242,59 @@ def _build_noah_command_stats_embed(bot: commands.Bot) -> discord.Embed:
     return embed
 
 
-NOAH_HELP_ROWS: list[tuple[str, str]] = [
-    ('.noah ask <question>', 'Ask a question to Noah AI.'),
-    ('.noah ai help', 'Chat privado con Noah AI y su configuración.'),
-    ('.noah summary', 'Summarize recent channel messages.'),
-    ('.noah behonest <question>', 'Ask Noah without filters.'),
-    ('.noah quote <user>', 'Quote the replied message in a styled embed.'),
-    ('.noah merge', 'Render all images from a replied message.'),
-    ('.noah if <type>', 'Invert embed rarity symbol and color.'),
-    ('.noah ping', 'Check if Noah is responsive.'),
-    ('.noah d20', 'Tira un d20 y muestra el resultado estilo D&D.'),
-    ('.noah areyouok', 'Muestra el total de comandos y por categoria.'),
-    ('.noah monitor help', 'Consumo de Noah (CPU, RAM, disco) y estadísticas de uso.'),
-    ('.noah kill', 'Stop the bot process immediately.'),
-    ('.noah help', 'Show Noah AI commands.'),
-    ('.noah daily', 'Resumen diario del servidor.'),
-    ('.noah daily -user @user', 'Resumen diario de un usuario.'),
-    ('.noah autogami help', 'Show Autogami sync commands.'),
-    ('.noah vc help', 'Show voice stats commands.'),
-    ('.noah spotify help', 'Muestra los comandos de Spotify.'),
-    ('.noah presentations', 'Obliga a presentarse (solo admins).'),
-    ('.noah mute', 'Mutea a todos en tu VC menos a ti (solo admins).'),
-    ('.noah unmute', 'Desmutea a todos en tu VC (solo admins).'),
-    ('.noah guard help', 'Protocolo de contingencia ante raids (solo staff).'),
-    ('.noah rrpp help', 'Mensajes con aviso a los RRPP (solo admins).'),
-    ('.noah confess help', 'Confesiones totalmente anónimas.'),
-    ('.noah billboard help', 'Cartelera de pelis del server.'),
-    ('.noah sports help', 'Quedadas para hacer deporte (con mapa y plazas).'),
-    ('.noah council help', 'Consejo oculto con votos anónimos (solo admins).'),
-    ('.waifuracer setemoji <emoji>', 'Set your claim reaction emoji.'),
-    ('.waifuracer help', 'Show waifuracer commands.'),
-    ('.noah waifu help', 'Show waifu battle commands'),
-    ('.steallist help', 'Show steallist commands.'),
-]
+HELP = register_help(
+    HelpModule(
+        key="general",
+        emoji="⚙️",
+        name="General",
+        summary="Comandos sueltos: ping, dados, resumen diario, IA rápida y citas",
+        description="Comandos sueltos de Noah. Los módulos grandes tienen su propio `help`.",
+        sections=(
+            HelpSection(
+                "Básicos",
+                (
+                    HelpEntry(".noah ping", "Comprueba si Noah responde."),
+                    HelpEntry(".noah d20", "Tira un d20 estilo D&D."),
+                    HelpEntry(".noah daily [-user @user]", "Resumen del día del servidor (o de alguien)."),
+                    HelpEntry(".noah areyouok", "Cuántos comandos tiene Noah por módulo."),
+                    HelpEntry(".jarvis <mensaje>", "Clip de Jarvis diciendo tu mensaje."),
+                ),
+            ),
+            HelpSection(
+                "IA rápida",
+                (
+                    HelpEntry(".noah ask <pregunta>", "Pregunta rápida a Noah."),
+                    HelpEntry(".noah summary", "Resume los últimos 100 mensajes del canal."),
+                    HelpEntry(".noah behonest <pregunta>", "Pregunta a Noah sin filtros."),
+                ),
+            ),
+            HelpSection(
+                "Mensajes",
+                (
+                    HelpEntry(".noah quote @user", "Respondiendo a un mensaje: lo cita en un embed con votos."),
+                    HelpEntry(".noah merge", "Respondiendo a un mensaje: junta las imágenes de sus embeds."),
+                    HelpEntry(".noah if <rareza>", "Respondiendo a un embed: le cambia la rareza y el color."),
+                ),
+            ),
+            HelpSection(
+                "Staff",
+                (
+                    HelpEntry(".noah mute · .noah unmute", "Mutea o desmutea a todos en tu VC menos a ti."),
+                    HelpEntry(".noah setlist @user ...", "Deja el rol Lista solo a los mencionados."),
+                    HelpEntry(".noah kill", "Apaga Noah al momento."),
+                ),
+                staff=True,
+            ),
+        ),
+    )
+)
 
 
 def register_noah_commands(bot: commands.Bot) -> None:
     @bot.group()
     async def noah(ctx: commands.Context) -> None:
         if ctx.invoked_subcommand is None:
-            await ctx.send("Use `.noah help` to see commands.")
+            await ctx.send(view=build_index_view(0, ctx.author.id))
 
     @noah.command()
     async def ping(ctx: commands.Context) -> None:
@@ -297,11 +317,11 @@ def register_noah_commands(bot: commands.Bot) -> None:
 
     @noah.command()
     async def help(ctx: commands.Context) -> None:
-        chart = EmbedTable(headers=["Command", "Description"], title="Noah AI Commands")
-        for row in NOAH_HELP_ROWS:
-            chart.add_row(list(row))
+        await ctx.send(view=build_index_view(0, ctx.author.id))
 
-        await ctx.send(embed=chart.render())
+    @bot.listen("on_ready")
+    async def _install_help_buttons() -> None:
+        install_help_buttons(bot)
 
     @noah.command()
     async def daily(ctx: commands.Context, *, args: str = "") -> None:

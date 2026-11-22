@@ -4,8 +4,41 @@ import discord
 from discord.ext import commands
 
 from noah_bot.modules.bot_context import get_bot_context
-from noah_bot.modules.discord_formatter import DiscordChart, EmbedTable
+from noah_bot.modules.discord_formatter import DiscordChart
 from noah_bot.modules.leaderboard import generate_date
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
+
+
+HELP = register_help(
+    HelpModule(
+        key="waifuracer",
+        emoji="⏱️",
+        name="Waifuracer",
+        summary="Cronometra cuánto tardas en claimear y guarda récords",
+        description="Mide el tiempo entre que aparece una waifu y la claimeas, y guarda los récords. Alias `.wfr`.",
+        sections=(
+            HelpSection(
+                "Cronómetro",
+                (
+                    HelpEntry(".timeit", "Empieza un cronómetro (alias `.ti`)."),
+                    HelpEntry(".claim", "Lo para y enseña el resultado."),
+                    HelpEntry(".waifuracer elapsed", "Tiempo desde el último `.timeit`."),
+                    HelpEntry(".waifuracer predict", "Predice cuándo aparecerá la próxima waifu."),
+                    HelpEntry(".waifuracer setemoji <emoji>", "Tu emoji de reacción al claimear."),
+                ),
+            ),
+            HelpSection(
+                "Récords",
+                (
+                    HelpEntry(".waifuracer add @user <tiempo> [-tag tag]", "Añade un récord."),
+                    HelpEntry(".waifuracer remove <id>", "Borra un récord por ID."),
+                    HelpEntry(".waifuracer top [-user @user]", "Los 20 mejores (opcionalmente de alguien)."),
+                    HelpEntry(".waifuracer latest [-user @user]", "Los 20 últimos (opcionalmente de alguien)."),
+                ),
+            ),
+        ),
+    )
+)
 
 
 def register_waifuracer_commands(bot: commands.Bot) -> None:
@@ -16,34 +49,7 @@ def register_waifuracer_commands(bot: commands.Bot) -> None:
 
     @waifuracer.command()
     async def help(ctx: commands.Context) -> None:
-        chart = EmbedTable(
-            headers=["Command", "Description"], title="Waifuracer Commands"
-        )
-        chart.add_row(
-            [".waifuracer add @user <time> [-tag tag]", "Add a new time record."]
-        )
-        chart.add_row([".waifuracer remove <id>", "Remove a time record by ID."])
-        chart.add_row(
-            [
-                ".waifuracer top [-user @user]",
-                "Show top 20 records (optionally by user).",
-            ]
-        )
-        chart.add_row(
-            [
-                ".waifuracer latest [-user @user]",
-                "Show latest 20 records (optionally by user).",
-            ]
-        )
-        chart.add_row([".waifuracer elapsed", "Show elapsed time since last .timeit"])
-        chart.add_row([".waifuracer predict", "Predict next waifu appearance time."])
-        chart.add_row(
-            [".waifuracer setemoji <emoji>", "Set your claim reaction emoji."]
-        )
-        chart.add_row([".timeit", "Start a waifuracer timer."])
-        chart.add_row([".claim", "Stop timer and show result."])
-
-        await ctx.send(embed=chart.render())
+        await send_help(ctx, "waifuracer")
 
     @waifuracer.command()
     async def elapsed(ctx: commands.Context) -> None:

@@ -9,6 +9,7 @@ from discord.ext import commands
 from noah_bot.modules.bot_context import get_bot_context, is_guard_active
 from noah_bot.modules.discord_formatter import build_quote_text_embed
 from noah_bot.modules.presentations import PresentationsStore
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 PRESENTATION_STICKY_BUTTON_ID = "presentations:sticky:introduce"
 PRESENTATION_STICKY_REPOST_DELAY = 2.0
@@ -64,57 +65,39 @@ def _is_presentation_channel(channel: discord.abc.Messageable, channel_id: int) 
     return getattr(channel, "parent_id", None) == channel_id
 
 
-def _build_presentations_help_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="Presentaciones",
-        description=(
-            "Obliga a los usuarios a presentarse antes de hablar en otros canales. "
-            "Solo administradores."
+HELP = register_help(
+    HelpModule(
+        key="presentations",
+        emoji="👋",
+        name="Presentaciones",
+        summary="Obliga a presentarse antes de hablar en otros canales",
+        description="Los usuarios tienen que presentarse antes de poder hablar en otros canales.",
+        sections=(
+            HelpSection(
+                "Para todos",
+                (HelpEntry(".noah presentations show [@user]", "Muestra la presentación de alguien (o la tuya)."),),
+            ),
+            HelpSection(
+                "Configuración",
+                (
+                    HelpEntry(
+                        ".noah presentations setchannel <#canal>",
+                        "Canal de presentaciones. Revisa su historial y marca como presentados a quienes ya escribieron.",
+                    ),
+                    HelpEntry(".noah presentations complete <@user>", "Marca a alguien como presentado."),
+                    HelpEntry(".noah presentations enable / disable", "Activa o desactiva la obligación."),
+                    HelpEntry(
+                        ".noah presentations sticky on / off",
+                        "Deja al final del canal un mensaje con un botón que enseña la plantilla.",
+                    ),
+                    HelpEntry(".noah presentations status", "Configuración actual."),
+                    HelpEntry(".noah presentations list", "Quién se ha presentado y quién falta."),
+                ),
+                staff=True,
+            ),
         ),
-        color=discord.Color.blurple(),
     )
-    embed.add_field(
-        name=".noah presentations setchannel <#canal>",
-        value=(
-            "Configura el canal de presentaciones. Revisa su historial y marca como "
-            "presentados a todos los que ya escribieron allí."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah presentations complete <@user>",
-        value="Marca manualmente a un usuario como presentado.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah presentations enable / disable",
-        value="Activa o desactiva la obligación de presentarse.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah presentations sticky on / off",
-        value=(
-            "Deja siempre al final del canal de presentaciones un mensaje con un botón "
-            "que enseña a presentarse con la plantilla."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah presentations status",
-        value="Muestra la configuración actual.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah presentations list",
-        value="Muestra quién se ha presentado ya y quién falta por presentarse.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah presentations show [@user]",
-        value="Muestra la presentación de alguien (o la tuya). Disponible para todos.",
-        inline=False,
-    )
-    return embed
+)
 
 
 def _format_member_list(members: list[discord.Member]) -> tuple[str, bool]:
@@ -494,11 +477,11 @@ def register_presentations_commands(bot: commands.Bot, noah_group: commands.Grou
     @noah_group.group()
     async def presentations(ctx: commands.Context) -> None:
         if ctx.invoked_subcommand is None:
-            await ctx.send(embed=_build_presentations_help_embed())
+            await send_help(ctx, "presentations")
 
     @presentations.command()
     async def help(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_presentations_help_embed())
+        await send_help(ctx, "presentations")
 
     async def _check_admin(ctx: commands.Context) -> bool:
         if ctx.guild is None:
@@ -759,7 +742,7 @@ def register_presentations_commands(bot: commands.Bot, noah_group: commands.Grou
         error: commands.CommandError,
     ) -> None:
         if isinstance(error, commands.MissingRequiredArgument):
-            await ctx.send(embed=_build_presentations_help_embed())
+            await send_help(ctx, "presentations")
             return
 
         if isinstance(error, (commands.ChannelNotFound, commands.MemberNotFound)):

@@ -49,6 +49,7 @@ from noah_bot.modules.council import (
     tally,
     winners,
 )
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 _log = logging.getLogger(__name__)
 
@@ -2221,43 +2222,48 @@ class CouncilConfigView(discord.ui.LayoutView):
                 )
 
 
-def _help_view() -> discord.ui.LayoutView:
-    box = _box()
-    box.add_item(
-        _text(
-            "## 📌 Consejo\n"
-            f"-# Canal oculto ({CHANNEL_NAME}) para que el consejo decida en privado. Existe "
-            "siempre, pero entre consejos está vacío y solo lo ven los admins."
-        )
+HELP = register_help(
+    HelpModule(
+        key="council",
+        emoji="📌",
+        name="Consejo",
+        summary="Canal oculto con votaciones anónimas y actas",
+        description=(
+            f"Canal oculto ({CHANNEL_NAME}) para que el consejo decida en privado. Existe siempre, pero "
+            "entre consejos está vacío y solo lo ven los admins."
+        ),
+        staff=True,
+        sections=(
+            HelpSection(
+                "Comandos",
+                (
+                    HelpEntry(
+                        ".noah council init",
+                        "Consola privada para empezar: tema, descripción y a quién excluir (implicados que no "
+                        "deben ver el canal aunque estén en el consejo).",
+                    ),
+                    HelpEntry(
+                        ".noah council poll",
+                        "Votación de 2 a 4 opciones. Un voto por persona, anónimo y corregible mientras esté "
+                        "abierta. Resultados en directo u ocultos hasta cerrar; con 🔍 Votos los admins ven quién votó qué.",
+                    ),
+                    HelpEntry(".noah council meet", "Deja entrar al rol del consejo y le avisa con una mención."),
+                    HelpEntry(
+                        ".noah council exclude",
+                        "Excluye o readmite gente en cualquier momento (sus votos abiertos se anulan).",
+                    ),
+                    HelpEntry(
+                        ".noah council finish",
+                        "Cierra los polls, envía el acta (con la conversación en un .txt), borra los mensajes y "
+                        "vuelve a ocultar el canal.",
+                    ),
+                    HelpEntry(".noah council config", "Rol del consejo, canal del consejo y canal de actas."),
+                ),
+            ),
+        ),
+        note="El mensaje fijado del canal trae botones para lo mismo.",
     )
-    box.add_item(_sep())
-    box.add_item(
-        _text(
-            "**`.noah council init`**\n"
-            "Consola privada para empezar: tema, descripción y a quién excluir (implicados que "
-            "no deben ver el canal aunque estén en el consejo).\n\n"
-            "**`.noah council poll`**\n"
-            "Votación de 2 a 4 opciones. Un voto por persona, anónimo y corregible mientras "
-            "esté abierta. Resultados en directo u ocultos hasta cerrar; con 🔍 Votos los "
-            "admins ven quién votó qué.\n\n"
-            "**`.noah council meet`**\n"
-            "Deja entrar al rol del consejo y le avisa con una mención.\n\n"
-            "**`.noah council exclude`**\n"
-            "Excluye o readmite gente en cualquier momento (sus votos abiertos se anulan).\n\n"
-            "**`.noah council finish`**\n"
-            "Cierra los polls, envía el acta (con la conversación en un .txt), borra todos los "
-            "mensajes y vuelve a ocultar el canal.\n\n"
-            "**`.noah council config`**\n"
-            "Rol del consejo, canal del consejo y canal de actas."
-        )
-    )
-    box.add_item(_sep())
-    box.add_item(
-        _text("-# Todo es solo para admins. El mensaje fijado del canal trae botones para lo mismo.")
-    )
-    view = discord.ui.LayoutView()
-    view.add_item(box)
-    return view
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2315,11 +2321,11 @@ def register_council_commands(bot: commands.Bot, noah_group: commands.Group) -> 
 
     @noah_group.group(name="council", invoke_without_command=True)
     async def council(ctx: commands.Context) -> None:
-        await ctx.send(view=_help_view())
+        await send_help(ctx, "council")
 
     @council.command(name="help")
     async def council_help(ctx: commands.Context) -> None:
-        await ctx.send(view=_help_view())
+        await send_help(ctx, "council")
 
     @council.command(name="config")
     async def council_config(ctx: commands.Context) -> None:

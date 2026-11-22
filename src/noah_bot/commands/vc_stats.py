@@ -6,6 +6,7 @@ from discord.ext import commands, tasks
 from noah_bot.modules.bot_context import get_bot_context
 from noah_bot.modules.daily_stats import overlap_seconds_for_current_day
 from noah_bot.modules.discord_formatter import EmbedTable
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 
 def _format_minutes(total_minutes: int) -> str:
@@ -123,6 +124,40 @@ def _voice_rooms(bot: commands.Bot) -> dict[int, list[list[int]]]:
     return rooms
 
 
+HELP = register_help(
+    HelpModule(
+        key="vc",
+        emoji="🎙️",
+        name="Voz",
+        summary="Tiempo en voz, rankings y niveles",
+        description="Noah cuenta el tiempo que pasas en los canales de voz y sube de nivel a quien más está.",
+        sections=(
+            HelpSection(
+                "Tus stats",
+                (
+                    HelpEntry(".noah vc summary [@user]", "Resumen visual de tus stats de voz (o de otro)."),
+                    HelpEntry(".noah vc stats [@user]", "Tus stats de voz (o las de otro)."),
+                    HelpEntry(".noah vc top", "Ranking de tiempo en voz."),
+                    HelpEntry(".noah vc active", "Quién está conectado ahora mismo."),
+                    HelpEntry(".noah vc alerttype <montadito|noah>", "Tu estilo de alerta de nivel."),
+                ),
+            ),
+            HelpSection(
+                "Configuración",
+                (
+                    HelpEntry(".noah vc setminutes @user <minutos>", "Fija los minutos totales de alguien."),
+                    HelpEntry(".noah vc startleveling <horas>", "Activa los niveles por horas acumuladas."),
+                    HelpEntry(".noah vc banchannel #canal", "Excluye un canal del conteo."),
+                    HelpEntry(".noah vc alertmessages #canal", "Canal único para las alertas de nivel."),
+                    HelpEntry(".noah vc testalert", "Alerta de prueba con tu usuario."),
+                ),
+                staff=True,
+            ),
+        ),
+    )
+)
+
+
 def register_vc_stats_commands(bot: commands.Bot, noah_group: commands.Group) -> None:
     @tasks.loop(seconds=60)
     async def voice_social_tick() -> None:
@@ -218,50 +253,7 @@ def register_vc_stats_commands(bot: commands.Bot, noah_group: commands.Group) ->
 
     @vc.command()
     async def help(ctx: commands.Context) -> None:
-        chart = EmbedTable(headers=["Command", "Description"], title="Voice Stats")
-        chart.add_row([".noah vc summary", "Resumen visual de tus stats de voz."])
-        chart.add_row([".noah vc summary @user", "Resumen visual de otro usuario."])
-        chart.add_row([".noah vc stats", "Muestra tus stats de voz."])
-        chart.add_row([".noah vc stats @user", "Muestra las stats de otro usuario."])
-        chart.add_row([".noah vc top", "Ranking de tiempo en voice chat."])
-        chart.add_row([".noah vc active", "Usuarios conectados ahora mismo."])
-        chart.add_row(
-            [
-                ".noah vc alerttype <montadito|noah>",
-                "Elige tu estilo personal de alerta de nivel.",
-            ]
-        )
-        chart.add_row(
-            [
-                ".noah vc setminutes @user <minutes>",
-                "[Admin/Funcionarios] Fija los minutos totales.",
-            ]
-        )
-        chart.add_row(
-            [
-                ".noah vc startleveling <hours>",
-                "[Admin/Funcionarios] Activa los niveles por horas acumuladas.",
-            ]
-        )
-        chart.add_row(
-            [
-                ".noah vc banchannel #canal",
-                "[Admin/Funcionarios] Excluye un canal del conteo.",
-            ]
-        )
-        chart.add_row(
-            [
-                ".noah vc alertmessages #canal",
-                "[Admin/Funcionarios] Define el canal unico para alertas de nivel.",
-            ]
-        )
-        chart.add_row(
-            [
-                ".noah vc testalert",
-                "[Admin/Funcionarios] Envia una alerta de prueba con tu usuario.",
-            ]
-        )
-        await ctx.send(embed=chart.render())
+        await send_help(ctx, "vc")
 
     @vc.command()
     async def stats(

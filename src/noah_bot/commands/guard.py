@@ -23,6 +23,7 @@ from noah_bot.modules.guard import (
     read_overwrites,
     score_suspect,
 )
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 
 _log = logging.getLogger("discord.ext.commands.bot")
@@ -227,70 +228,70 @@ def _text_file(name: str, lines: list[str]) -> discord.File:
     return discord.File(io.BytesIO("\n".join(lines).encode("utf-8")), filename=name)
 
 
-def _build_help_embed() -> discord.Embed:
-    embed = _base_embed(
-        "Noah Guard",
-        (
-            "Protocolo de contingencia ante raids. Oculta todos los canales para los "
-            "usuarios, habilita un canal de texto y uno de voz temporales, restringe los "
-            "comandos de Noah y registra la actividad. Al finalizar, el servidor vuelve "
-            "a su estado anterior.\n\nSolo para administración y usuarios autorizados."
+HELP = register_help(
+    HelpModule(
+        key="guard",
+        emoji="🛡️",
+        name="Guard",
+        summary="Protocolo de contingencia ante raids",
+        description=(
+            "Oculta todos los canales, habilita un canal de texto y uno de voz temporales, restringe "
+            "los comandos de Noah y registra la actividad. Al terminar, el servidor vuelve a su estado anterior."
         ),
-        COLOR_INFO,
-    )
-    embed.add_field(
-        name="Control",
-        value=(
-            "`.noah guard start` Activa el protocolo de contingencia.\n"
-            "`.noah guard stop` Lo desactiva y restaura el servidor.\n"
-            "`.noah guard status` Muestra el estado actual.\n"
-            "`.noah guard retry` Reintenta restaurar permisos pendientes."
+        staff=True,
+        sections=(
+            HelpSection(
+                "Control",
+                (
+                    HelpEntry(".noah guard start", "Activa el protocolo de contingencia."),
+                    HelpEntry(".noah guard stop", "Lo desactiva y restaura el servidor."),
+                    HelpEntry(".noah guard status", "Estado actual."),
+                    HelpEntry(".noah guard retry", "Reintenta restaurar permisos pendientes."),
+                ),
+            ),
+            HelpSection(
+                "Simulacro",
+                (
+                    HelpEntry(".noah guard drill", "Ensayo sin cambios: qué se tocaría y qué falta."),
+                    HelpEntry(".noah guard drill live", "Simulacro real, sin baneos y con parada automática."),
+                ),
+            ),
+            HelpSection(
+                "Estadísticas",
+                (
+                    HelpEntry(".noah guard stats", "Resumen y usuarios más activos."),
+                    HelpEntry(".noah guard joins", "Entradas al servidor durante la contingencia."),
+                    HelpEntry(".noah guard user @usuario", "Detalle de un usuario."),
+                    HelpEntry(".noah guard suspects", "Usuarios ordenados por puntuación de sospecha."),
+                ),
+            ),
+            HelpSection(
+                "Acciones en bloque",
+                (
+                    HelpEntry(".noah guard ban joins", "Banea a quienes entraron durante la contingencia."),
+                    HelpEntry(
+                        ".noah guard ban suspects [puntos]",
+                        f"Banea a los sospechosos (por defecto, {DEFAULT_SUSPECT_SCORE} puntos o más).",
+                    ),
+                    HelpEntry(".noah guard kick joins · kick suspects [puntos]", "Lo mismo, expulsando."),
+                ),
+                text="-# Todas piden confirmación antes de ejecutarse.",
+            ),
+            HelpSection(
+                "Configuración",
+                (
+                    HelpEntry(".noah guard config", "Panel de configuración."),
+                    HelpEntry(".noah guard config show", "Muestra la configuración."),
+                    HelpEntry(".noah guard config adduser @usuario · removeuser", "Usuarios autorizados."),
+                    HelpEntry(".noah guard config addrole @rol · removerole", "Roles autorizados."),
+                    HelpEntry(".noah guard config newdays <días>", "Antigüedad de cuenta nueva."),
+                    HelpEntry(".noah guard config drillminutes <min>", "Duración del simulacro."),
+                ),
+            ),
         ),
-        inline=False,
+        note="Solo administración y usuarios autorizados.",
     )
-    embed.add_field(
-        name="Simulacro",
-        value=(
-            "`.noah guard drill` Ensayo sin cambios: qué se tocaría y qué falta.\n"
-            "`.noah guard drill live` Simulacro real, sin baneos y con parada automática."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Estadísticas",
-        value=(
-            "`.noah guard stats` Resumen y usuarios más activos.\n"
-            "`.noah guard joins` Entradas al servidor durante la contingencia.\n"
-            "`.noah guard user @usuario` Detalle de un usuario.\n"
-            "`.noah guard suspects` Usuarios ordenados por puntuación de sospecha."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Acciones en bloque",
-        value=(
-            "`.noah guard ban joins` Banea a quienes entraron durante la contingencia.\n"
-            "`.noah guard ban suspects [puntos]` Banea a los sospechosos "
-            f"(por defecto, {DEFAULT_SUSPECT_SCORE} puntos o más).\n"
-            "`.noah guard kick joins` y `.noah guard kick suspects [puntos]` "
-            "hacen lo mismo expulsando.\n"
-            "Todas piden confirmación antes de ejecutarse."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Configuración",
-        value=(
-            "`.noah guard config` Abre el panel de configuración.\n"
-            "`.noah guard config show` Muestra la configuración.\n"
-            "`.noah guard config adduser @usuario` y `removeuser`\n"
-            "`.noah guard config addrole @rol` y `removerole`\n"
-            "`.noah guard config newdays <días>` Antigüedad de cuenta nueva.\n"
-            "`.noah guard config drillminutes <min>` Duración del simulacro."
-        ),
-        inline=False,
-    )
-    return embed
+)
 
 
 def _build_notice_embed(session: dict[str, Any], *, reminder: bool = False) -> discord.Embed:
@@ -2152,13 +2153,13 @@ def register_guard_commands(bot: commands.Bot, noah_group: commands.Group) -> No
     async def guard(ctx: commands.Context) -> None:
         if not await _ensure_staff(ctx):
             return
-        await ctx.send(embed=_build_help_embed())
+        await send_help(ctx, "guard")
 
     @guard.command(name="help")
     async def guard_help(ctx: commands.Context) -> None:
         if not await _ensure_staff(ctx):
             return
-        await ctx.send(embed=_build_help_embed())
+        await send_help(ctx, "guard")
 
     @guard.command()
     async def start(ctx: commands.Context) -> None:

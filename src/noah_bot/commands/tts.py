@@ -10,6 +10,7 @@ from discord.ext import commands
 from noah_bot.modules.bot_context import get_bot_context, is_guard_active
 from noah_bot.modules.discord_formatter import EmbedTable
 from noah_bot.modules.tts import text_to_speech
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 
 GREET_MESSAGES = (
@@ -73,15 +74,45 @@ async def _play_tts(
     voice_client.play(source, after=_cleanup)
 
 
+HELP = register_help(
+    HelpModule(
+        key="tts",
+        emoji="🗣️",
+        name="TTS",
+        summary="Noah habla en tu canal de voz",
+        description="Noah entra en tu canal de voz y lee en voz alta lo que le escribas, con voces de ElevenLabs.",
+        sections=(
+            HelpSection(
+                "Hablar",
+                (
+                    HelpEntry(".noah tts join", "Mete a Noah en tu canal de voz."),
+                    HelpEntry(".noah tts say <texto>", "Noah lo lee en voz alta (alias `nts`)."),
+                    HelpEntry(".noah tts greet", "Activa o desactiva que Noah salude a quien entra al canal."),
+                ),
+            ),
+            HelpSection(
+                "Voces",
+                (
+                    HelpEntry(".noah tts showvoices", "Voces disponibles y cuál está activa."),
+                    HelpEntry(".noah tts setvoice <nombre>", "Cambia la voz activa."),
+                    HelpEntry(".noah tts addvoice <voice_id> <nombre>", "Añade una voz de ElevenLabs."),
+                    HelpEntry(".noah tts delvoice <nombre>", "Borra una voz."),
+                ),
+            ),
+        ),
+    )
+)
+
+
 def register_tts_commands(bot: commands.Bot, noah_group: commands.Group) -> None:
     @noah_group.group()
     async def tts(ctx: commands.Context) -> None:
         if ctx.invoked_subcommand is None:
-            await ctx.send(
-                "Use `.noah tts join`, `.noah tts say`, `.noah tts greet`, "
-                "`.noah tts showvoices`, `.noah tts addvoice`, `.noah tts delvoice` "
-                "or `.noah tts setvoice`."
-            )
+            await send_help(ctx, "tts")
+
+    @tts.command(name="help")
+    async def tts_help(ctx: commands.Context) -> None:
+        await send_help(ctx, "tts")
 
     @tts.command()
     async def showvoices(ctx: commands.Context) -> None:

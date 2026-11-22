@@ -8,6 +8,7 @@ from noah_bot.commands.presentations import build_presentation_embed, find_prese
 from noah_bot.modules.bot_context import get_bot_context
 from noah_bot.modules.discord_formatter import build_quote_embed
 from noah_bot.modules.rrpp import RrppStore
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 
 SELECT_LIMIT = 25
@@ -69,60 +70,46 @@ def _role_problem(guild: discord.Guild, role: discord.Role) -> str | None:
     return None
 
 
-def _build_help_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="RRPP",
+HELP = register_help(
+    HelpModule(
+        key="rrpp",
+        emoji="🤝",
+        name="RRPP",
+        summary="Avisos y puntos para los RRPP",
         description=(
-            "Los RRPP reciben avisos cuando alguien reacciona a una cita RRPP y ganan "
-            "puntos por saludar, conseguir presentaciones y llevar gente al VC."
+            "Los RRPP reciben avisos cuando alguien reacciona a una cita RRPP y ganan puntos por "
+            "saludar, conseguir presentaciones y llevar gente al VC."
         ),
-        color=RRPP_COLOR,
-    )
-    embed.add_field(
-        name=".noah rrpp guide",
-        value="Explica cómo funcionan los puntos y los niveles.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah rrpp claim · .nrc",
-        value="Reclama puntos. Para un saludo, úsalo respondiendo a tu propio mensaje.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah rrpp summary [@user]",
-        value="Muestra tu nivel, tus puntos y tus últimos claims.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah rrpp inspect [@user]",
-        value=(
-            "Ficha de un usuario: cuenta, verificación, presentación, primeros mensajes, voz y RRPP. "
-            "Pulsa 👤 Buscar para elegir a quién."
+        sections=(
+            HelpSection(
+                "Puntos",
+                (
+                    HelpEntry(".noah rrpp guide", "Cómo funcionan los puntos y los niveles."),
+                    HelpEntry(".noah rrpp claim · .nrc", "Reclama puntos. Para un saludo, respondiendo a tu propio mensaje."),
+                    HelpEntry(".noah rrpp summary [@user]", "Nivel, puntos y últimos claims."),
+                    HelpEntry(".noah rrpp top", "Ranking de niveles."),
+                ),
+            ),
+            HelpSection(
+                "Fichas",
+                (
+                    HelpEntry(
+                        ".noah rrpp inspect [@user]",
+                        "Cuenta, verificación, presentación, primeros mensajes, voz y RRPP. 👤 Buscar elige a quién.",
+                    ),
+                ),
+            ),
+            HelpSection(
+                "Admin",
+                (
+                    HelpEntry(".noah rrpp config", "Rol RRPP, miembros, emoji, mensajes activos y canales."),
+                    HelpEntry(".noah rrpp quote <@user>", "Respondiendo a un mensaje: lo cita y añade la reacción RRPP."),
+                ),
+                staff=True,
+            ),
         ),
-        inline=False,
     )
-    embed.add_field(
-        name=".noah rrpp top",
-        value="Ranking de niveles de los RRPP.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah rrpp config",
-        value=(
-            "[Admin] Panel: rol RRPP, miembros, emoji, mensajes activos y canales "
-            "(avisos, niveles, logs y claims)."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah rrpp quote <@user>",
-        value=(
-            "[Admin] Respondiendo a un mensaje: lo cita como `.noah quote` y añade la "
-            "reacción RRPP."
-        ),
-        inline=False,
-    )
-    return embed
+)
 
 
 def _build_panel_embed(guild: discord.Guild, store: RrppStore) -> discord.Embed:
@@ -587,11 +574,11 @@ def register_rrpp_commands(bot: commands.Bot, noah_group: commands.Group) -> com
 
     @noah_group.group(invoke_without_command=True)
     async def rrpp(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_help_embed())
+        await send_help(ctx, "rrpp")
 
     @rrpp.command()
     async def help(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_help_embed())
+        await send_help(ctx, "rrpp")
 
     @rrpp.command()
     async def config(ctx: commands.Context) -> None:

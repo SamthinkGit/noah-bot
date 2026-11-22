@@ -15,6 +15,7 @@ from noah_bot.modules.discord_formatter import (
     render_embeds_to_png,
 )
 from noah_bot.modules.send_message import delete_message, send_message
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 
 MEDIA_DIR = Path(__file__).resolve().parents[3] / "media"
@@ -43,63 +44,49 @@ CHEST_TYPE_COLORS = {
 CHEST_COLOR_MAX_DISTANCE = 45
 
 
-def _build_autogami_help_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="Autogami",
-        description="Sincroniza tu token y prueba el envio automatizado.",
-        color=discord.Color.blurple(),
+HELP = register_help(
+    HelpModule(
+        key="autogami",
+        emoji="🎴",
+        name="Autogami",
+        summary="Tu token de Autogami, emojis favoritos y envíos automáticos",
+        description="Sincroniza tu token de Autogami para que Noah reaccione, abra cofres y envíe comandos por ti.",
+        sections=(
+            HelpSection(
+                "Token",
+                (
+                    HelpEntry(".noah autogami sync", "Instrucciones y el RAR para sacar tu token."),
+                    HelpEntry(".noah autogami sync <token>", "Borra tu mensaje, pide consentimiento y guarda el token cifrado."),
+                    HelpEntry(".noah autogami test", "Envía `test success` con tu token sincronizado."),
+                ),
+            ),
+            HelpSection(
+                "Favoritos",
+                (
+                    HelpEntry(".noah autogami addfav <emoji> [inicio|final]", "Emoji para reaccionar a los `Waifu Claimed!` (por defecto, al final)."),
+                    HelpEntry(".noah autogami delfav <emoji>", "Quita un emoji de tus favoritos."),
+                    HelpEntry(".noah autogami showfavs", "Muestra tus favoritos."),
+                    HelpEntry(".noah autogami sortfavs <emoji> <emoji> ...", "Los indicados pasan al principio en ese orden; el resto va detrás."),
+                    HelpEntry(".noah autogami chestconfig <emoji>", "Emoji para abrir cofres automáticamente.", staff=True),
+                ),
+            ),
+            HelpSection(
+                "Envíos",
+                (
+                    HelpEntry(
+                        ".noah autogami v <num> <num> ... [-merge] [-silent]",
+                        "Envía `.v` en tandas de 5 con 6 s entre tandas. Acepta `-user @user`. "
+                        "Alias `.nv`, `.nvms`. `-silent` requiere `-merge`.",
+                    ),
+                    HelpEntry(
+                        ".noah autogami trade <nums...> to @user <nums...>",
+                        "Prepara una oferta con previews de ambos lados y botones para aceptar o declinar.",
+                    ),
+                ),
+            ),
+        ),
     )
-    embed.add_field(
-        name=".noah autogami sync",
-        value="Recibe instrucciones y el RAR para sacar tu token.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah autogami sync <token>",
-        value="Borra tu mensaje, pide consentimiento y guarda tu token cifrado.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah autogami test",
-        value="Envia `test success` usando tu token sincronizado.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah autogami addfav <emoji> [inicio|final]",
-        value="Guarda un emoji favorito para reaccionar a los `Waifu Claimed!`. Por defecto va al final.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah autogami delfav <emoji>",
-        value="Borra un emoji de tus favs de Autogami.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah autogami showfavs",
-        value="Muestra todos tus emojis favoritos guardados.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah autogami sortfavs <emoji> <emoji> ...",
-        value="Reordena tus favs: los emojis indicados pasan al principio en ese orden y el resto se queda detrás.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah autogami chestconfig <emoji>",
-        value="Configura el emoji para abrir chest automáticamente. Solo admins/Funcionarios.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah autogami v <num> <num> ... [-merge] [-silent]",
-        value="Envia `.v` en tandas de 5 con 6s de espera entre cada tanda. Acepta `-user @user`. Alias: `.nv`, `.nvms`. `-silent` requiere `-merge`.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah autogami trade <nums...> to @user <nums...>",
-        value="Prepara una oferta de trade, recopila previews silenciosas de ambos lados y permite aceptar o declinar con botones.",
-        inline=False,
-    )
-    return embed
+)
 
 
 async def _send_sync_instructions(ctx: commands.Context) -> None:
@@ -1183,11 +1170,11 @@ def register_autogami_commands(bot: commands.Bot, noah_group: commands.Group) ->
     @noah_group.group()
     async def autogami(ctx: commands.Context) -> None:
         if ctx.invoked_subcommand is None:
-            await ctx.send(embed=_build_autogami_help_embed())
+            await send_help(ctx, "autogami")
 
     @autogami.command()
     async def help(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_autogami_help_embed())
+        await send_help(ctx, "autogami")
 
     @autogami.command()
     async def sync(ctx: commands.Context, *, token: str | None = None) -> None:

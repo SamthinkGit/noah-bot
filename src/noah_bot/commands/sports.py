@@ -53,6 +53,7 @@ from noah_bot.modules.sports import (
 )
 from noah_bot.modules.sports_banner import render_banner
 from noah_bot.modules.sports_map import build_map, is_url, maps_url
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 _log = logging.getLogger(__name__)
 
@@ -1931,42 +1932,39 @@ class SportsConfigView(discord.ui.View):
                 await self.message.edit(view=None)
 
 
-def _build_help_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="Eventos deportivos",
+HELP = register_help(
+    HelpModule(
+        key="sports",
+        emoji="🏅",
+        name="Deporte",
+        summary="Quedadas para hacer deporte, con mapa y plazas",
         description=(
-            "Agenda de las quedadas para hacer deporte. El panel se queda siempre abajo en "
-            "su canal con los próximos 7 días: apúntate con el botón de cada evento o abre su "
-            "ficha para ver el mapa, la foto y quién va. A los apuntados se les menciona "
-            "1 h antes de empezar."
+            "Agenda de las quedadas para hacer deporte. El panel se queda siempre abajo en su "
+            "canal con los próximos 7 días. A los apuntados se les menciona 1 h antes."
         ),
-        color=SPORTS_COLOR,
-    )
-    embed.add_field(
-        name="Panel",
-        value=(
-            "**Apuntarme** (a la derecha de cada evento) te apunta al momento; si te arrepientes, "
-            "la respuesta trae **Desapuntarme**. En el menú **Ver ficha…** se abre en privado "
-            "la ficha con el mapa, la foto, quién va y **Abrir en Maps**. ◀️ / ▶️ pasan de 7 "
-            "en 7 días (◀️ también enseña los eventos que ya pasaron, en gris) y ✏️ **Editar** "
-            "abre el gestor (rol editor), donde puedes 📄 **Duplicar** un evento."
+        sections=(
+            HelpSection(
+                "Panel",
+                text=(
+                    "**Apuntarme** (a la derecha de cada evento) te apunta al momento; la respuesta trae "
+                    "**Desapuntarme**. **Ver ficha…** abre en privado el mapa, la foto, quién va y "
+                    "**Abrir en Maps**. ◀️ / ▶️ pasan de 7 en 7 días (◀️ también enseña los que ya "
+                    "pasaron) y ✏️ **Editar** abre el gestor (rol editor), donde puedes 📄 **Duplicar**."
+                ),
+            ),
+            HelpSection(
+                "Comandos",
+                (
+                    HelpEntry(
+                        ".noah sports edit",
+                        "Gestor de eventos: nombre, día, hora, duración, ubicación, plazas, descripción y foto (rol editor).",
+                    ),
+                    HelpEntry(".noah sports config", "Canal del panel y rol editor.", staff=True),
+                ),
+            ),
         ),
-        inline=False,
     )
-    embed.add_field(
-        name=".noah sports edit",
-        value=(
-            "Abre el gestor para añadir, editar o quitar eventos: nombre, día, hora, duración, "
-            "ubicación, plazas, descripción y foto (rol editor)."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah sports config",
-        value="Elige el canal del panel y el rol editor (solo admins).",
-        inline=False,
-    )
-    return embed
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2140,11 +2138,11 @@ def register_sports_commands(bot: commands.Bot, noah_group: commands.Group) -> N
 
     @noah_group.group(name="sports", invoke_without_command=True)
     async def sports(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_help_embed())
+        await send_help(ctx, "sports")
 
     @sports.command(name="help")
     async def sports_help(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_help_embed())
+        await send_help(ctx, "sports")
 
     @sports.command(name="config")
     async def sports_config(ctx: commands.Context) -> None:

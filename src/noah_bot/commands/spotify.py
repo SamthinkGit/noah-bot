@@ -13,6 +13,7 @@ from noah_bot.modules.spotify_player import (
     TrackInfo,
     format_ms,
 )
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 
 MIRROR_POLL_SECONDS = 4.0
@@ -21,82 +22,49 @@ SYNC_OFFSET_MS = 1500
 CONFIRM_DELETE_AFTER = 20.0
 
 
-def _build_spotify_help_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="🎧 Noah Spotify",
+HELP = register_help(
+    HelpModule(
+        key="spotify",
+        emoji="🎧",
+        name="Spotify",
+        summary="El audio real de tu Spotify en el canal de voz",
         description=(
-            "Reproduce el audio real de tu Spotify en el canal de voz. **No** "
-            "transfiere la reproduccion: suena en el bot y en tu PC/Alexa a la "
-            "vez. Solo admins."
+            "Reproduce el audio de tu Spotify en el canal de voz. **No** transfiere la reproducción: "
+            "suena en Noah y en tu PC/Alexa a la vez."
         ),
-        color=discord.Color.green(),
-    )
-    embed.add_field(
-        name=".noah spotify unlock <password>",
-        value=(
-            "Te da acceso a los comandos de Spotify. Noah borra tu mensaje al "
-            "momento para que no se vea la password."
+        staff=True,
+        sections=(
+            HelpSection(
+                "Acceso",
+                (
+                    HelpEntry(".noah spotify unlock <password>", "Te da acceso. Noah borra tu mensaje al momento."),
+                    HelpEntry(".noah spotify lock", "Te quita el acceso a ti mismo."),
+                    HelpEntry(
+                        ".noah spotify auth",
+                        "Adjunta `credentials.json` (audio, de `auth_local.py`) o `spotify_webapi.json` "
+                        "(espejo, de `auth_webapi.py`); Noah lo guarda y borra el mensaje.",
+                    ),
+                    HelpEntry(".noah spotify login", "Reabre la sesión con las credenciales guardadas."),
+                    HelpEntry(".noah spotify status", "Estado de credenciales, sesión y espejo."),
+                ),
+            ),
+            HelpSection(
+                "Reproducción",
+                (
+                    HelpEntry(".noah spotify join / leave", "Mete o saca a Noah de tu canal de voz."),
+                    HelpEntry(
+                        ".noah spotify mirror",
+                        f"Modo espejo: Noah sigue lo que suena en tu cuenta (cada {int(MIRROR_POLL_SECONDS)} s).",
+                    ),
+                    HelpEntry(".noah spotify play <link>", "Un track suelto (link o `spotify:track:...`)."),
+                    HelpEntry(".noah spotify stop", "Para lo que suena y apaga el espejo."),
+                    HelpEntry(".noah spotify now", "Qué suena en Noah y en tu cuenta."),
+                    HelpEntry(".noah spotify vol <0-200>", "Volumen de Noah (no toca el de Spotify)."),
+                ),
+            ),
         ),
-        inline=False,
     )
-    embed.add_field(
-        name=".noah spotify lock",
-        value="Te quita el acceso a ti mismo.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah spotify auth",
-        value=(
-            "Adjunta un JSON y Noah lo guarda y borra el mensaje. Acepta los "
-            "dos: `credentials.json` (audio, de `auth_local.py`) y "
-            "`spotify_webapi.json` (para el espejo, de `auth_webapi.py`)."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah spotify login",
-        value="Fuerza reabrir la sesion de Spotify con las credenciales guardadas.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah spotify join / leave",
-        value="Mete o saca a Noah de tu canal de voz.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah spotify mirror",
-        value=(
-            "Activa/desactiva el modo espejo: Noah sigue lo que suena en tu "
-            f"cuenta, comprobandolo cada {int(MIRROR_POLL_SECONDS)}s."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah spotify play <link>",
-        value="Reproduce un track suelto (link o `spotify:track:...`).",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah spotify stop",
-        value="Para lo que este sonando en Noah y apaga el espejo.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah spotify now",
-        value="Muestra que suena en Noah y que suena en tu cuenta.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah spotify vol <0-200>",
-        value="Ajusta el volumen de Noah (no toca el de Spotify).",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah spotify status",
-        value="Estado de las credenciales, la sesion y el espejo.",
-        inline=False,
-    )
-    return embed
+)
 
 
 async def _delete_message(ctx: commands.Context) -> bool:
@@ -274,11 +242,11 @@ def register_spotify_commands(bot: commands.Bot, noah_group: commands.Group) -> 
     @noah_group.group()
     async def spotify(ctx: commands.Context) -> None:
         if ctx.invoked_subcommand is None:
-            await ctx.send(embed=_build_spotify_help_embed())
+            await send_help(ctx, "spotify")
 
     @spotify.command(name="help")
     async def spotify_help(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_spotify_help_embed())
+        await send_help(ctx, "spotify")
 
     @spotify.command()
     async def auth(ctx: commands.Context) -> None:

@@ -11,6 +11,53 @@ from noah_bot.modules.discord_formatter import (
     with_loading,
 )
 from noah_bot.modules.waifu_game import DOJO_CHARGE_SECONDS, Waifu
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
+
+
+HELP = register_help(
+    HelpModule(
+        key="waifu",
+        emoji="⚔️",
+        name="Waifu battle",
+        summary="Combates entre las waifus de los jugadores",
+        description="Crea tu waifu, entrénala y ataca a las de los demás jugadores.",
+        sections=(
+            HelpSection(
+                "Tu waifu",
+                (
+                    HelpEntry(".noah waifu set <nombre> -special <especial>", "Crea tu waifu con su ataque especial."),
+                    HelpEntry(".noah waifu status [-user @user]", "Estado de tu waifu (o de otra)."),
+                    HelpEntry(".noah waifu stats [-user @user]", "Sus estadísticas."),
+                    HelpEntry(".noah waifu remaining [-user @user]", "Cuánto le queda para volver a estar activa. Alias `rem`."),
+                    HelpEntry(".noah waifu setimage", "Respondiendo a un embed con imagen: la usa para tu waifu."),
+                    HelpEntry(".noah waifu setcolor <hex | random | reset>", "Color de sus embeds."),
+                ),
+            ),
+            HelpSection(
+                "Entrenar y combatir",
+                (
+                    HelpEntry(".noah waifu attack @user", "Ataca a la waifu de otro jugador."),
+                    HelpEntry(".noah waifu attackedby [-user @user]", "Daño recibido y de quién."),
+                    HelpEntry(".noah waifu sleep", "La pone a descansar."),
+                    HelpEntry(".noah waifu alive", "La vuelve a activar."),
+                    HelpEntry(".noah waifu levelup", "Sube de nivel si puede."),
+                    HelpEntry(".noah waifu daily <stat>", "Entrenamiento diario de una estadística."),
+                    HelpEntry(".noah waifu dojo", "Entrena en el dojo (jugadores de la partida)."),
+                    HelpEntry(".noah waifu report", "Informe de todos los jugadores."),
+                ),
+            ),
+            HelpSection(
+                "Admin",
+                (
+                    HelpEntry(".noah waifu setplayers @user1 @user2 ...", "Elige los jugadores de la partida."),
+                    HelpEntry(".noah waifu setpeacefulmode @user", "Retira a alguien de forma pacífica."),
+                    HelpEntry(".noah waifu forcedojo", "Abre un dojo nuevo al momento."),
+                ),
+                staff=True,
+            ),
+        ),
+    )
+)
 
 
 def register_waifu_commands(noah_group: commands.Group) -> None:
@@ -855,20 +902,4 @@ def register_waifu_commands(noah_group: commands.Group) -> None:
 
     @waifu.command()
     async def help(ctx: commands.Context) -> None:
-        chart = EmbedTable(headers=["Command"], title="Waifu Game Commands")
-        chart.add_row([".noah waifu set <name> -special <special name>"])
-        chart.add_row([".noah waifu attack @user"])
-        chart.add_row([".noah waifu report"])
-        chart.add_row([".noah waifu status -user @user"])
-        chart.add_row([".noah waifu remaining -user @user"])
-        chart.add_row([".noah waifu sleep"])
-        chart.add_row([".noah waifu levelup"])
-        chart.add_row([".noah waifu stats -user @user"])
-        chart.add_row([".noah waifu daily <stat>"])
-        chart.add_row([".noah waifu alive"])
-        chart.add_row([".noah waifu setimage"])
-        chart.add_row([".noah waifu dojo"])
-        chart.add_row([".noah waifu setcolor <hex | random | reset>"])
-        chart.add_row([".noah waifu attackedby -user @user"])
-        chart.add_row(["[admin] .noah waifu setplayers <@user1> <@user2> ..."])
-        await ctx.send(embed=chart.render())
+        await send_help(ctx, "waifu")

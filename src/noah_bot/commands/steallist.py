@@ -2,7 +2,30 @@ import discord
 from discord.ext import commands
 
 from noah_bot.modules.bot_context import get_bot_context
-from noah_bot.modules.discord_formatter import EmbedTable
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
+
+
+HELP = register_help(
+    HelpModule(
+        key="steallist",
+        emoji="🫳",
+        name="Steallist",
+        summary="Apunta las waifus que te han robado",
+        description="Lista de waifus que te han robado y a quién. Alias `.sl`.",
+        sections=(
+            HelpSection(
+                "Comandos",
+                (
+                    HelpEntry(".steallist add @user <waifu>", "Añade una waifu a tu lista."),
+                    HelpEntry(".steallist show", "Tus robos pendientes."),
+                    HelpEntry(".steallist show @user", "Waifus que te ha robado alguien."),
+                    HelpEntry(".steallist remove <id>", "Quita una waifu por ID."),
+                    HelpEntry(".steallist clear @user", "Borra todas las tuyas que tiene esa persona."),
+                ),
+            ),
+        ),
+    )
+)
 
 
 def register_steallist_commands(bot: commands.Bot) -> None:
@@ -13,20 +36,7 @@ def register_steallist_commands(bot: commands.Bot) -> None:
 
     @steallist_cmd.command()
     async def help(ctx: commands.Context) -> None:
-        chart = EmbedTable(
-            headers=["Command", "Description"], title="StealList Commands"
-        )
-        chart.add_row(
-            [".steallist add @user <waifu>", "Add a waifu to your steal list."]
-        )
-        chart.add_row([".steallist show", "Show your pending steals."])
-        chart.add_row([".steallist show @user", "Show waifus stolen from a user."])
-        chart.add_row([".steallist remove <id>", "Remove a waifu by ID."])
-        chart.add_row(
-            [".steallist clear @user", "Clear all waifus owned by you from that user."]
-        )
-
-        await ctx.send(embed=chart.render())
+        await send_help(ctx, "steallist")
 
     @steallist_cmd.command()
     async def add(

@@ -1093,10 +1093,9 @@ async def tool_companeros_voz(ctx: ToolContext, args: dict[str, Any], step: Step
 
 
 def _commands_text(ctx: ToolContext) -> str:
-    from noah_bot.commands.noah import NOAH_HELP_ROWS
+    from noah_bot.modules.help_ui import catalog_text
 
-    lines = ["Comandos principales (prefijo '.'):"]
-    lines.extend(f"- {usage}: {description}" for usage, description in NOAH_HELP_ROWS)
+    lines = ["Comandos de Noah por módulo (prefijo '.'):", catalog_text()]
     names = sorted(
         {
             f".{command.qualified_name}"

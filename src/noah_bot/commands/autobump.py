@@ -19,41 +19,35 @@ from noah_bot.modules.slash_command import (
     resolve_application_command,
     trigger_slash_command,
 )
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 
 GUARD_PAUSE_SECONDS = 300
 
 
-def _build_autobump_help_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="Autobump",
+HELP = register_help(
+    HelpModule(
+        key="autobump",
+        emoji="📣",
+        name="Autobump",
+        summary="Bump automático en Disboard cada 3-4 h",
         description=(
-            "Bumpea el servidor en Disboard usando el `/bump` real y tu token de "
-            "Autogami, cada 3-4 horas aleatorias."
+            "Bumpea el servidor en Disboard usando el `/bump` real y tu token de Autogami, "
+            "cada 3-4 horas aleatorias."
         ),
-        color=discord.Color.blurple(),
+        sections=(
+            HelpSection(
+                "Comandos",
+                (
+                    HelpEntry(".noah autobump", "Lo activa en este canal y hace el primer bump al momento.", staff=True),
+                    HelpEntry(".noah autobump stop", "Lo desactiva en este servidor.", staff=True),
+                    HelpEntry(".noah autobump status", "Si está activo y cuándo toca el siguiente."),
+                    HelpEntry(".noah autobump debug", "Qué responde Discord al buscar `/bump` con tu token.", staff=True),
+                ),
+            ),
+        ),
     )
-    embed.add_field(
-        name=".noah autobump",
-        value="Activa el autobump en este canal y hace el primer bump al momento. Solo admins.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah autobump stop",
-        value="Desactiva el autobump de este servidor. Solo admins.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah autobump status",
-        value="Muestra si el autobump está activo y cuándo toca el siguiente.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah autobump debug",
-        value="Muestra qué responde Discord al buscar `/bump` con tu token. Solo admins.",
-        inline=False,
-    )
-    return embed
+)
 
 
 def _is_autobump_admin(author: discord.abc.User) -> bool:
@@ -245,7 +239,7 @@ def register_autobump_commands(bot: commands.Bot, noah_group: commands.Group) ->
 
     @autobump.command()
     async def help(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_autobump_help_embed())
+        await send_help(ctx, "autobump")
 
     @autobump.command()
     async def stop(ctx: commands.Context) -> None:

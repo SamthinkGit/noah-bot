@@ -46,6 +46,7 @@ from noah_bot.modules.noah_ai_tools import (
     execute_tool,
     tools_for,
 )
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 _log = logging.getLogger(__name__)
 
@@ -1252,42 +1253,53 @@ class AiConfigView(discord.ui.LayoutView):
         )
 
 
-def _help_view(is_admin: bool) -> discord.ui.LayoutView:
-    view = discord.ui.LayoutView(timeout=None)
-    container = discord.ui.Container(accent_color=AI_COLOR)
-    text = (
-        "## Noah AI\n"
-        "Chats **privados** con Noah. Puede leer los canales que el staff permite (solo leer, "
-        "nunca escribir ni borrar) y responder cosas como: quién se ha presentado, cuándo se "
-        "conectó alguien a VC, con quién habla o coincide más, o un resumen del día.\n\n"
-        "**Cómo se usa**\n"
-        "- Pulsa **💬 Abrir chat privado** en el panel. Puedes abrir varios chats.\n"
-        "- **⚙️ Configurar mi Noah**: longitud, estilo propio y si ver el razonamiento.\n"
-        "- Límite de preguntas al día (los admins no tienen).\n"
-        "- Si intentas sacarle información restringida te avisa; si insistes, cierra el chat y avisa al staff."
+HELP = register_help(
+    HelpModule(
+        key="ai",
+        emoji="🧠",
+        name="Noah AI",
+        summary="Chats privados con Noah que pueden leer el servidor",
+        description=(
+            "Chats **privados** con Noah. Puede leer los canales que el staff permite (solo leer, nunca "
+            "escribir ni borrar) y responder cosas como quién se ha presentado, cuándo se conectó alguien "
+            "a VC, con quién habla o coincide más, o un resumen del día."
+        ),
+        sections=(
+            HelpSection(
+                "Cómo se usa",
+                text=(
+                    "- Pulsa **💬 Abrir chat privado** en el panel. Puedes abrir varios chats.\n"
+                    "- **⚙️ Configurar mi Noah**: longitud, estilo propio y si ver el razonamiento.\n"
+                    "- Hay un límite de preguntas al día (los admins no tienen).\n"
+                    "- Si intentas sacarle información restringida te avisa; si insistes, cierra el chat y avisa al staff."
+                ),
+            ),
+            HelpSection(
+                "Admins",
+                (
+                    HelpEntry(".noah ai config", "Modelo, API key, canales, límite, canales legibles, temas y panel."),
+                    HelpEntry(".noah ai chats", "Últimos chats abiertos."),
+                ),
+                text=(
+                    "Los admins pueden pedir a Noah que lea cualquier canal, los chats, la auditoría y los eventos.\n"
+                    "-# El canal de chats debe dejar a todos **Ver canal** y **Enviar mensajes en hilos**, pero no "
+                    "**Enviar mensajes** ni **Crear hilos**. El bot necesita crear hilos privados y gestionar hilos."
+                ),
+                staff=True,
+            ),
+        ),
     )
-    if is_admin:
-        text += (
-            "\n\n**Admins**\n"
-            "- `.noah ai config`: modelo, API key, canales, límite, canales legibles, temas y panel.\n"
-            "- `.noah ai chats`: últimos chats abiertos.\n"
-            "- Los admins pueden pedir a Noah que lea cualquier canal, los chats, la auditoría y los eventos.\n"
-            "-# El canal de chats debe dejar a todos **Ver canal** y **Enviar mensajes en hilos**, pero no "
-            "**Enviar mensajes** ni **Crear hilos**. El bot necesita crear hilos privados y gestionar hilos."
-        )
-    container.add_item(discord.ui.TextDisplay(text))
-    view.add_item(container)
-    return view
+)
 
 
 def register_ai_commands(bot: commands.Bot, noah_group: commands.Group) -> None:
     @noah_group.group(name="ai", invoke_without_command=True)
     async def ai(ctx: commands.Context) -> None:
-        await ctx.send(view=_help_view(_is_admin(ctx.author)), allowed_mentions=NONE)
+        await send_help(ctx, "ai")
 
     @ai.command(name="help")
     async def ai_help(ctx: commands.Context) -> None:
-        await ctx.send(view=_help_view(_is_admin(ctx.author)), allowed_mentions=NONE)
+        await send_help(ctx, "ai")
 
     @ai.command(name="config")
     async def ai_config(ctx: commands.Context) -> None:

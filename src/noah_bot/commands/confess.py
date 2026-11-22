@@ -6,6 +6,7 @@ from discord.ext import commands
 
 from noah_bot.modules.bot_context import get_bot_context, is_guard_active
 from noah_bot.modules.confessions import ConfessionsStore
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 CONFESS_COLOR = discord.Color.from_rgb(230, 126, 34)
 PANEL_BUTTON_ID = "noah:confess:open"
@@ -198,51 +199,45 @@ def _build_panel_embed() -> discord.Embed:
     )
 
 
-def _build_help_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="Confesiones",
+HELP = register_help(
+    HelpModule(
+        key="confess",
+        emoji="🤫",
+        name="Confesiones",
+        summary="Confesiones totalmente anónimas",
         description=(
-            "Confesiones totalmente anónimas: se escriben en un formulario privado y "
-            "se publican sin ningún dato del autor. El bot no guarda quién las envía."
+            "Se escriben en un formulario privado y se publican sin ningún dato del autor. "
+            "El bot no guarda quién las envía."
         ),
-        color=CONFESS_COLOR,
-    )
-    embed.add_field(
-        name="Panel con botón",
-        value="La forma más discreta: pulsa **Escribir confesión** y no queda nada en el chat.",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah confess",
-        value=(
-            "Borra tu mensaje al momento y deja un botón temporal que solo tú puedes "
-            f"usar (desaparece en {PROMPT_TIMEOUT}s)."
+        sections=(
+            HelpSection(
+                "Cómo confesar",
+                (
+                    HelpEntry(
+                        ".noah confess",
+                        f"Borra tu mensaje al momento y deja un botón que solo tú puedes usar ({PROMPT_TIMEOUT} s).",
+                    ),
+                ),
+                text="Lo más discreto es el panel: pulsa **Escribir confesión** y no queda nada en el chat.",
+            ),
+            HelpSection(
+                "Canal de confesiones",
+                text=(
+                    "Solo se quedan los mensajes de Noah: cualquier otro se borra al momento y Noah avisa "
+                    f"con un mensaje que desaparece a los {CHANNEL_CLEANUP_NOTICE_DELETE_AFTER} s."
+                ),
+            ),
+            HelpSection(
+                "Configuración",
+                (
+                    HelpEntry(".noah confess config", "Canal de confesiones y dónde va el panel."),
+                    HelpEntry(".noah confess sticky [on / off]", "Mantiene el panel siempre como último mensaje de su canal."),
+                ),
+                staff=True,
+            ),
         ),
-        inline=False,
     )
-    embed.add_field(
-        name=".noah confess config",
-        value="Elige el canal de confesiones y dónde va el panel (solo admins).",
-        inline=False,
-    )
-    embed.add_field(
-        name="Canal de confesiones",
-        value=(
-            "Solo se quedan los mensajes de Noah: cualquier otro mensaje se borra al "
-            f"momento y Noah avisa con un mensaje que desaparece a los "
-            f"{CHANNEL_CLEANUP_NOTICE_DELETE_AFTER}s."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah confess sticky [on / off]",
-        value=(
-            "Mantiene el panel siempre como último mensaje de su canal: cada vez que "
-            "alguien escribe, se borra y se vuelve a publicar abajo (solo admins)."
-        ),
-        inline=False,
-    )
-    return embed
+)
 
 
 def _build_config_embed(guild: discord.Guild, store: ConfessionsStore) -> discord.Embed:
@@ -687,7 +682,7 @@ def register_confess_commands(bot: commands.Bot, noah_group: commands.Group) -> 
 
     @confess.command()
     async def help(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_help_embed())
+        await send_help(ctx, "confess")
 
     @confess.command()
     async def config(ctx: commands.Context) -> None:

@@ -7,7 +7,6 @@ import discord
 from discord.ext import commands, tasks
 
 from noah_bot.modules.bot_context import get_bot_context
-from noah_bot.modules.discord_formatter import EmbedTable
 from noah_bot.modules.monitor import (
     DISK_BUDGET_MB,
     RAM_BUDGET_MB,
@@ -21,6 +20,7 @@ from noah_bot.modules.monitor import (
     plural,
 )
 from noah_bot.modules.monitor_card import render_monitor_card
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 BAR_WIDTH = 16
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
@@ -145,6 +145,27 @@ async def _take_snapshot(bot: commands.Bot) -> Snapshot:
     return await asyncio.to_thread(store.snapshot, bot.latency, len(asyncio.all_tasks()))
 
 
+HELP = register_help(
+    HelpModule(
+        key="monitor",
+        emoji="📊",
+        name="Monitor",
+        summary="CPU, RAM, disco y estadísticas de uso de Noah",
+        description="Cuánto consume Noah y cuánto se usa: arranques, reconexiones, comandos y errores.",
+        sections=(
+            HelpSection(
+                "Comandos",
+                (
+                    HelpEntry(".noah monitor", "CPU, RAM, disco y uso en texto (vista terminal)."),
+                    HelpEntry(".noah monitor card", "Tarjeta con la gráfica de CPU y RAM de las últimas 24 h."),
+                    HelpEntry(".noah monitor wakes", "Últimos arranques y reconexiones."),
+                ),
+            ),
+        ),
+    )
+)
+
+
 def register_monitor_commands(bot: commands.Bot, noah_group: commands.Group) -> None:
     @tasks.loop(seconds=SAMPLE_SECONDS)
     async def monitor_sampler() -> None:
@@ -202,8 +223,4 @@ def register_monitor_commands(bot: commands.Bot, noah_group: commands.Group) -> 
 
     @monitor.command(name="help")
     async def monitor_help(ctx: commands.Context) -> None:
-        chart = EmbedTable(headers=["Command", "Description"], title="Noah Monitor")
-        chart.add_row([".noah monitor", "CPU, RAM, disco y uso en texto (vista terminal)."])
-        chart.add_row([".noah monitor card", "Tarjeta con gráfica de CPU y RAM de 24 h."])
-        chart.add_row([".noah monitor wakes", "Últimos arranques y reconexiones."])
-        await ctx.send(embed=chart.render())
+        await send_help(ctx, "monitor")

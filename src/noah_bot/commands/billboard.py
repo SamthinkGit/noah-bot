@@ -26,6 +26,7 @@ from noah_bot.modules.billboard import (
 )
 from noah_bot.modules.billboard_banner import render_banner
 from noah_bot.modules.bot_context import get_bot_context, is_guard_active
+from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 _log = logging.getLogger(__name__)
 
@@ -1931,37 +1932,35 @@ class BillboardConfigView(discord.ui.View):
                 await self.message.edit(view=None)
 
 
-def _build_help_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="Cartelera",
+HELP = register_help(
+    HelpModule(
+        key="billboard",
+        emoji="🎬",
+        name="Cartelera",
+        summary="Agenda de las pelis que vemos en el server",
         description=(
-            "Agenda de las pelis que vemos en el server. El panel se queda siempre abajo "
-            "en su canal: navega por los próximos días, abre la ficha de cada sesión (con póster) y "
-            "apúntate. A los apuntados se les menciona 1 h antes de empezar."
+            "El panel se queda siempre abajo en su canal: navega por los próximos días, abre la "
+            "ficha de cada sesión (con póster) y apúntate. A los apuntados se les menciona 1 h antes."
         ),
-        color=BILLBOARD_COLOR,
-    )
-    embed.add_field(
-        name="Panel",
-        value=(
-            "Muestra los próximos 7 días; ◀️ / ▶️ pasan de 7 en 7 (◀️ también enseña las pelis "
-            "que ya pasaron, en gris) y ✏️ **Editar** abre el "
-            "gestor (rol editor). "
-            "🎟️ **Ficha** abre en privado el póster y el botón **Apuntarme / Desapuntarme**."
+        sections=(
+            HelpSection(
+                "Panel",
+                text=(
+                    "Muestra los próximos 7 días; ◀️ / ▶️ pasan de 7 en 7 (◀️ también enseña las pelis "
+                    "que ya pasaron, en gris). 🎟️ **Ficha** abre en privado el póster y **Apuntarme / "
+                    "Desapuntarme**. ✏️ **Editar** abre el gestor (rol editor)."
+                ),
+            ),
+            HelpSection(
+                "Comandos",
+                (
+                    HelpEntry(".noah billboard edit", "Gestor para añadir, editar o quitar pelis y anuncios (rol editor)."),
+                    HelpEntry(".noah billboard config", "Canal del panel y rol editor.", staff=True),
+                ),
+            ),
         ),
-        inline=False,
     )
-    embed.add_field(
-        name=".noah billboard edit",
-        value="Abre el gestor para añadir, editar o quitar películas y anuncios (rol editor).",
-        inline=False,
-    )
-    embed.add_field(
-        name=".noah billboard config",
-        value="Elige el canal del panel y el rol editor (solo admins).",
-        inline=False,
-    )
-    return embed
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2148,11 +2147,11 @@ def register_billboard_commands(bot: commands.Bot, noah_group: commands.Group) -
 
     @noah_group.group(invoke_without_command=True)
     async def billboard(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_help_embed())
+        await send_help(ctx, "billboard")
 
     @billboard.command(name="help")
     async def billboard_help(ctx: commands.Context) -> None:
-        await ctx.send(embed=_build_help_embed())
+        await send_help(ctx, "billboard")
 
     @billboard.command(name="config")
     async def billboard_config(ctx: commands.Context) -> None:
