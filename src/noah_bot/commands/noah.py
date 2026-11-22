@@ -11,10 +11,9 @@ from noah_bot.commands.autogami import register_autogami_commands
 from noah_bot.commands.billboard import register_billboard_commands
 from noah_bot.commands.confess import register_confess_commands
 from noah_bot.commands.council import register_council_commands
-from noah_bot.commands.gochi import register_gotchi_commands
 from noah_bot.commands.guard import register_guard_commands
+from noah_bot.commands.monitor import register_monitor_commands
 from noah_bot.commands.presentations import register_presentations_commands
-from noah_bot.commands.relics import register_relics_commands
 from noah_bot.commands.rrpp import register_rrpp_commands
 from noah_bot.commands.rrpp_inspect import register_rrpp_inspect_commands
 from noah_bot.commands.rrpp_points import register_rrpp_points_commands
@@ -247,11 +246,11 @@ NOAH_HELP_ROWS: list[tuple[str, str]] = [
     ('.noah ping', 'Check if Noah is responsive.'),
     ('.noah d20', 'Tira un d20 y muestra el resultado estilo D&D.'),
     ('.noah areyouok', 'Muestra el total de comandos y por categoria.'),
+    ('.noah monitor help', 'Consumo de Noah (CPU, RAM, disco) y estadísticas de uso.'),
     ('.noah kill', 'Stop the bot process immediately.'),
     ('.noah help', 'Show Noah AI commands.'),
     ('.noah daily', 'Resumen diario del servidor.'),
     ('.noah daily -user @user', 'Resumen diario de un usuario.'),
-    ('.noah gochi help', 'Muestra los comandos de Noah Gochi.'),
     ('.noah autogami help', 'Show Autogami sync commands.'),
     ('.noah vc help', 'Show voice stats commands.'),
     ('.noah spotify help', 'Muestra los comandos de Spotify.'),
@@ -267,7 +266,6 @@ NOAH_HELP_ROWS: list[tuple[str, str]] = [
     ('.waifuracer setemoji <emoji>', 'Set your claim reaction emoji.'),
     ('.waifuracer help', 'Show waifuracer commands.'),
     ('.noah waifu help', 'Show waifu battle commands'),
-    ('.noah relics help', 'Muestra los comandos de noah relics.'),
     ('.steallist help', 'Show steallist commands.'),
 ]
 
@@ -293,6 +291,7 @@ def register_noah_commands(bot: commands.Bot) -> None:
     @noah.command()
     async def kill(ctx: commands.Context) -> None:
         await ctx.send("💀 Noah is shutting down.")
+        get_bot_context(ctx.bot).monitor.save()
         await asyncio.sleep(0.5)
         os._exit(0)
 
@@ -710,10 +709,8 @@ def register_noah_commands(bot: commands.Bot) -> None:
         )
 
     register_waifu_commands(noah)
-    register_gotchi_commands(noah)
     register_autogami_commands(bot, noah)
     register_autobump_commands(bot, noah)
-    register_relics_commands(bot, noah)
     register_tts_commands(bot, noah)
     register_spotify_commands(bot, noah)
     register_vc_stats_commands(bot, noah)
@@ -726,4 +723,5 @@ def register_noah_commands(bot: commands.Bot) -> None:
     register_billboard_commands(bot, noah)
     register_sports_commands(bot, noah)
     register_council_commands(bot, noah)
+    register_monitor_commands(bot, noah)
     register_ai_commands(bot, noah)

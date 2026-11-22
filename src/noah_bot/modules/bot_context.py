@@ -13,10 +13,8 @@ from noah_bot.modules.daily_stats import DailyStatsManager
 from noah_bot.modules.discord_formatter import UserEmojiManager
 from noah_bot.modules.guard import GuardStore
 from noah_bot.modules.leaderboard import Leaderboard
-from noah_bot.modules.noah_gochi import NoahGochiManager
-from noah_bot.modules.noah_gochi_ai import NoahGochiStoryService
+from noah_bot.modules.monitor import MonitorStore
 from noah_bot.modules.presentations import PresentationsStore
-from noah_bot.modules.relics_game import RelicsGameManager
 from noah_bot.modules.rrpp import RrppStore
 from noah_bot.modules.sports import SportsStore
 from noah_bot.modules.spotify_player import (
@@ -49,17 +47,9 @@ class BotContext:
     billboard: BillboardStore = field(default_factory=BillboardStore)
     sports: SportsStore = field(default_factory=SportsStore)
     council: CouncilStore = field(default_factory=CouncilStore)
+    monitor: MonitorStore = field(default_factory=MonitorStore)
     waifu_manager: WaifuGameManager = field(
         default_factory=lambda: WaifuGameManager(json_path="waifu_game.json")
-    )
-    relics_manager: RelicsGameManager = field(
-        default_factory=lambda: RelicsGameManager(json_path="noah_relics.json")
-    )
-    gochi_manager: NoahGochiManager = field(
-        default_factory=lambda: NoahGochiManager(json_path="noah_gochi.json")
-    )
-    gochi_story_service: NoahGochiStoryService = field(
-        default_factory=NoahGochiStoryService
     )
     daily_stats: DailyStatsManager = field(default_factory=DailyStatsManager)
     spotify_player: SpotifyPlayer = field(default_factory=SpotifyPlayer)

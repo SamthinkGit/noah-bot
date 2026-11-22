@@ -18,6 +18,7 @@ dependencies = [
     "langsmith>=0.6.2",
     "librespot",
     "pillow>=12.1.0",
+    "psutil>=7.0",
     "pynacl>=1.5,<1.6",
     "requests>=2.32.0",
     "rich>=14.2.0",
