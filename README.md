@@ -103,3 +103,22 @@ en hilos* y *Gestionar hilos*. Para la auditoría, *Ver registro de auditoría*.
 **Datos**: `noah_ai.json` (config, preferencias, uso y registro de chats; contiene la API key,
 está en `.gitignore`) y `voice_social.json` (medias de voz y coincidencias en VC; es aparte
 de `voice_stats.json` y no afecta a los niveles).
+
+---
+
+## 🛡️ Moderación
+
+Comandos de **clic derecho → Aplicaciones**, solo para administradores (Discord los oculta al resto):
+
+- En un mensaje: **Marcar mensaje** (infracción, se queda), **Eliminar y marcar** (guarda copia y
+  lo borra) y **Guardar evidencia** (sin contar como infracción). Abren un formulario con motivo
+  y gravedad opcionales.
+- En un usuario: **Ver expediente** y **Añadir nota** (texto, referencia y hasta 10 capturas).
+
+Cada caso se publica en el canal de logs con los adjuntos resubidos, así se conservan aunque el
+mensaje se borre. Al usuario no se le avisa. Primero: `.noah mod config #canal-staff`.
+
+Consultas (`.noah mod help`): `flags`, `flags @user…`, `user @user`, `notes @user`, `case <nº>`,
+`note @user <texto>` (con capturas o respondiendo a un mensaje) y `remove <nº>`.
+
+**Datos**: `modlog.json` (en `.gitignore`).

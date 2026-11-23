@@ -13,6 +13,7 @@ from noah_bot.modules.daily_stats import DailyStatsManager
 from noah_bot.modules.discord_formatter import UserEmojiManager
 from noah_bot.modules.guard import GuardStore
 from noah_bot.modules.leaderboard import Leaderboard
+from noah_bot.modules.modlog import ModlogStore
 from noah_bot.modules.monitor import MonitorStore
 from noah_bot.modules.presentations import PresentationsStore
 from noah_bot.modules.rrpp import RrppStore
@@ -48,6 +49,7 @@ class BotContext:
     sports: SportsStore = field(default_factory=SportsStore)
     council: CouncilStore = field(default_factory=CouncilStore)
     monitor: MonitorStore = field(default_factory=MonitorStore)
+    modlog: ModlogStore = field(default_factory=ModlogStore)
     waifu_manager: WaifuGameManager = field(
         default_factory=lambda: WaifuGameManager(json_path="waifu_game.json")
     )

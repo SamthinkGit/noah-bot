@@ -41,6 +41,7 @@ INDEX_ORDER = (
     "steallist",
     "autobump",
     "guard",
+    "mod",
     "rrpp",
     "council",
 )

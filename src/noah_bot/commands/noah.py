@@ -12,6 +12,7 @@ from noah_bot.commands.billboard import register_billboard_commands
 from noah_bot.commands.confess import register_confess_commands
 from noah_bot.commands.council import register_council_commands
 from noah_bot.commands.guard import register_guard_commands
+from noah_bot.commands.modlog import register_modlog_commands
 from noah_bot.commands.monitor import register_monitor_commands
 from noah_bot.commands.presentations import register_presentations_commands
 from noah_bot.commands.rrpp import register_rrpp_commands
@@ -744,4 +745,5 @@ def register_noah_commands(bot: commands.Bot) -> None:
     register_sports_commands(bot, noah)
     register_council_commands(bot, noah)
     register_monitor_commands(bot, noah)
+    register_modlog_commands(bot, noah)
     register_ai_commands(bot, noah)
