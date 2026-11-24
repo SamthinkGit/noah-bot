@@ -1,6 +1,6 @@
 """Normas del servidor: la lista y los textos del panel de `.noah ruleboard`.
 
-Se guarda en `rules.json` por servidor: las normas (emoji + texto), los textos del
+Se guarda en `rules.json` por servidor: las normas (icono o emoji + texto), los textos del
 panel (título, soporte, incumplimiento, firma), el color, el canal de tickets y dónde
 está publicado el mensaje para poder editarlo en sitio cada vez que algo cambia.
 """
@@ -12,37 +12,66 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Icono del catálogo (ver `ruleboard_emojis.ICON_LABELS`) y texto de cada norma.
 DEFAULT_RULES: tuple[tuple[str, str], ...] = (
-    ("🔞", "Edad obligatoria entre 18 y 30 años."),
-    ("💔", "Prohibido utilizar el servidor con la intención de ligar."),
-    ("✉️", "Prohibido abrir MD sin pedir permiso."),
-    ("🤝", "Respetar a las personas dentro y fuera del servidor."),
-    ("🛡️", "Prohibido ridiculizar o menospreciar a otros miembros por cualquier motivo."),
-    ("🫂", "Evita comportamientos que generen incomodidad o dificulten tu integración en la comunidad."),
-    ("💬", "Prohibido abordar recurrentemente temas políticos o afines."),
-    ("⛔", "No enviar contenido pornográfico o NSFW."),
-    ("🔔", "No hacer spam."),
-    ("📁", "Respetar el uso de los canales de texto."),
-    ("⏳", "Mantener un mínimo de actividad."),
+    ("rating-18-plus", "Edad obligatoria entre 18 y 30 años."),
+    ("heart-broken", "Prohibido utilizar el servidor con la intención de ligar."),
+    ("mail", "Prohibido abrir MD sin pedir permiso."),
+    ("heart-handshake", "Respetar a las personas dentro y fuera del servidor."),
+    ("shield", "Prohibido ridiculizar o menospreciar a otros miembros por cualquier motivo."),
+    ("users", "Evita comportamientos que generen incomodidad o dificulten tu integración en la comunidad."),
+    ("message-circle", "Prohibido abordar recurrentemente temas políticos o afines."),
+    ("ban", "No enviar contenido pornográfico o NSFW."),
+    ("bell", "No hacer spam."),
+    ("folder", "Respetar el uso de los canales de texto."),
+    ("hourglass", "Mantener un mínimo de actividad."),
 )
 
-DEFAULT_COLOR = 0xE891B4
+# Las primeras versiones guardaban emojis normales: se pasan a su icono equivalente.
+UNICODE_TO_ICON: dict[str, str] = {
+    "🔞": "rating-18-plus",
+    "💔": "heart-broken",
+    "✉️": "mail",
+    "✉": "mail",
+    "🤝": "heart-handshake",
+    "🛡️": "shield",
+    "🛡": "shield",
+    "🫂": "users",
+    "💬": "message-circle",
+    "⛔": "ban",
+    "🔔": "bell",
+    "📁": "folder",
+    "⏳": "hourglass",
+}
 
-# Campos de texto que se cambian con `.noah ruleboard set <campo> <texto>`.
+DEFAULT_COLOR = 0x22D3EE  # azul cian (franja e iconos)
+OLD_DEFAULT_COLORS = {0xE891B4}  # rosa de la primera versión
+
+# Textos del panel que se cambian desde `.noah ruleboard config` (vacío = el original).
 TEXT_FIELDS: dict[str, str] = {
     "titulo": "𝙉𝙊𝙍𝙈𝘼𝙎 𝘿𝙀 𝙇𝘼 𝘾𝙊𝙈𝙐𝙉𝙄𝘿𝘼𝘿",
-    "soporte_titulo": "⊹ 𝙎𝙊𝙋𝙊𝙍𝙏𝙀 𝙔 𝘾𝙊𝙉𝙑𝙄𝙑𝙀𝙉𝘾𝙄𝘼",
-    "soporte": (
-        "ⓘ Ante cualquier problema dentro del servidor, tenéis a vuestra disposición el canal "
-        "{tickets} para informar de cualquier actividad inapropiada."
-    ),
-    "incumplimiento_titulo": "⊹ 𝙄𝙉𝘾𝙐𝙈𝙋𝙇𝙄𝙈𝙄𝙀𝙉𝙏𝙊",
+    "soporte_titulo": "⊹ Soporte",
+    "soporte": "¿Algún problema? Abre un ticket.",
+    "incumplimiento_titulo": "",
     "incumplimiento": (
-        "El incumplimiento total o parcial de cualquiera de estas normas será valorado por la "
-        "administración y podrá ser motivo de expulsión."
+        "El incumplimiento total o parcial será valorado por la administración y podrá ser "
+        "motivo de expulsión."
     ),
     "firma": "𝑨𝒎𝒊𝒈𝒐𝒔 𝑴𝒂𝒅𝒓𝒊𝒅 ♡",
 }
+
+
+def default_rules() -> list[dict[str, str | None]]:
+    return [{"icon": icon, "emoji": None, "text": text} for icon, text in DEFAULT_RULES]
+
+
+def _migrate_rule(rule: dict[str, Any]) -> None:
+    if "icon" in rule:
+        return
+    icon = UNICODE_TO_ICON.get(rule.get("emoji") or "")
+    rule["icon"] = icon
+    if icon is not None or rule.get("emoji") == "•":
+        rule["emoji"] = None
 
 
 class RulesError(ValueError):
@@ -76,7 +105,7 @@ class RulesStore:
         guild = self._state["guilds"].get(str(guild_id))
         if guild is None:
             guild = {
-                "rules": [{"emoji": emoji, "text": text} for emoji, text in DEFAULT_RULES],
+                "rules": default_rules(),
                 "texts": {},
                 "color": DEFAULT_COLOR,
                 "tickets_channel_id": None,
@@ -86,6 +115,10 @@ class RulesStore:
             }
             self._state["guilds"][str(guild_id)] = guild
         guild.setdefault("texts", {})
+        for rule in guild["rules"]:
+            _migrate_rule(rule)
+        if guild.get("color") in OLD_DEFAULT_COLORS:
+            guild["color"] = DEFAULT_COLOR
         return guild
 
     def _touch(self, guild: dict[str, Any]) -> None:
@@ -102,6 +135,11 @@ class RulesStore:
         data["texts"] = {key: data["texts"].get(key, default) for key, default in TEXT_FIELDS.items()}
         return data
 
+    def colors(self) -> set[int]:
+        """Colores de todos los paneles (para no borrar iconos que alguno use)."""
+        with self._lock:
+            return {int(guild.get("color", DEFAULT_COLOR)) for guild in self._state["guilds"].values()}
+
     # ---------- normas ----------
 
     def _index(self, guild: dict[str, Any], number: int) -> int:
@@ -110,26 +148,33 @@ class RulesStore:
             raise RulesError(f"No existe la norma {number}. Hay {len(rules)}.")
         return number - 1
 
-    def add(self, guild_id: int, emoji: str, text: str, position: int | None = None) -> int:
+    def add(
+        self,
+        guild_id: int,
+        text: str,
+        *,
+        icon: str | None = None,
+        emoji: str | None = None,
+        position: int | None = None,
+    ) -> int:
         with self._lock:
             guild = self._guild(guild_id)
             rules = guild["rules"]
             index = len(rules) if position is None else max(0, min(len(rules), position - 1))
-            rules.insert(index, {"emoji": emoji, "text": text})
+            rules.insert(index, {"icon": icon, "emoji": emoji, "text": text})
             self._touch(guild)
             return index + 1
 
-    def edit(self, guild_id: int, number: int, *, emoji: str | None = None, text: str | None = None) -> None:
+    def edit(
+        self, guild_id: int, number: int, *, text: str, icon: str | None = None, emoji: str | None = None
+    ) -> None:
         with self._lock:
             guild = self._guild(guild_id)
             rule = guild["rules"][self._index(guild, number)]
-            if emoji is not None:
-                rule["emoji"] = emoji
-            if text is not None:
-                rule["text"] = text
+            rule.update(icon=icon, emoji=emoji, text=text)
             self._touch(guild)
 
-    def remove(self, guild_id: int, number: int) -> dict[str, str]:
+    def remove(self, guild_id: int, number: int) -> dict[str, Any]:
         with self._lock:
             guild = self._guild(guild_id)
             rule = guild["rules"].pop(self._index(guild, number))
@@ -149,7 +194,7 @@ class RulesStore:
     def reset_rules(self, guild_id: int) -> None:
         with self._lock:
             guild = self._guild(guild_id)
-            guild["rules"] = [{"emoji": emoji, "text": text} for emoji, text in DEFAULT_RULES]
+            guild["rules"] = default_rules()
             self._touch(guild)
 
     # ---------- textos y ajustes ----------

@@ -1,15 +1,21 @@
-"""`.noah ruleboard`: panel de normas del servidor (componentes V2) editable desde Discord.
+"""`.noah ruleboard`: panel de normas del servidor editable desde Discord.
 
-Todo se gestiona desde un único panel, `.noah ruleboard config`: elegir una norma y
-editarla, moverla o quitarla, añadir nuevas, cambiar los textos, la firma, el color y
-el canal de tickets, y publicar. Cada cambio edita en sitio el mensaje publicado.
+El panel publicado es un contenedor de componentes V2: cabecera con la imagen de Noah,
+normas con iconos de línea del color del panel, soporte con botón a tickets,
+incumplimiento y la firma con el logo del server en pequeño. Los iconos y el logo son
+emojis de la aplicación (ver `ruleboard_emojis`).
+
+Todo se gestiona desde `.noah ruleboard config`, y cada cambio edita en sitio el
+mensaje publicado.
 """
 
 import logging
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands
@@ -22,6 +28,7 @@ from noah_bot.modules.help_ui import (
     register_help,
     send_help,
 )
+from noah_bot.modules.ruleboard_emojis import ICON_LABELS, RuleboardEmojis
 from noah_bot.modules.rules import DEFAULT_COLOR, TEXT_FIELDS, RulesError, RulesStore
 
 TEXT_LIMIT = 4000  # límite de Discord para el texto de un mensaje con componentes V2
@@ -32,6 +39,8 @@ CONFIG_COLOR = discord.Color.from_rgb(180, 108, 255)
 CUSTOM_EMOJI = re.compile(r"^<a?:\w{2,32}:\d{15,25}>$")
 HEX_COLOR = re.compile(r"^#?([0-9a-fA-F]{6})$")
 NO_MENTIONS = discord.AllowedMentions.none()
+LOCAL_TZ = ZoneInfo("Europe/Madrid")
+EMOJIS = RuleboardEmojis()
 log = logging.getLogger(__name__)
 
 
@@ -55,9 +64,9 @@ HELP = register_help(
                 "Qué se puede hacer",
                 text=(
                     "• Elegir una norma en el desplegable y **editarla**, **subirla**, **bajarla** o **quitarla**.\n"
-                    "• **Añadir** normas (con emoji del server o normal, y posición opcional).\n"
+                    "• **Añadir** normas con un icono del catálogo (o un emoji propio) y posición opcional.\n"
                     "• **Textos**: título, soporte e incumplimiento. Usa `{tickets}` para nombrar el canal de tickets.\n"
-                    "• **Estilo**: firma del pie y color de la franja.\n"
+                    "• **Estilo**: firma del pie y color de la franja y los iconos.\n"
                     "• **Tickets**: canal del botón «Ir a tickets» (vacío = uno con «ticket» en el nombre).\n"
                     "• **Publicar**: elige canal; si ya estaba en otro, se mueve.\n"
                     "• **Vista previa** solo para ti y **Restaurar** la lista original."
@@ -91,8 +100,8 @@ def _looks_like_emoji(token: str) -> bool:
     return any(unicodedata.category(ch) == "So" for ch in token)
 
 
-def _option_emoji(emoji: str) -> discord.PartialEmoji | None:
-    if not _looks_like_emoji(emoji):
+def _partial_emoji(emoji: str | None) -> discord.PartialEmoji | None:
+    if not emoji or not _looks_like_emoji(emoji):
         return None
     try:
         return discord.PartialEmoji.from_str(emoji)
@@ -115,70 +124,54 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _rule_icon(rule: dict[str, Any], color: int) -> str:
+    """Emoji con el que se pinta la norma: su emoji propio, su icono o un punto."""
+    return rule.get("emoji") or EMOJIS.icon(rule.get("icon"), color) or "•"
+
+
+async def _prepare_emojis(bot: discord.Client, guild: discord.Guild) -> list[str]:
+    color = int(_store(bot).get(guild.id)["color"])
+    return await EMOJIS.prepare(bot, guild, color, _store(bot).colors())
+
+
+def _problems_note(problems: list[str]) -> str:
+    return f" ⚠️ Emojis: {'; '.join(problems[:2])}" if problems else ""
+
+
 # ---------------------------------------------------------------------------
 # Panel publicado
 
 
-def _rule_lines(rules: list[dict[str, str]]) -> str:
+def _rule_lines(rules: list[dict[str, Any]], color: int) -> str:
     width = max(2, len(str(len(rules))))
     return "\n".join(
-        f"{rule['emoji']} **{index:0{width}d}** ┊ {rule['text']}".strip()
+        f"{_rule_icon(rule, color)} **{index:0{width}d}** · {rule['text']}"
         for index, rule in enumerate(rules, start=1)
     )
 
 
-_logo_cache: dict[int, tuple[str, str]] = {}  # guild_id -> (clave del icono, emoji)
-
-
-async def _server_logo(bot: discord.Client, guild: discord.Guild) -> str | None:
-    """Logo del server como emoji de la aplicación, para ponerlo en pequeño junto a la firma.
-
-    Los componentes V2 no tienen pie con icono como los embeds, así que Noah sube el
-    icono como emoji propio (no gasta huecos del server) y lo rehace si cambia el icono.
-    """
-    icon = guild.icon
-    if icon is None:
-        return None
-    cached = _logo_cache.get(guild.id)
-    if cached is not None and cached[0] == icon.key:
-        return cached[1]
-
-    prefix = f"g{guild.id}_"
-    name = f"{prefix}{icon.key.removeprefix('a_')[:8]}"
-    try:
-        emojis = await bot.fetch_application_emojis()
-        emoji = next((e for e in emojis if e.name == name), None)
-        if emoji is None:
-            image = await icon.replace(size=128, static_format="png").read()
-            emoji = await bot.create_application_emoji(name=name, image=image)
-        for old in emojis:
-            if old.name.startswith(prefix) and old.name != name:
-                try:
-                    await old.delete()
-                except discord.HTTPException:
-                    pass
-    except discord.HTTPException:
-        log.warning("No he podido preparar el logo del server %s como emoji", guild.id, exc_info=True)
-        return None
-
-    _logo_cache[guild.id] = (icon.key, str(emoji))
-    return str(emoji)
-
-
-def _panel_texts(guild: discord.Guild, data: dict[str, Any], logo: str | None = None) -> dict[str, str]:
+def _panel_texts(guild: discord.Guild, data: dict[str, Any]) -> dict[str, str]:
     texts = data["texts"]
+    color = int(data["color"])
     tickets = _tickets_channel(guild, data)
     tickets_ref = tickets.mention if tickets is not None else "#tickets"
     count = len(data["rules"])
+    updated = datetime.fromtimestamp(int(data["updated_at"]), LOCAL_TZ).strftime("%d/%m/%Y")
+    support = texts["soporte"].replace("{tickets}", tickets_ref)
+    logo = EMOJIS.logo(guild)
     return {
         "header": (
             f"## {texts['titulo']}\n"
-            f"-# {count} {'norma' if count == 1 else 'normas'} · actualizado <t:{data['updated_at']}:D>"
+            f"-# {count} {'norma' if count == 1 else 'normas'} · actualizado el {updated}"
         ),
-        "rules": _rule_lines(data["rules"]) or "-# Todavía no hay normas.",
-        "support": f"**{texts['soporte_titulo']}**\n{texts['soporte'].replace('{tickets}', tickets_ref)}",
-        "breach": f"**{texts['incumplimiento_titulo']}**\n{texts['incumplimiento']}",
-        "footer": f"{logo} **{texts['firma']}**" if logo else f"**{texts['firma']}**",
+        "rules": _rule_lines(data["rules"], color) or "-# Todavía no hay normas.",
+        "support": f"**{texts['soporte_titulo']}**\n{support}" if texts["soporte_titulo"] else support,
+        "breach": (
+            f"**{texts['incumplimiento_titulo']}**\n-# {texts['incumplimiento']}"
+            if texts["incumplimiento_titulo"]
+            else f"-# {texts['incumplimiento']}"
+        ),
+        "footer": f"-# {logo} {texts['firma']}" if logo else f"-# {texts['firma']}",
     }
 
 
@@ -186,34 +179,28 @@ def panel_length(guild: discord.Guild, data: dict[str, Any]) -> int:
     return sum(len(text) for text in _panel_texts(guild, data).values())
 
 
-def build_rules_view(
-    guild: discord.Guild, data: dict[str, Any], avatar_url: str | None, logo: str | None = None
-) -> discord.ui.LayoutView:
-    texts = _panel_texts(guild, data, logo)
-
-    def sep() -> discord.ui.Separator:
-        return discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
-
+def build_rules_view(guild: discord.Guild, data: dict[str, Any], avatar_url: str | None) -> discord.ui.LayoutView:
+    texts = _panel_texts(guild, data)
     box = discord.ui.Container(accent_color=discord.Color(int(data["color"])))
 
     if avatar_url:
         box.add_item(discord.ui.Section(texts["header"], accessory=discord.ui.Thumbnail(avatar_url)))
     else:
         box.add_item(discord.ui.TextDisplay(texts["header"]))
-    box.add_item(sep())
+    box.add_item(discord.ui.Separator())
     box.add_item(discord.ui.TextDisplay(texts["rules"]))
-    box.add_item(sep())
+    box.add_item(discord.ui.Separator())
 
     tickets = _tickets_channel(guild, data)
     if tickets is not None:
-        button = discord.ui.Button(label="Ir a tickets", emoji="🎫", url=tickets.jump_url)
+        button = discord.ui.Button(
+            label="Ir a tickets", emoji=EMOJIS.button_icon() or "🎫", url=tickets.jump_url
+        )
         box.add_item(discord.ui.Section(texts["support"], accessory=button))
     else:
         box.add_item(discord.ui.TextDisplay(texts["support"]))
-    box.add_item(sep())
+    box.add_item(discord.ui.Separator())
     box.add_item(discord.ui.TextDisplay(texts["breach"]))
-    box.add_item(sep())
-
     box.add_item(discord.ui.TextDisplay(texts["footer"]))
 
     view = discord.ui.LayoutView(timeout=None)
@@ -228,36 +215,34 @@ def _check_length(guild: discord.Guild, data: dict[str, Any]) -> None:
 
 async def _sync_published(bot: discord.Client, guild: discord.Guild) -> str:
     """Edita el panel publicado. Devuelve una línea corta con el resultado."""
+    problems = await _prepare_emojis(bot, guild)
     store = _store(bot)
     data = store.get(guild.id)
     if not data.get("message_id"):
-        return "Aún sin publicar."
+        return "Aún sin publicar." + _problems_note(problems)
 
     channel = guild.get_channel(int(data["channel_id"]))
     if not isinstance(channel, discord.TextChannel):
         store.set_message(guild.id, None, None)
         return "⚠️ El canal del panel ya no existe: vuelve a publicarlo."
 
-    view = build_rules_view(guild, data, _avatar_url(bot), await _server_logo(bot, guild))
+    view = build_rules_view(guild, data, _avatar_url(bot))
     try:
         await channel.get_partial_message(int(data["message_id"])).edit(view=view, allowed_mentions=NO_MENTIONS)
     except discord.NotFound:
         store.set_message(guild.id, None, None)
         return "⚠️ El mensaje publicado se borró: vuelve a publicarlo."
-    except discord.HTTPException as error:
-        return f"⚠️ No he podido actualizar el panel publicado: {error.text or error}."
-    return f"Panel actualizado en {channel.mention}."
+    except discord.HTTPException:
+        # p. ej. un panel publicado como embed en una versión anterior: se publica de nuevo.
+        return await _repost(bot, guild, channel)
+    return f"Panel actualizado en {channel.mention}." + _problems_note(problems)
 
 
-async def _publish(bot: discord.Client, guild: discord.Guild, channel: discord.TextChannel) -> str:
+async def _repost(bot: discord.Client, guild: discord.Guild, channel: discord.TextChannel) -> str:
     store = _store(bot)
     data = store.get(guild.id)
-    if data.get("message_id") and int(data["channel_id"]) == channel.id:
-        return await _sync_published(bot, guild)
-
-    view = build_rules_view(guild, data, _avatar_url(bot), await _server_logo(bot, guild))
     try:
-        message = await channel.send(view=view, allowed_mentions=NO_MENTIONS)
+        message = await channel.send(view=build_rules_view(guild, data, _avatar_url(bot)), allowed_mentions=NO_MENTIONS)
     except discord.Forbidden:
         raise RulesError(f"No puedo escribir en {channel.mention}.") from None
 
@@ -268,10 +253,20 @@ async def _publish(bot: discord.Client, guild: discord.Guild, channel: discord.T
             try:
                 await old_channel.get_partial_message(int(data["message_id"])).delete()
                 note += f" Borrado el anterior de {old_channel.mention}."
+            except discord.NotFound:
+                pass
             except discord.HTTPException:
                 note += f" No he podido borrar el anterior de {old_channel.mention}."
     store.set_message(guild.id, channel.id, message.id)
     return note
+
+
+async def _publish(bot: discord.Client, guild: discord.Guild, channel: discord.TextChannel) -> str:
+    data = _store(bot).get(guild.id)
+    if data.get("message_id") and int(data["channel_id"]) == channel.id:
+        return await _sync_published(bot, guild)
+    problems = await _prepare_emojis(bot, guild)
+    return await _repost(bot, guild, channel) + _problems_note(problems)
 
 
 # ---------------------------------------------------------------------------
@@ -299,13 +294,13 @@ def _row(*items: discord.ui.Item[Any]) -> discord.ui.ActionRow:
 
 
 class RuleboardConfigView(discord.ui.LayoutView):
-    def __init__(self, bot: discord.Client, guild: discord.Guild) -> None:
+    def __init__(self, bot: discord.Client, guild: discord.Guild, notice: str = "") -> None:
         super().__init__(timeout=CONFIG_TIMEOUT)
         self.bot = bot
         self.guild = guild
         self.selected: int | None = None  # número de norma (1..n)
         self.confirm_reset = False
-        self.notice = ""
+        self.notice = notice
         self.message: discord.Message | None = None
         self.render()
 
@@ -315,6 +310,7 @@ class RuleboardConfigView(discord.ui.LayoutView):
         self.clear_items()
         data = _store(self.bot).get(self.guild.id)
         rules = data["rules"]
+        color = int(data["color"])
         if self.selected is not None and not 1 <= self.selected <= len(rules):
             self.selected = None
 
@@ -329,12 +325,12 @@ class RuleboardConfigView(discord.ui.LayoutView):
             tickets_text += " (auto)"
         used = panel_length(self.guild, data)
 
-        box = discord.ui.Container(accent_color=discord.Color(int(data["color"])))
+        box = discord.ui.Container(accent_color=discord.Color(color))
         box.add_item(
             discord.ui.TextDisplay(
                 "## 📜 Ruleboard · configuración\n"
                 f"-# {published}\n"
-                f"-# Tickets: {tickets_text} · Color: #{int(data['color']):06x} · {used}/{TEXT_LIMIT} caracteres"
+                f"-# Tickets: {tickets_text} · Color: #{color:06x} · {used}/{TEXT_LIMIT} caracteres"
             )
         )
         box.add_item(discord.ui.Separator())
@@ -342,21 +338,20 @@ class RuleboardConfigView(discord.ui.LayoutView):
         width = max(2, len(str(len(rules))))
         lines = []
         for index, rule in enumerate(rules, start=1):
-            line = f"`{index:0{width}d}` {rule['emoji']} {_clip(rule['text'], 90)}"
-            lines.append(f"**▸ {line}**" if index == self.selected else line)
+            line = f"{_rule_icon(rule, color)} `{index:0{width}d}` {_clip(rule['text'], 90)}"
+            lines.append(f"**▸** {line}" if index == self.selected else line)
         box.add_item(discord.ui.TextDisplay("\n".join(lines) or "-# Todavía no hay normas."))
 
         if rules:
-            options = []
-            for index, rule in enumerate(rules, start=1):
-                options.append(
-                    discord.SelectOption(
-                        label=_clip(f"{index}. {rule['text']}", 100),
-                        value=str(index),
-                        emoji=_option_emoji(rule["emoji"]),
-                        default=index == self.selected,
-                    )
+            options = [
+                discord.SelectOption(
+                    label=_clip(f"{index}. {rule['text']}", 100),
+                    value=str(index),
+                    emoji=_partial_emoji(_rule_icon(rule, color)),
+                    default=index == self.selected,
                 )
+                for index, rule in enumerate(rules, start=1)
+            ]
             select = discord.ui.Select(placeholder="Elige una norma para editarla, moverla o quitarla", options=options)
             select.callback = self._on_select
             box.add_item(_row(select))
@@ -487,7 +482,7 @@ class RuleboardConfigView(discord.ui.LayoutView):
     async def _on_remove(self, interaction: discord.Interaction) -> None:
         rule = _store(self.bot).remove(self.guild.id, self.selected)
         self.selected = None
-        await self.changed(interaction, f"🗑️ Quitada: {rule['emoji']} {_clip(rule['text'], 60)}")
+        await self.changed(interaction, f"🗑️ Quitada: {_clip(rule['text'], 60)}")
 
     async def _on_texts(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(TextsModal(self))
@@ -511,14 +506,16 @@ class RuleboardConfigView(discord.ui.LayoutView):
         await self.changed(interaction, "♻️ Normas restauradas a la lista original.")
 
     async def _on_preview(self, interaction: discord.Interaction) -> None:
-        data = _store(self.bot).get(self.guild.id)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        logo = await _server_logo(self.bot, self.guild)
+        problems = await _prepare_emojis(self.bot, self.guild)
+        data = _store(self.bot).get(self.guild.id)
         await interaction.followup.send(
-            view=build_rules_view(self.guild, data, _avatar_url(self.bot), logo),
+            view=build_rules_view(self.guild, data, _avatar_url(self.bot)),
             ephemeral=True,
             allowed_mentions=NO_MENTIONS,
         )
+        if problems:
+            await interaction.followup.send(_problems_note(problems).strip(), ephemeral=True)
 
     async def _on_close(self, interaction: discord.Interaction) -> None:
         self.stop()
@@ -535,7 +532,9 @@ class RuleModal(discord.ui.Modal):
         super().__init__(title=f"Editar norma {number}" if number else "Nueva norma", timeout=CONFIG_TIMEOUT)
         self.parent = parent
         self.number = number
-        rule = _store(parent.bot).get(parent.guild.id)["rules"][number - 1] if number else {}
+        data = _store(parent.bot).get(parent.guild.id)
+        color = int(data["color"])
+        rule = data["rules"][number - 1] if number else {}
 
         self.text_input = discord.ui.TextInput(
             style=discord.TextStyle.paragraph,
@@ -543,17 +542,30 @@ class RuleModal(discord.ui.Modal):
             default=rule.get("text"),
             placeholder="Respetar el uso de los canales de texto.",
         )
-        self.emoji_input = discord.ui.TextInput(
+        self.icon_select = discord.ui.Select(
+            placeholder="Elige un icono",
+            min_values=0,
+            max_values=1,
             required=False,
-            max_length=64,
-            default=rule.get("emoji") if rule.get("emoji") != "•" else None,
-            placeholder="📁",
+            options=[
+                discord.SelectOption(
+                    label=label,
+                    value=key,
+                    emoji=_partial_emoji(EMOJIS.icon(key, color)),
+                    default=key == rule.get("icon"),
+                )
+                for key, label in ICON_LABELS.items()
+            ],
+        )
+        self.emoji_input = discord.ui.TextInput(
+            required=False, max_length=64, default=rule.get("emoji"), placeholder="📁 o <:nombre:id>"
         )
         self.add_item(discord.ui.Label(text="Norma", component=self.text_input))
+        self.add_item(discord.ui.Label(text="Icono", component=self.icon_select))
         self.add_item(
             discord.ui.Label(
-                text="Emoji",
-                description="Normal o del server (pega <:nombre:id>). Vacío = sin emoji.",
+                text="Emoji propio (opcional)",
+                description="Si lo pones, se usa en vez del icono. Normal o del server (<:nombre:id>).",
                 component=self.emoji_input,
             )
         )
@@ -571,8 +583,9 @@ class RuleModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         parent = self.parent
         text = self.text_input.value.strip()
-        emoji = self.emoji_input.value.strip() or "•"
-        if emoji != "•" and not _looks_like_emoji(emoji):
+        emoji = self.emoji_input.value.strip() or None
+        icon = None if emoji else (self.icon_select.values[0] if self.icon_select.values else None)
+        if emoji and not _looks_like_emoji(emoji):
             raise RulesError(f"`{emoji}` no parece un emoji.")
         if not text:
             raise RulesError("Falta el texto de la norma.")
@@ -586,19 +599,20 @@ class RuleModal(discord.ui.Modal):
 
         store = _store(parent.bot)
         preview = store.get(parent.guild.id)
+        new_rule = {"icon": icon, "emoji": emoji, "text": text}
         if self.number is None:
             if len(preview["rules"]) >= MAX_RULES:
                 raise RulesError(f"Máximo {MAX_RULES} normas.")
-            preview["rules"].append({"emoji": emoji, "text": text})
+            preview["rules"].append(new_rule)
         else:
-            preview["rules"][self.number - 1] = {"emoji": emoji, "text": text}
+            preview["rules"][self.number - 1] = new_rule
         _check_length(parent.guild, preview)
 
         if self.number is None:
-            parent.selected = store.add(parent.guild.id, emoji, text, position)
+            parent.selected = store.add(parent.guild.id, text, icon=icon, emoji=emoji, position=position)
             await parent.changed(interaction, f"➕ Norma {parent.selected} añadida.")
         else:
-            store.edit(parent.guild.id, self.number, emoji=emoji, text=text)
+            store.edit(parent.guild.id, self.number, text=text, icon=icon, emoji=emoji)
             await parent.changed(interaction, f"✏️ Norma {self.number} editada.")
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
@@ -607,11 +621,11 @@ class RuleModal(discord.ui.Modal):
 
 class TextsModal(discord.ui.Modal, title="Textos del panel"):
     FIELDS = (
-        ("titulo", "Título", discord.TextStyle.short, 100, None),
-        ("soporte_titulo", "Título de soporte", discord.TextStyle.short, 100, None),
+        ("titulo", "Título", discord.TextStyle.short, 100, "Vacío = texto original."),
+        ("soporte_titulo", "Título de soporte", discord.TextStyle.short, 100, "Vacío = texto original."),
         ("soporte", "Texto de soporte", discord.TextStyle.paragraph, 800, "Usa {tickets} para nombrar el canal de tickets."),
-        ("incumplimiento_titulo", "Título de incumplimiento", discord.TextStyle.short, 100, None),
-        ("incumplimiento", "Texto de incumplimiento", discord.TextStyle.paragraph, 800, None),
+        ("incumplimiento_titulo", "Título de incumplimiento", discord.TextStyle.short, 100, "Opcional. Vacío = sin título."),
+        ("incumplimiento", "Texto de incumplimiento", discord.TextStyle.paragraph, 800, "Vacío = texto original."),
     )
 
     def __init__(self, parent: RuleboardConfigView) -> None:
@@ -620,15 +634,9 @@ class TextsModal(discord.ui.Modal, title="Textos del panel"):
         texts = _store(parent.bot).get(parent.guild.id)["texts"]
         self.inputs: dict[str, discord.ui.TextInput] = {}
         for key, label, style, limit, description in self.FIELDS:
-            field = discord.ui.TextInput(style=style, required=False, max_length=limit, default=texts[key])
+            field = discord.ui.TextInput(style=style, required=False, max_length=limit, default=texts[key] or None)
             self.inputs[key] = field
-            self.add_item(
-                discord.ui.Label(
-                    text=label,
-                    description=description or "Vacío = texto original.",
-                    component=field,
-                )
-            )
+            self.add_item(discord.ui.Label(text=label, description=description, component=field))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         parent = self.parent
@@ -639,7 +647,7 @@ class TextsModal(discord.ui.Modal, title="Textos del panel"):
             preview["texts"][key] = value or TEXT_FIELDS[key]
         _check_length(parent.guild, preview)
         for key, value in values.items():
-            store.set_text(parent.guild.id, key, None if value == TEXT_FIELDS[key] else value)
+            store.set_text(parent.guild.id, key, None if value in (None, TEXT_FIELDS[key]) else value)
         await parent.changed(interaction, "📝 Textos actualizados.")
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
@@ -653,7 +661,7 @@ class StyleModal(discord.ui.Modal, title="Estilo del panel"):
         data = _store(parent.bot).get(parent.guild.id)
         self.signature = discord.ui.TextInput(required=False, max_length=100, default=data["texts"]["firma"])
         self.color = discord.ui.TextInput(
-            required=False, max_length=7, default=f"#{int(data['color']):06x}", placeholder="#e891b4"
+            required=False, max_length=7, default=f"#{int(data['color']):06x}", placeholder=f"#{DEFAULT_COLOR:06x}"
         )
         self.add_item(
             discord.ui.Label(
@@ -664,8 +672,8 @@ class StyleModal(discord.ui.Modal, title="Estilo del panel"):
         )
         self.add_item(
             discord.ui.Label(
-                text="Color de la franja",
-                description=f"Hexadecimal. Vacío = #{DEFAULT_COLOR:06x}.",
+                text="Color de la franja y los iconos",
+                description=f"Hexadecimal. Vacío = #{DEFAULT_COLOR:06x} (azul cian).",
                 component=self.color,
             )
         )
@@ -678,7 +686,7 @@ class StyleModal(discord.ui.Modal, title="Estilo del panel"):
         if raw_color:
             match = HEX_COLOR.match(raw_color)
             if match is None:
-                raise RulesError("Usa un color en hexadecimal, por ejemplo `#e891b4`.")
+                raise RulesError(f"Usa un color en hexadecimal, por ejemplo `#{DEFAULT_COLOR:06x}`.")
             color = int(match.group(1), 16)
         signature = self.signature.value.strip() or None
 
@@ -773,7 +781,10 @@ def register_rules_commands(bot: commands.Bot, noah_group: commands.Group) -> No
         if not _can_manage(ctx.author):
             await ctx.send("❌ Solo los admins pueden gestionar las normas.")
             return
-        view = RuleboardConfigView(ctx.bot, ctx.guild)
+        async with ctx.typing():
+            # La primera vez sube los iconos y el logo como emojis de la aplicación.
+            problems = await _prepare_emojis(ctx.bot, ctx.guild)
+        view = RuleboardConfigView(ctx.bot, ctx.guild, notice=_problems_note(problems).strip())
         view.message = await ctx.send(view=view, allowed_mentions=NO_MENTIONS)
 
     @ruleboard.command(name="help")
