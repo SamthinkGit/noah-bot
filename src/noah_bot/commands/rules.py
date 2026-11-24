@@ -1,4 +1,4 @@
-"""`.noah ruleboard`: panel de normas del servidor editable desde Discord.
+"""`.noah ruleboard`: panel de normas del servidor (componentes V2) editable desde Discord.
 
 Todo se gestiona desde un único panel, `.noah ruleboard config`: elegir una norma y
 editarla, moverla o quitarla, añadir nuevas, cambiar los textos, la firma, el color y
@@ -9,7 +9,6 @@ import logging
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
 from typing import Any
 
 import discord
@@ -25,7 +24,7 @@ from noah_bot.modules.help_ui import (
 )
 from noah_bot.modules.rules import DEFAULT_COLOR, TEXT_FIELDS, RulesError, RulesStore
 
-TEXT_LIMIT = 6000  # límite de Discord para el texto total de un embed
+TEXT_LIMIT = 4000  # límite de Discord para el texto de un mensaje con componentes V2
 RULE_LIMIT = 300
 MAX_RULES = 25  # opciones de un desplegable
 CONFIG_TIMEOUT = 900
@@ -118,12 +117,6 @@ def _clip(text: str, limit: int) -> str:
 
 # ---------------------------------------------------------------------------
 # Panel publicado
-#
-# Es un embed clásico (no componentes V2) para poder llevar el logo del server en
-# pequeño en el pie, junto a la firma, como en las confesiones.
-
-DESCRIPTION_LIMIT = 4096
-FIELD_LIMIT = 1024
 
 
 def _rule_lines(rules: list[dict[str, str]]) -> str:
@@ -134,18 +127,58 @@ def _rule_lines(rules: list[dict[str, str]]) -> str:
     )
 
 
-def _panel_texts(guild: discord.Guild, data: dict[str, Any]) -> dict[str, str]:
+_logo_cache: dict[int, tuple[str, str]] = {}  # guild_id -> (clave del icono, emoji)
+
+
+async def _server_logo(bot: discord.Client, guild: discord.Guild) -> str | None:
+    """Logo del server como emoji de la aplicación, para ponerlo en pequeño junto a la firma.
+
+    Los componentes V2 no tienen pie con icono como los embeds, así que Noah sube el
+    icono como emoji propio (no gasta huecos del server) y lo rehace si cambia el icono.
+    """
+    icon = guild.icon
+    if icon is None:
+        return None
+    cached = _logo_cache.get(guild.id)
+    if cached is not None and cached[0] == icon.key:
+        return cached[1]
+
+    prefix = f"g{guild.id}_"
+    name = f"{prefix}{icon.key.removeprefix('a_')[:8]}"
+    try:
+        emojis = await bot.fetch_application_emojis()
+        emoji = next((e for e in emojis if e.name == name), None)
+        if emoji is None:
+            image = await icon.replace(size=128, static_format="png").read()
+            emoji = await bot.create_application_emoji(name=name, image=image)
+        for old in emojis:
+            if old.name.startswith(prefix) and old.name != name:
+                try:
+                    await old.delete()
+                except discord.HTTPException:
+                    pass
+    except discord.HTTPException:
+        log.warning("No he podido preparar el logo del server %s como emoji", guild.id, exc_info=True)
+        return None
+
+    _logo_cache[guild.id] = (icon.key, str(emoji))
+    return str(emoji)
+
+
+def _panel_texts(guild: discord.Guild, data: dict[str, Any], logo: str | None = None) -> dict[str, str]:
     texts = data["texts"]
     tickets = _tickets_channel(guild, data)
     tickets_ref = tickets.mention if tickets is not None else "#tickets"
+    count = len(data["rules"])
     return {
-        "title": texts["titulo"],
+        "header": (
+            f"## {texts['titulo']}\n"
+            f"-# {count} {'norma' if count == 1 else 'normas'} · actualizado <t:{data['updated_at']}:D>"
+        ),
         "rules": _rule_lines(data["rules"]) or "-# Todavía no hay normas.",
-        "support_title": texts["soporte_titulo"],
-        "support": texts["soporte"].replace("{tickets}", tickets_ref),
-        "breach_title": texts["incumplimiento_titulo"],
-        "breach": texts["incumplimiento"],
-        "footer": texts["firma"],
+        "support": f"**{texts['soporte_titulo']}**\n{texts['soporte'].replace('{tickets}', tickets_ref)}",
+        "breach": f"**{texts['incumplimiento_titulo']}**\n{texts['incumplimiento']}",
+        "footer": f"{logo} **{texts['firma']}**" if logo else f"**{texts['firma']}**",
     }
 
 
@@ -153,51 +186,44 @@ def panel_length(guild: discord.Guild, data: dict[str, Any]) -> int:
     return sum(len(text) for text in _panel_texts(guild, data).values())
 
 
-def build_rules_embed(guild: discord.Guild, data: dict[str, Any], avatar_url: str | None) -> discord.Embed:
-    texts = _panel_texts(guild, data)
-    embed = discord.Embed(
-        title=texts["title"],
-        description=texts["rules"],
-        color=discord.Color(int(data["color"])),
-        timestamp=datetime.fromtimestamp(int(data["updated_at"]), tz=UTC),
-    )
-    embed.add_field(name=texts["support_title"], value=texts["support"], inline=False)
-    embed.add_field(name=texts["breach_title"], value=texts["breach"], inline=False)
+def build_rules_view(
+    guild: discord.Guild, data: dict[str, Any], avatar_url: str | None, logo: str | None = None
+) -> discord.ui.LayoutView:
+    texts = _panel_texts(guild, data, logo)
+
+    def sep() -> discord.ui.Separator:
+        return discord.ui.Separator(spacing=discord.SeparatorSpacing.large)
+
+    box = discord.ui.Container(accent_color=discord.Color(int(data["color"])))
+
     if avatar_url:
-        embed.set_thumbnail(url=avatar_url)
-    embed.set_footer(text=texts["footer"], icon_url=guild.icon.url if guild.icon is not None else None)
-    return embed
+        box.add_item(discord.ui.Section(texts["header"], accessory=discord.ui.Thumbnail(avatar_url)))
+    else:
+        box.add_item(discord.ui.TextDisplay(texts["header"]))
+    box.add_item(sep())
+    box.add_item(discord.ui.TextDisplay(texts["rules"]))
+    box.add_item(sep())
 
-
-def build_rules_buttons(guild: discord.Guild, data: dict[str, Any]) -> discord.ui.View | None:
     tickets = _tickets_channel(guild, data)
-    if tickets is None:
-        return None
-    view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label="Ir a tickets", emoji="🎫", url=tickets.jump_url))
+    if tickets is not None:
+        button = discord.ui.Button(label="Ir a tickets", emoji="🎫", url=tickets.jump_url)
+        box.add_item(discord.ui.Section(texts["support"], accessory=button))
+    else:
+        box.add_item(discord.ui.TextDisplay(texts["support"]))
+    box.add_item(sep())
+    box.add_item(discord.ui.TextDisplay(texts["breach"]))
+    box.add_item(sep())
+
+    box.add_item(discord.ui.TextDisplay(texts["footer"]))
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(box)
     return view
 
 
-def _panel_kwargs(bot: discord.Client, guild: discord.Guild, data: dict[str, Any]) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {
-        "embed": build_rules_embed(guild, data, _avatar_url(bot)),
-        "allowed_mentions": NO_MENTIONS,
-    }
-    view = build_rules_buttons(guild, data)
-    if view is not None:
-        kwargs["view"] = view
-    return kwargs
-
-
 def _check_length(guild: discord.Guild, data: dict[str, Any]) -> None:
-    texts = _panel_texts(guild, data)
-    if len(texts["rules"]) > DESCRIPTION_LIMIT:
-        raise RulesError(f"Las normas pasarían de {DESCRIPTION_LIMIT} caracteres (límite de Discord). Acorta alguna.")
-    for key, label in (("support", "soporte"), ("breach", "incumplimiento")):
-        if len(texts[key]) > FIELD_LIMIT:
-            raise RulesError(f"El bloque de {label} pasaría de {FIELD_LIMIT} caracteres. Acórtalo.")
     if panel_length(guild, data) > TEXT_LIMIT:
-        raise RulesError(f"El panel pasaría de {TEXT_LIMIT} caracteres. Acorta algún texto.")
+        raise RulesError(f"El panel pasaría de {TEXT_LIMIT} caracteres (límite de Discord). Acorta algún texto.")
 
 
 async def _sync_published(bot: discord.Client, guild: discord.Guild) -> str:
@@ -212,24 +238,26 @@ async def _sync_published(bot: discord.Client, guild: discord.Guild) -> str:
         store.set_message(guild.id, None, None)
         return "⚠️ El canal del panel ya no existe: vuelve a publicarlo."
 
-    kwargs = _panel_kwargs(bot, guild, data)
-    kwargs.setdefault("view", None)  # quita el botón si ya no hay canal de tickets
+    view = build_rules_view(guild, data, _avatar_url(bot), await _server_logo(bot, guild))
     try:
-        await channel.get_partial_message(int(data["message_id"])).edit(**kwargs)
+        await channel.get_partial_message(int(data["message_id"])).edit(view=view, allowed_mentions=NO_MENTIONS)
     except discord.NotFound:
         store.set_message(guild.id, None, None)
         return "⚠️ El mensaje publicado se borró: vuelve a publicarlo."
-    except discord.HTTPException:
-        # p. ej. un panel antiguo en componentes V2, que no admite embeds: se publica de nuevo.
-        return await _repost(bot, guild, channel)
+    except discord.HTTPException as error:
+        return f"⚠️ No he podido actualizar el panel publicado: {error.text or error}."
     return f"Panel actualizado en {channel.mention}."
 
 
-async def _repost(bot: discord.Client, guild: discord.Guild, channel: discord.TextChannel) -> str:
+async def _publish(bot: discord.Client, guild: discord.Guild, channel: discord.TextChannel) -> str:
     store = _store(bot)
     data = store.get(guild.id)
+    if data.get("message_id") and int(data["channel_id"]) == channel.id:
+        return await _sync_published(bot, guild)
+
+    view = build_rules_view(guild, data, _avatar_url(bot), await _server_logo(bot, guild))
     try:
-        message = await channel.send(**_panel_kwargs(bot, guild, data))
+        message = await channel.send(view=view, allowed_mentions=NO_MENTIONS)
     except discord.Forbidden:
         raise RulesError(f"No puedo escribir en {channel.mention}.") from None
 
@@ -240,19 +268,10 @@ async def _repost(bot: discord.Client, guild: discord.Guild, channel: discord.Te
             try:
                 await old_channel.get_partial_message(int(data["message_id"])).delete()
                 note += f" Borrado el anterior de {old_channel.mention}."
-            except discord.NotFound:
-                pass
             except discord.HTTPException:
                 note += f" No he podido borrar el anterior de {old_channel.mention}."
     store.set_message(guild.id, channel.id, message.id)
     return note
-
-
-async def _publish(bot: discord.Client, guild: discord.Guild, channel: discord.TextChannel) -> str:
-    data = _store(bot).get(guild.id)
-    if data.get("message_id") and int(data["channel_id"]) == channel.id:
-        return await _sync_published(bot, guild)
-    return await _repost(bot, guild, channel)
 
 
 # ---------------------------------------------------------------------------
@@ -493,7 +512,13 @@ class RuleboardConfigView(discord.ui.LayoutView):
 
     async def _on_preview(self, interaction: discord.Interaction) -> None:
         data = _store(self.bot).get(self.guild.id)
-        await interaction.response.send_message(ephemeral=True, **_panel_kwargs(self.bot, self.guild, data))
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        logo = await _server_logo(self.bot, self.guild)
+        await interaction.followup.send(
+            view=build_rules_view(self.guild, data, _avatar_url(self.bot), logo),
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
 
     async def _on_close(self, interaction: discord.Interaction) -> None:
         self.stop()
