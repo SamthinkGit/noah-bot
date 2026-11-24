@@ -17,6 +17,7 @@ from noah_bot.modules.modlog import ModlogStore
 from noah_bot.modules.monitor import MonitorStore
 from noah_bot.modules.presentations import PresentationsStore
 from noah_bot.modules.rrpp import RrppStore
+from noah_bot.modules.rules import RulesStore
 from noah_bot.modules.sports import SportsStore
 from noah_bot.modules.spotify_player import (
     SpotifyAccessStore,
@@ -50,6 +51,7 @@ class BotContext:
     council: CouncilStore = field(default_factory=CouncilStore)
     monitor: MonitorStore = field(default_factory=MonitorStore)
     modlog: ModlogStore = field(default_factory=ModlogStore)
+    rules: RulesStore = field(default_factory=RulesStore)
     waifu_manager: WaifuGameManager = field(
         default_factory=lambda: WaifuGameManager(json_path="waifu_game.json")
     )

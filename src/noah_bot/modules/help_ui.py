@@ -42,6 +42,7 @@ INDEX_ORDER = (
     "autobump",
     "guard",
     "mod",
+    "ruleboard",
     "rrpp",
     "council",
 )
