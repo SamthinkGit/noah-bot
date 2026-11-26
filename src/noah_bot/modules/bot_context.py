@@ -19,6 +19,7 @@ from noah_bot.modules.presentations import PresentationsStore
 from noah_bot.modules.rrpp import RrppStore
 from noah_bot.modules.rules import RulesStore
 from noah_bot.modules.sports import SportsStore
+from noah_bot.modules.stickers import StickersStore
 from noah_bot.modules.spotify_player import (
     SpotifyAccessStore,
     SpotifyGuildState,
@@ -52,6 +53,7 @@ class BotContext:
     monitor: MonitorStore = field(default_factory=MonitorStore)
     modlog: ModlogStore = field(default_factory=ModlogStore)
     rules: RulesStore = field(default_factory=RulesStore)
+    stickers: StickersStore = field(default_factory=StickersStore)
     waifu_manager: WaifuGameManager = field(
         default_factory=lambda: WaifuGameManager(json_path="waifu_game.json")
     )

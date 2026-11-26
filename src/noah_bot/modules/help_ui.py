@@ -43,6 +43,7 @@ INDEX_ORDER = (
     "guard",
     "mod",
     "ruleboard",
+    "stickers",
     "rrpp",
     "council",
 )

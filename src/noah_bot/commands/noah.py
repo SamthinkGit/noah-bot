@@ -21,6 +21,7 @@ from noah_bot.commands.rrpp_inspect import register_rrpp_inspect_commands
 from noah_bot.commands.rrpp_points import register_rrpp_points_commands
 from noah_bot.commands.spotify import register_spotify_commands
 from noah_bot.commands.sports import register_sports_commands
+from noah_bot.commands.stickers import register_stickers_commands
 from noah_bot.commands.tts import register_tts_commands
 from noah_bot.commands.noah_ai import register_ai_commands
 from noah_bot.commands.vc_stats import register_vc_stats_commands
@@ -748,4 +749,5 @@ def register_noah_commands(bot: commands.Bot) -> None:
     register_monitor_commands(bot, noah)
     register_modlog_commands(bot, noah)
     register_rules_commands(bot, noah)
+    register_stickers_commands(bot, noah)
     register_ai_commands(bot, noah)
