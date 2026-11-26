@@ -85,7 +85,7 @@ def _limit_label(limit: int | None) -> str:
 def _limit_reached(store: ConfessionsStore, guild_id: int, user_id: int) -> str | None:
     """Aviso si la persona ya ha gastado todas sus confesiones de hoy."""
     limit = store.get_daily_limit(guild_id)
-    if limit is None or store.quota.used(guild_id, user_id) < limit:
+    if limit is None or store.used_today(guild_id, user_id) < limit:
         return None
     return (
         f"⛔ Ya has enviado {_plural(limit)} hoy, el máximo del servidor. "
@@ -160,7 +160,7 @@ class ConfessionModal(discord.ui.Modal, title="Confesión anónima"):
 
         # Se gasta antes de publicar para que dos envíos a la vez no se salten el límite.
         limit = store.get_daily_limit(guild.id)
-        if not store.quota.take(guild.id, interaction.user.id, limit):
+        if not store.take_daily(guild.id, interaction.user.id, limit):
             reached = _limit_reached(store, guild.id, interaction.user.id)
             await interaction.response.send_message(reached or "⛔ Ya no te quedan confesiones hoy.", ephemeral=True)
             return
@@ -172,12 +172,12 @@ class ConfessionModal(discord.ui.Modal, title="Confesión anónima"):
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception:
-            store.quota.give_back(guild.id, interaction.user.id)
+            store.give_back_daily(guild.id, interaction.user.id)
             raise
 
         remaining = ""
         if limit is not None:
-            left = max(0, limit - store.quota.used(guild.id, interaction.user.id))
+            left = max(0, limit - store.used_today(guild.id, interaction.user.id))
             remaining = f"\n-# Te quedan {_plural(left)} hoy." if left else "\n-# Era tu última confesión de hoy."
         await interaction.response.send_message(
             f"✅ Tu confesión anónima [#{number}]({sent.jump_url}) se ha publicado en "
@@ -265,7 +265,8 @@ HELP = register_help(
         summary="Confesiones totalmente anónimas",
         description=(
             "Se escriben en un formulario privado y se publican sin ningún dato del autor. "
-            "El bot no guarda quién las envía."
+            "El bot no guarda qué confesión es de quién: solo cuántas lleva hoy cada persona, "
+            "para el límite diario."
         ),
         sections=(
             HelpSection(

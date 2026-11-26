@@ -1,8 +1,5 @@
-import hashlib
-import hmac
 import json
-import secrets
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -11,62 +8,18 @@ LOCAL_TZ = ZoneInfo("Europe/Madrid")
 MAX_DAILY_LIMIT = 50
 
 
-class DailyQuota:
-    """Cuántas confesiones lleva hoy cada persona, solo en memoria.
-
-    No se guarda el id de nadie: cada persona se identifica con un hash con una clave
-    aleatoria que se crea al arrancar el bot. Nada se escribe a disco, no se relaciona
-    con ninguna confesión y todo se borra al cambiar el día (hora de Madrid) o al
-    reiniciar el bot.
-    """
-
-    def __init__(self) -> None:
-        self._secret = secrets.token_bytes(32)
-        self._day: date | None = None
-        self._counts: dict[str, int] = {}
-
-    def _key(self, guild_id: int, user_id: int) -> str:
-        return hmac.new(self._secret, f"{guild_id}:{user_id}".encode(), hashlib.sha256).hexdigest()
-
-    def _roll(self) -> None:
-        today = datetime.now(LOCAL_TZ).date()
-        if today != self._day:
-            self._day = today
-            self._counts.clear()
-
-    def used(self, guild_id: int, user_id: int) -> int:
-        self._roll()
-        return self._counts.get(self._key(guild_id, user_id), 0)
-
-    def take(self, guild_id: int, user_id: int, limit: int | None) -> bool:
-        """Gasta una confesión del día. `False` si ya llegó al límite."""
-        self._roll()
-        key = self._key(guild_id, user_id)
-        used = self._counts.get(key, 0)
-        if limit is not None and used >= limit:
-            return False
-        self._counts[key] = used + 1
-        return True
-
-    def give_back(self, guild_id: int, user_id: int) -> None:
-        """Devuelve la confesión gastada si al final no se pudo publicar."""
-        key = self._key(guild_id, user_id)
-        if self._counts.get(key, 0) > 0:
-            self._counts[key] -= 1
-
-
 class ConfessionsStore:
     """Configuración de confesiones por servidor.
 
-    Nunca se guarda nada sobre quién envía cada confesión: solo los canales,
-    el mensaje del panel, el contador para numerarlas y el límite diario. Lo que lleva
-    cada persona hoy está en `quota`, solo en memoria.
+    Nunca se guarda qué ha escrito cada persona ni qué confesión es de quién: solo los
+    canales, el mensaje del panel, el contador para numerarlas, el límite diario y
+    cuántas confesiones lleva hoy cada persona (para aplicar ese límite). Ese consumo
+    solo guarda el día de hoy: al cambiar de día se borra.
     """
 
     def __init__(self, json_path: str = "confessions.json") -> None:
         self.json_path = Path(json_path)
         self._guilds: dict[str, dict[str, Any]] = self._load()
-        self.quota = DailyQuota()
 
     def _load(self) -> dict[str, dict[str, Any]]:
         if not self.json_path.exists():
@@ -161,3 +114,40 @@ class ConfessionsStore:
 
     def get_daily_limit(self, guild_id: int) -> int | None:
         return self._get_int(guild_id, "daily_limit") or None
+
+    # ---------- consumo diario por persona ----------
+
+    def _usage_today(self, guild_id: int) -> dict[str, int]:
+        """Confesiones de hoy por persona (`{user_id: n}`). Lo de otros días se descarta."""
+        today = datetime.now(LOCAL_TZ).date().isoformat()
+        guild_data = self._guild_data(guild_id)
+        usage = guild_data.get("daily_usage")
+        if not isinstance(usage, dict) or usage.get("day") != today or not isinstance(usage.get("users"), dict):
+            usage = {"day": today, "users": {}}
+            guild_data["daily_usage"] = usage
+        return usage["users"]
+
+    def used_today(self, guild_id: int, user_id: int) -> int:
+        try:
+            return int(self._usage_today(guild_id).get(str(user_id), 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def take_daily(self, guild_id: int, user_id: int, limit: int | None) -> bool:
+        """Gasta una confesión del día de la persona. `False` si ya llegó al límite."""
+        used = self.used_today(guild_id, user_id)
+        if limit is not None and used >= limit:
+            return False
+        self._usage_today(guild_id)[str(user_id)] = used + 1
+        self._save()
+        return True
+
+    def give_back_daily(self, guild_id: int, user_id: int) -> None:
+        """Devuelve la confesión gastada si al final no se pudo publicar."""
+        users = self._usage_today(guild_id)
+        used = self.used_today(guild_id, user_id)
+        if used <= 1:
+            users.pop(str(user_id), None)
+        else:
+            users[str(user_id)] = used - 1
+        self._save()
