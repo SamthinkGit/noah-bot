@@ -5,7 +5,7 @@ import discord
 from discord.ext import commands
 
 from noah_bot.modules.bot_context import get_bot_context, is_guard_active
-from noah_bot.modules.confessions import ConfessionsStore
+from noah_bot.modules.confessions import MAX_DAILY_LIMIT, ConfessionsStore
 from noah_bot.modules.help_ui import HelpEntry, HelpModule, HelpSection, register_help, send_help
 
 CONFESS_COLOR = discord.Color.from_rgb(230, 126, 34)
@@ -74,6 +74,48 @@ def _jump_url(guild_id: int, channel_id: int, message_id: int) -> str:
     return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
 
 
+def _plural(count: int) -> str:
+    return f"{count} confesión" if count == 1 else f"{count} confesiones"
+
+
+def _limit_label(limit: int | None) -> str:
+    return f"{_plural(limit)} al día por persona" if limit else "Sin límite"
+
+
+def _limit_reached(store: ConfessionsStore, guild_id: int, user_id: int) -> str | None:
+    """Aviso si la persona ya ha gastado todas sus confesiones de hoy."""
+    limit = store.get_daily_limit(guild_id)
+    if limit is None or store.quota.used(guild_id, user_id) < limit:
+        return None
+    return (
+        f"⛔ Ya has enviado {_plural(limit)} hoy, el máximo del servidor. "
+        "Podrás volver a confesar mañana."
+    )
+
+
+def _parse_limit(raw: str) -> int | None:
+    """Número de 1 a MAX_DAILY_LIMIT, o `None` para quitar el límite. ValueError si no vale."""
+    text = raw.strip().casefold()
+    if text in {"", "0", "off", "no", "ninguno", "sin limite", "sin límite"}:
+        return None
+    limit = int(text)
+    if not 1 <= limit <= MAX_DAILY_LIMIT:
+        raise ValueError
+    return limit
+
+
+async def _open_modal(interaction: discord.Interaction) -> bool:
+    """Abre el formulario, o avisa si ya no le quedan confesiones hoy."""
+    if interaction.guild is not None:
+        store = get_bot_context(interaction.client).confessions
+        reached = _limit_reached(store, interaction.guild.id, interaction.user.id)
+        if reached is not None:
+            await interaction.response.send_message(reached, ephemeral=True)
+            return False
+    await interaction.response.send_modal(ConfessionModal())
+    return True
+
+
 class ConfessionModal(discord.ui.Modal, title="Confesión anónima"):
     confession = discord.ui.TextInput(
         label="Tu confesión",
@@ -116,14 +158,30 @@ class ConfessionModal(discord.ui.Modal, title="Confesión anónima"):
             await interaction.response.send_message(f"❌ {problem}", ephemeral=True)
             return
 
-        number = store.next_number(guild.id)
-        sent = await channel.send(
-            embed=build_confession_embed(guild, number, text),
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        # Se gasta antes de publicar para que dos envíos a la vez no se salten el límite.
+        limit = store.get_daily_limit(guild.id)
+        if not store.quota.take(guild.id, interaction.user.id, limit):
+            reached = _limit_reached(store, guild.id, interaction.user.id)
+            await interaction.response.send_message(reached or "⛔ Ya no te quedan confesiones hoy.", ephemeral=True)
+            return
+
+        try:
+            number = store.next_number(guild.id)
+            sent = await channel.send(
+                embed=build_confession_embed(guild, number, text),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception:
+            store.quota.give_back(guild.id, interaction.user.id)
+            raise
+
+        remaining = ""
+        if limit is not None:
+            left = max(0, limit - store.quota.used(guild.id, interaction.user.id))
+            remaining = f"\n-# Te quedan {_plural(left)} hoy." if left else "\n-# Era tu última confesión de hoy."
         await interaction.response.send_message(
             f"✅ Tu confesión anónima [#{number}]({sent.jump_url}) se ha publicado en "
-            f"{channel.mention}.",
+            f"{channel.mention}.{remaining}",
             ephemeral=True,
         )
 
@@ -152,7 +210,7 @@ class ConfessPanelView(discord.ui.View):
     )
     async def open(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         _ = button
-        await interaction.response.send_modal(ConfessionModal())
+        await _open_modal(interaction)
 
 
 class ConfessPromptView(discord.ui.View):
@@ -177,7 +235,7 @@ class ConfessPromptView(discord.ui.View):
     )
     async def open(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         _ = button
-        await interaction.response.send_modal(ConfessionModal())
+        await _open_modal(interaction)
         self.stop()
         with suppress(discord.HTTPException):
             await interaction.message.delete()
@@ -232,6 +290,10 @@ HELP = register_help(
                 (
                     HelpEntry(".noah confess config", "Canal de confesiones y dónde va el panel."),
                     HelpEntry(".noah confess sticky [on / off]", "Mantiene el panel siempre como último mensaje de su canal."),
+                    HelpEntry(
+                        ".noah confess limit [número / off]",
+                        f"Máximo de confesiones por persona y día (1-{MAX_DAILY_LIMIT}). Sin número, enseña el actual.",
+                    ),
                 ),
                 staff=True,
             ),
@@ -270,6 +332,9 @@ def _build_config_embed(guild: discord.Guild, store: ConfessionsStore) -> discor
         name="Mensaje fijo",
         value="Activado" if store.is_sticky(guild.id) else "Desactivado",
         inline=True,
+    )
+    embed.add_field(
+        name="Límite diario", value=_limit_label(store.get_daily_limit(guild.id)), inline=True
     )
     embed.add_field(
         name="Confesiones enviadas", value=f"`{store.get_count(guild.id)}`", inline=True
@@ -433,6 +498,13 @@ class ConfessConfigView(discord.ui.View):
             await interaction.followup.send(f"❌ {problem}", ephemeral=True)
         await self.refresh(interaction)
 
+    @discord.ui.button(label="Límite diario", style=discord.ButtonStyle.secondary, row=2)
+    async def daily_limit(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        _ = button
+        await interaction.response.send_modal(DailyLimitModal(self))
+
     @discord.ui.button(label="Cerrar", style=discord.ButtonStyle.secondary, row=2)
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         _ = button
@@ -443,6 +515,33 @@ class ConfessConfigView(discord.ui.View):
         if self.message is not None:
             with suppress(discord.HTTPException):
                 await self.message.edit(view=None)
+
+
+class DailyLimitModal(discord.ui.Modal, title="Límite diario de confesiones"):
+    def __init__(self, parent: ConfessConfigView) -> None:
+        super().__init__(timeout=300)
+        self.parent = parent
+        current = parent.store.get_daily_limit(parent.guild.id)
+        self.limit = discord.ui.TextInput(
+            label=f"Confesiones por persona y día (1-{MAX_DAILY_LIMIT})",
+            placeholder="Vacío o 0 = sin límite",
+            default=str(current) if current else None,
+            required=False,
+            max_length=3,
+        )
+        self.add_item(self.limit)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            limit = _parse_limit(self.limit.value)
+        except ValueError:
+            await interaction.response.send_message(
+                f"❌ Escribe un número del 1 al {MAX_DAILY_LIMIT}, o déjalo vacío para quitar el límite.",
+                ephemeral=True,
+            )
+            return
+        self.parent.store.set_daily_limit(self.parent.guild.id, limit)
+        await self.parent.refresh(interaction)
 
 
 def _is_panel_message(bot: commands.Bot, message: discord.Message) -> bool:
@@ -750,3 +849,29 @@ def register_confess_commands(bot: commands.Bot, noah_group: commands.Group) -> 
         await _sticky_notice(
             ctx, "❌ Usa `.noah confess sticky on` o `.noah confess sticky off`."
         )
+
+    @confess.command(name="limit")
+    async def limit(ctx: commands.Context, value: str | None = None) -> None:
+        if ctx.guild is None:
+            await ctx.send("❌ Este comando solo funciona dentro de un servidor.")
+            return
+
+        store = get_bot_context(ctx.bot).confessions
+        if value is None:
+            await ctx.send(f"📏 Límite diario: **{_limit_label(store.get_daily_limit(ctx.guild.id))}**.")
+            return
+
+        if not _is_confess_admin(ctx.author):
+            await ctx.send("❌ Solo los administradores pueden usar este comando.")
+            return
+
+        try:
+            new_limit = _parse_limit(value)
+        except ValueError:
+            await ctx.send(
+                f"❌ Usa un número del 1 al {MAX_DAILY_LIMIT}, o `.noah confess limit off` para quitarlo."
+            )
+            return
+
+        store.set_daily_limit(ctx.guild.id, new_limit)
+        await ctx.send(f"✅ Límite diario: **{_limit_label(new_limit)}**.")
