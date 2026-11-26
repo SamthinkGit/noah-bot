@@ -5,15 +5,15 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 LOCAL_TZ = ZoneInfo("Europe/Madrid")
-MAX_DAILY_LIMIT = 50
 
 
 class ConfessionsStore:
     """Configuración de confesiones por servidor.
 
     Nunca se guarda qué ha escrito cada persona ni qué confesión es de quién: solo los
-    canales, el mensaje del panel, el contador para numerarlas, el límite diario y
-    cuántas confesiones lleva hoy cada persona (para aplicar ese límite). Ese consumo
+    canales, el mensaje del panel, el contador para numerarlas, el límite por persona y
+    cuántas confesiones lleva hoy cada persona (para aplicar ese límite). No hay límite
+    total del servidor. Ese consumo
     solo guarda el día de hoy: al cambiar de día se borra.
     """
 
